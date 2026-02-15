@@ -34,6 +34,13 @@ const DAILY_DIR = path.join(MEMORY_DIR, "daily");
 const BACKUP_SUFFIX = ".e2e-backup";
 const TIMEOUT_MS = 120_000; // 2 minutes per pi invocation
 
+// Optional: pin provider/model for deterministic CI runs.
+// Examples:
+//   PI_E2E_PROVIDER=openai
+//   PI_E2E_MODEL=gpt-4o-mini
+const PI_E2E_PROVIDER = process.env.PI_E2E_PROVIDER;
+const PI_E2E_MODEL = process.env.PI_E2E_MODEL;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -52,7 +59,11 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 
 	// Escape the prompt for shell — use base64 encoding to avoid quoting issues
 	const promptB64 = Buffer.from(prompt).toString("base64");
-	const cmd = `echo "${promptB64}" | base64 -d | pi -p --mode ${mode} -e ${EXTENSION_PATH} --no-session`;
+	const providerArg = PI_E2E_PROVIDER ? ` --provider "${PI_E2E_PROVIDER}"` : "";
+	const modelArg = PI_E2E_MODEL ? ` --model "${PI_E2E_MODEL}"` : "";
+	const cmd =
+		`echo "${promptB64}" | base64 -d | ` +
+		`pi -p --mode ${mode}${providerArg}${modelArg} -e "${EXTENSION_PATH}" --no-session`;
 
 	let stdout: string;
 	let exitCode = 0;

@@ -9,6 +9,12 @@
 
 Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`).
 
+## Activity Tracking (Required)
+
+- Track all work sessions by writing a short entry to the pi-memory daily log using `memory_write` (target: `daily`).
+- Summaries should include what changed, files touched, and any notable decisions.
+- Use the scratchpad tool for follow-ups or TODOs discovered during work.
+
 ## Build, Test, and Development Commands
 
 - `pi -p -e ./index.ts "remember: I prefer dark mode"`: manual local run (print mode)

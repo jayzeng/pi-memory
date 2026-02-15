@@ -25,6 +25,7 @@
   "homepage": "https://github.com/jayzeng/pi-memory#readme",
   "scripts": {
     "postinstall": "node scripts/postinstall.cjs",
+    "build": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --ext .ts,.tsx",
     "test": "npx tsx test/e2e.ts"
   },
@@ -32,6 +33,7 @@
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "eslint": "^9.0.0",
+    "typescript": "^5.9.3",
     "tsx": "^4.0.0"
   },
   "peerDependencies": {
