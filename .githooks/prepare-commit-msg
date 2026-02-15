@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit_msg_file="$1"
+commit_source="${2:-}"
+
+# Skip merge commits to avoid rewriting generated messages.
+if [ "$commit_source" = "merge" ]; then
+	exit 0
+fi
+
+name=$(git config user.name || true)
+email=$(git config user.email || true)
+
+if [ -z "$name" ] || [ -z "$email" ]; then
+	exit 0
+fi
+
+signoff="Signed-off-by: $name <$email>"
+
+if ! grep -q "^${signoff}$" "$commit_msg_file"; then
+	printf "\n%s\n" "$signoff" >> "$commit_msg_file"
+fi
