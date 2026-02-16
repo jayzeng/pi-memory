@@ -1,6 +1,6 @@
 {
-  "name": "@jayzeng/pi-memory",
-  "version": "1.0.0",
+  "name": "pi-memory",
+  "version": "0.2.0",
   "description": "Pi coding agent extension for memory with qmd-powered semantic search across daily logs, long-term memory, and scratchpad",
   "main": "index.ts",
   "type": "module",
@@ -17,12 +17,21 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jayzeng/pi-memory.git"
+    "url": "git+https://github.com/jayzeng/pi-memory.git"
   },
   "bugs": {
     "url": "https://github.com/jayzeng/pi-memory/issues"
   },
   "homepage": "https://github.com/jayzeng/pi-memory#readme",
+  "files": [
+    "index.ts",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "postinstall": "node scripts/postinstall.cjs",
     "build": "tsc -p tsconfig.json --noEmit",

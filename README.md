@@ -9,6 +9,10 @@ Persistent memory across coding sessions — long-term facts, daily logs, and a 
 ## Installation
 
 ```bash
+# Install from npm (recommended)
+pi install npm:pi-memory
+
+# Install from local checkout
 pi install ./pi-memory
 
 # Optional (enables `memory_search` + selective injection, requires Bun)
@@ -169,6 +173,22 @@ pi -p -e ./index.ts "remember: I prefer dark mode"
 
 # Verify memory was written
 cat ~/.pi/agent/memory/MEMORY.md
+```
+
+## Publishing (maintainers)
+
+```bash
+# Confirm package name is available
+npm view pi-memory
+
+# Bump version (choose patch/minor/major)
+npm version patch
+
+# Publish to npm (public)
+npm publish --access public
+
+# Verify install
+pi install npm:pi-memory
 ```
 
 ## Changelog
