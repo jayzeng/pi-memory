@@ -1,57 +1,61 @@
 {
-  "name": "pi-memory",
-  "version": "0.3.0",
-  "description": "Pi coding agent extension for memory with qmd-powered semantic search across daily logs, long-term memory, and scratchpad",
-  "main": "index.ts",
-  "type": "module",
-  "keywords": [
-    "pi",
-    "pi-coding-agent",
-    "memory",
-    "search",
-    "qmd",
-    "scratchpad",
-    "daily-log"
-  ],
-  "author": "jayzeng",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/jayzeng/pi-memory.git"
-  },
-  "bugs": {
-    "url": "https://github.com/jayzeng/pi-memory/issues"
-  },
-  "homepage": "https://github.com/jayzeng/pi-memory#readme",
-  "files": [
-    "index.ts",
-    "scripts",
-    "README.md",
-    "LICENSE"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "postinstall": "node scripts/postinstall.cjs",
-    "build": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint . --ext .ts,.tsx",
-    "test": "npx tsx test/e2e.ts"
-  },
-  "devDependencies": {
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
-    "eslint": "^9.0.0",
-    "typescript": "^5.9.3",
-    "tsx": "^4.0.0"
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.0.1",
-    "@mariozechner/pi-ai": ">=0.0.1",
-    "@sinclair/typebox": ">=0.34.0"
-  },
-  "overrides": {
-    "rimraf": "^6.1.3",
-    "glob": "^13.0.3"
-  }
+	"name": "pi-memory",
+	"version": "0.3.1",
+	"description": "Pi coding agent extension for memory with qmd-powered semantic search across daily logs, long-term memory, and scratchpad",
+	"main": "index.ts",
+	"type": "module",
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"pi-package",
+		"memory",
+		"search",
+		"qmd",
+		"scratchpad",
+		"daily-log"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"author": "jayzeng",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/jayzeng/pi-memory.git"
+	},
+	"bugs": {
+		"url": "https://github.com/jayzeng/pi-memory/issues"
+	},
+	"homepage": "https://github.com/jayzeng/pi-memory#readme",
+	"files": [
+		"index.ts",
+		"scripts",
+		"README.md",
+		"LICENSE"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"postinstall": "node scripts/postinstall.cjs",
+		"build": "tsc -p tsconfig.json --noEmit",
+		"lint": "biome check .",
+		"test": "npx tsx test/e2e.ts"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.0",
+		"tsx": "^4.0.0",
+		"typescript": "^5.9.3"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-ai": ">=0.0.1",
+		"@mariozechner/pi-coding-agent": ">=0.0.1",
+		"@sinclair/typebox": ">=0.34.0"
+	},
+	"overrides": {
+		"rimraf": "^6.1.3",
+		"glob": "^13.0.3"
+	}
 }

@@ -6,31 +6,31 @@
  * Uses temp directories for all file I/O — does not touch real memory files.
  */
 
-import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
+import * as path from "node:path";
 
 import {
-	_setBaseDir,
-	_resetBaseDir,
-	_setQmdAvailable,
-	_getUpdateTimer,
 	_clearUpdateTimer,
+	_getUpdateTimer,
+	_resetBaseDir,
+	_setBaseDir,
+	_setQmdAvailable,
+	buildMemoryContext,
+	dailyPath,
 	ensureDirs,
+	nowTimestamp,
+	parseScratchpad,
+	qmdCollectionInstructions,
+	qmdInstallInstructions,
+	readFileSafe,
+	type ScratchpadItem,
+	scheduleQmdUpdate,
+	serializeScratchpad,
+	shortSessionId,
 	todayStr,
 	yesterdayStr,
-	nowTimestamp,
-	shortSessionId,
-	readFileSafe,
-	dailyPath,
-	parseScratchpad,
-	serializeScratchpad,
-	buildMemoryContext,
-	qmdInstallInstructions,
-	qmdCollectionInstructions,
-	scheduleQmdUpdate,
-	type ScratchpadItem,
 } from "../index.js";
 
 // ---------------------------------------------------------------------------
@@ -54,13 +54,13 @@ function cleanupTmpDir() {
 /** Create a mock ExtensionAPI and capture registered tools/hooks. */
 function createMockPi() {
 	const tools: Record<string, any> = {};
-	const hooks: Record<string, Function> = {};
+	const hooks: Record<string, (...args: unknown[]) => unknown> = {};
 
 	const pi = {
 		registerTool(toolDef: any) {
 			tools[toolDef.name] = toolDef;
 		},
-		on(event: string, handler: Function) {
+		on(event: string, handler: (...args: unknown[]) => unknown) {
 			hooks[event] = handler;
 		},
 	};
@@ -285,9 +285,7 @@ describe("serializeScratchpad", () => {
 	});
 
 	test("includes metadata comments", () => {
-		const items: ScratchpadItem[] = [
-			{ done: false, text: "Task", meta: "<!-- 2026-02-15 [abc] -->" },
-		];
+		const items: ScratchpadItem[] = [{ done: false, text: "Task", meta: "<!-- 2026-02-15 [abc] -->" }];
 		const result = serializeScratchpad(items);
 		expect(result).toContain("<!-- 2026-02-15 [abc] -->");
 		expect(result).toContain("- [ ] Task");
@@ -480,7 +478,11 @@ describe("memory_write tool", () => {
 	test("appends to empty MEMORY.md", async () => {
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "User likes cats" }, null, null, ctx,
+			"call1",
+			{ target: "long_term", content: "User likes cats" },
+			null,
+			null,
+			ctx,
 		);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("User likes cats");
@@ -495,7 +497,11 @@ describe("memory_write tool", () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Existing content", "utf-8");
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "New fact" }, null, null, ctx,
+			"call1",
+			{ target: "long_term", content: "New fact" },
+			null,
+			null,
+			ctx,
 		);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Existing content");
@@ -508,7 +514,11 @@ describe("memory_write tool", () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Old content", "utf-8");
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "Brand new", mode: "overwrite" }, null, null, ctx,
+			"call1",
+			{ target: "long_term", content: "Brand new", mode: "overwrite" },
+			null,
+			null,
+			ctx,
 		);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Brand new");
@@ -520,7 +530,11 @@ describe("memory_write tool", () => {
 	test("appends to daily log", async () => {
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
-			"call1", { target: "daily", content: "Did some work" }, null, null, ctx,
+			"call1",
+			{ target: "daily", content: "Did some work" },
+			null,
+			null,
+			ctx,
 		);
 		const today = todayStr();
 		const content = fs.readFileSync(path.join(tmpDir, "daily", `${today}.md`), "utf-8");
@@ -533,9 +547,7 @@ describe("memory_write tool", () => {
 		const today = todayStr();
 		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), "Morning entry", "utf-8");
 		const ctx = createMockCtx();
-		await tools.memory_write.execute(
-			"call1", { target: "daily", content: "Afternoon entry" }, null, null, ctx,
-		);
+		await tools.memory_write.execute("call1", { target: "daily", content: "Afternoon entry" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "daily", `${today}.md`), "utf-8");
 		expect(content).toContain("Morning entry");
 		expect(content).toContain("Afternoon entry");
@@ -543,18 +555,14 @@ describe("memory_write tool", () => {
 
 	test("includes session ID in metadata comment", async () => {
 		const ctx = createMockCtx("mysession12345678");
-		await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "Test" }, null, null, ctx,
-		);
+		await tools.memory_write.execute("call1", { target: "long_term", content: "Test" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("[mysessio]"); // first 8 chars
 	});
 
 	test("includes timestamp in metadata comment", async () => {
 		const ctx = createMockCtx();
-		await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "Test" }, null, null, ctx,
-		);
+		await tools.memory_write.execute("call1", { target: "long_term", content: "Test" }, null, null, ctx);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		// Should have a timestamp like "2026-02-15 10:30:00"
 		expect(content).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
@@ -564,7 +572,11 @@ describe("memory_write tool", () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Old", "utf-8");
 		const ctx = createMockCtx();
 		const result = await tools.memory_write.execute(
-			"call1", { target: "long_term", content: "New" }, null, null, ctx,
+			"call1",
+			{ target: "long_term", content: "New" },
+			null,
+			null,
+			ctx,
 		);
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Old");
@@ -598,17 +610,13 @@ describe("scratchpad tool", () => {
 
 	test("list on empty scratchpad", async () => {
 		const ctx = createMockCtx();
-		const result = await tools.scratchpad.execute(
-			"call1", { action: "list" }, null, null, ctx,
-		);
+		const result = await tools.scratchpad.execute("call1", { action: "list" }, null, null, ctx);
 		expect(result.content[0].text).toBe("Scratchpad is empty.");
 	});
 
 	test("add item", async () => {
 		const ctx = createMockCtx();
-		const result = await tools.scratchpad.execute(
-			"call1", { action: "add", text: "Fix login bug" }, null, null, ctx,
-		);
+		const result = await tools.scratchpad.execute("call1", { action: "add", text: "Fix login bug" }, null, null, ctx);
 		expect(result.content[0].text).toContain("- [ ] Fix login bug");
 		const content = fs.readFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "utf-8");
 		expect(content).toContain("Fix login bug");
@@ -617,9 +625,7 @@ describe("scratchpad tool", () => {
 
 	test("add without text returns error", async () => {
 		const ctx = createMockCtx();
-		const result = await tools.scratchpad.execute(
-			"call1", { action: "add" }, null, null, ctx,
-		);
+		const result = await tools.scratchpad.execute("call1", { action: "add" }, null, null, ctx);
 		expect(result.content[0].text).toContain("Error");
 		expect(result.content[0].text).toContain("'text' is required");
 	});
@@ -868,9 +874,7 @@ describe("memory_search tool", () => {
 		// test machine, it will find it and fall through to the collection check.
 		// Either way, it should return isError with qmd setup instructions.
 		_setQmdAvailable(false);
-		const result = await tools.memory_search.execute(
-			"c1", { query: "test" }, null, null, {},
-		);
+		const result = await tools.memory_search.execute("c1", { query: "test" }, null, null, {});
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toContain("qmd");
 	});
@@ -889,7 +893,7 @@ describe("memory_search tool", () => {
 // ==========================================================================
 
 describe("lifecycle hooks", () => {
-	let hooks: Record<string, Function>;
+	let hooks: Record<string, (...args: unknown[]) => unknown>;
 
 	beforeEach(() => {
 		setupTmpDir();

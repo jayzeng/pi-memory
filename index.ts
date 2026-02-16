@@ -20,12 +20,12 @@
  *   - MEMORY.md + SCRATCHPAD.md + today's + yesterday's daily logs injected into every turn
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { StringEnum } from "@mariozechner/pi-ai";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
@@ -72,7 +72,10 @@ export function yesterdayStr(): string {
 }
 
 export function nowTimestamp(): string {
-	return new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+	return new Date()
+		.toISOString()
+		.replace("T", " ")
+		.replace(/\.\d+Z$/, "");
 }
 
 export function shortSessionId(sessionId: string): string {
@@ -170,10 +173,20 @@ function truncateText(text: string, maxChars: number, mode: TruncateMode) {
 	return { text: text.slice(0, maxChars), truncated: true };
 }
 
-function buildPreview(content: string, options: { maxLines: number; maxChars: number; mode: TruncateMode }): PreviewResult {
+function buildPreview(
+	content: string,
+	options: { maxLines: number; maxChars: number; mode: TruncateMode },
+): PreviewResult {
 	const normalized = normalizeContent(content);
 	if (!normalized) {
-		return { preview: "", truncated: false, totalLines: 0, totalChars: 0, previewLines: 0, previewChars: 0 };
+		return {
+			preview: "",
+			truncated: false,
+			totalLines: 0,
+			totalChars: 0,
+			previewLines: 0,
+			previewChars: 0,
+		};
 	}
 
 	const lines = normalized.split("\n");
@@ -282,7 +295,7 @@ export function serializeScratchpad(items: ScratchpadItem[]): string {
 		const checkbox = item.done ? "[x]" : "[ ]";
 		lines.push(`- ${checkbox} ${item.text}`);
 	}
-	return lines.join("\n") + "\n";
+	return `${lines.join("\n")}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,11 +443,8 @@ export function qmdInstallInstructions(): string {
 export async function setupQmdCollection(): Promise<boolean> {
 	try {
 		await new Promise<void>((resolve, reject) => {
-			execFile(
-				"qmd",
-				["collection", "add", MEMORY_DIR, "--name", "pi-memory"],
-				{ timeout: 10_000 },
-				(err) => (err ? reject(err) : resolve()),
+			execFile("qmd", ["collection", "add", MEMORY_DIR, "--name", "pi-memory"], { timeout: 10_000 }, (err) =>
+				err ? reject(err) : resolve(),
 			);
 		});
 	} catch {
@@ -450,11 +460,8 @@ export async function setupQmdCollection(): Promise<boolean> {
 	for (const [ctxPath, desc] of contexts) {
 		try {
 			await new Promise<void>((resolve, reject) => {
-				execFile(
-					"qmd",
-					["context", "add", ctxPath, desc, "-c", "pi-memory"],
-					{ timeout: 10_000 },
-					(err) => (err ? reject(err) : resolve()),
+				execFile("qmd", ["context", "add", ctxPath, desc, "-c", "pi-memory"], { timeout: 10_000 }, (err) =>
+					err ? reject(err) : resolve(),
 				);
 			});
 		} catch {
@@ -483,7 +490,15 @@ export function checkCollection(name: string): Promise<boolean> {
 			try {
 				const collections = JSON.parse(stdout);
 				if (Array.isArray(collections)) {
-					resolve(collections.some((c: any) => c.name === name || c === name));
+					resolve(
+						collections.some((entry) => {
+							if (typeof entry === "string") return entry === name;
+							if (entry && typeof entry === "object" && "name" in entry) {
+								return (entry as { name?: string }).name === name;
+							}
+							return false;
+						}),
+					);
 				} else {
 					// qmd may output an object with a collections array or similar
 					resolve(stdout.includes(name));
@@ -511,8 +526,11 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 	if (!qmdAvailable || !prompt.trim()) return "";
 
 	// Sanitize: strip control chars, limit to 200 chars for the search query
-	// eslint-disable-next-line no-control-regex
-	const sanitized = prompt.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
+	const sanitized = prompt
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: we intentionally strip control chars.
+		.replace(/[\x00-\x1f\x7f]/g, " ")
+		.trim()
+		.slice(0, 200);
 	if (!sanitized) return "";
 
 	try {
@@ -567,7 +585,7 @@ export function runQmdSearch(
 			}
 			try {
 				const parsed = JSON.parse(stdout);
-				const results = Array.isArray(parsed) ? parsed : parsed.results ?? parsed.hits ?? [];
+				const results = Array.isArray(parsed) ? parsed : (parsed.results ?? parsed.hits ?? []);
 				resolve(results);
 			} catch {
 				reject(new Error(`Failed to parse qmd output: ${stdout.slice(0, 200)}`));
@@ -620,7 +638,7 @@ export default function (pi: ExtensionAPI) {
 			"- Things to fix later or keep in mind \u2192 scratchpad tool",
 			"- Use memory_search to find past context across all memory files (keyword, semantic, or deep search).",
 			"- Use #tags (e.g. #decision, #preference) and [[links]] (e.g. [[auth-strategy]]) in memory content to improve future search recall.",
-			"- If someone says \"remember this,\" write it immediately.",
+			'- If someone says "remember this," write it immediately.',
 			"",
 			memoryContext,
 		].join("\n");
@@ -659,11 +677,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (parts.length === 0) return;
 
-		const handoff = [
-			`<!-- HANDOFF ${ts} [${sid}] -->`,
-			"## Session Handoff",
-			...parts,
-		].join("\n");
+		const handoff = [`<!-- HANDOFF ${ts} [${sid}] -->`, "## Session Handoff", ...parts].join("\n");
 
 		const filePath = dailyPath(todayStr());
 		const existing = readFileSafe(filePath) ?? "";
@@ -719,7 +733,12 @@ export default function (pi: ExtensionAPI) {
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
-					content: [{ type: "text", text: `Appended to daily log: ${filePath}${existingSnippet}` }],
+					content: [
+						{
+							type: "text",
+							text: `Appended to daily log: ${filePath}${existingSnippet}`,
+						},
+					],
 					details: {
 						path: filePath,
 						target,
@@ -800,7 +819,9 @@ export default function (pi: ExtensionAPI) {
 				description: "What to do",
 			}),
 			text: Type.Optional(
-				Type.String({ description: "Item text for add, or substring to match for done/undo" }),
+				Type.String({
+					description: "Item text for add, or substring to match for done/undo",
+				}),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -814,7 +835,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (action === "list") {
 				if (items.length === 0) {
-					return { content: [{ type: "text", text: "Scratchpad is empty." }], details: {} };
+					return {
+						content: [{ type: "text", text: "Scratchpad is empty." }],
+						details: {},
+					};
 				}
 				const serialized = serializeScratchpad(items);
 				const preview = buildPreview(serialized, {
@@ -823,7 +847,12 @@ export default function (pi: ExtensionAPI) {
 					mode: "start",
 				});
 				return {
-					content: [{ type: "text", text: formatPreviewBlock("Scratchpad preview", serialized, "start") }],
+					content: [
+						{
+							type: "text",
+							text: formatPreviewBlock("Scratchpad preview", serialized, "start"),
+						},
+					],
 					details: {
 						count: items.length,
 						open: items.filter((i) => !i.done).length,
@@ -834,7 +863,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (action === "add") {
 				if (!text) {
-					return { content: [{ type: "text", text: "Error: 'text' is required for add." }], details: {} };
+					return {
+						content: [{ type: "text", text: "Error: 'text' is required for add." }],
+						details: {},
+					};
 				}
 				items.push({ done: false, text, meta: `<!-- ${ts} [${sid}] -->` });
 				const serialized = serializeScratchpad(items);
@@ -853,13 +885,27 @@ export default function (pi: ExtensionAPI) {
 							text: `Added: - [ ] ${text}\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}`,
 						},
 					],
-					details: { action, sessionId: sid, timestamp: ts, qmdUpdateMode: getQmdUpdateMode(), preview },
+					details: {
+						action,
+						sessionId: sid,
+						timestamp: ts,
+						qmdUpdateMode: getQmdUpdateMode(),
+						preview,
+					},
 				};
 			}
 
 			if (action === "done" || action === "undo") {
 				if (!text) {
-					return { content: [{ type: "text", text: `Error: 'text' is required for ${action}.` }], details: {} };
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Error: 'text' is required for ${action}.`,
+							},
+						],
+						details: {},
+					};
 				}
 				const needle = text.toLowerCase();
 				const targetDone = action === "done";
@@ -873,7 +919,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!matched) {
 					return {
-						content: [{ type: "text", text: `No matching ${targetDone ? "open" : "done"} item found for: "${text}"` }],
+						content: [
+							{
+								type: "text",
+								text: `No matching ${targetDone ? "open" : "done"} item found for: "${text}"`,
+							},
+						],
 						details: {},
 					};
 				}
@@ -887,8 +938,19 @@ export default function (pi: ExtensionAPI) {
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
-					content: [{ type: "text", text: `Updated.\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}` }],
-					details: { action, sessionId: sid, timestamp: ts, qmdUpdateMode: getQmdUpdateMode(), preview },
+					content: [
+						{
+							type: "text",
+							text: `Updated.\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}`,
+						},
+					],
+					details: {
+						action,
+						sessionId: sid,
+						timestamp: ts,
+						qmdUpdateMode: getQmdUpdateMode(),
+						preview,
+					},
 				};
 			}
 
@@ -912,11 +974,19 @@ export default function (pi: ExtensionAPI) {
 							text: `Cleared ${removed} done item(s).\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}`,
 						},
 					],
-					details: { action, removed, qmdUpdateMode: getQmdUpdateMode(), preview },
+					details: {
+						action,
+						removed,
+						qmdUpdateMode: getQmdUpdateMode(),
+						preview,
+					},
 				};
 			}
 
-			return { content: [{ type: "text", text: `Unknown action: ${action}` }], details: {} };
+			return {
+				content: [{ type: "text", text: `Unknown action: ${action}` }],
+				details: {},
+			};
 		},
 	});
 
@@ -936,7 +1006,9 @@ export default function (pi: ExtensionAPI) {
 				description: "What to read",
 			}),
 			date: Type.Optional(
-				Type.String({ description: "Date for daily log (YYYY-MM-DD). Default: today." }),
+				Type.String({
+					description: "Date for daily log (YYYY-MM-DD). Default: today.",
+				}),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -945,16 +1017,31 @@ export default function (pi: ExtensionAPI) {
 
 			if (target === "list") {
 				try {
-					const files = fs.readdirSync(DAILY_DIR).filter((f) => f.endsWith(".md")).sort().reverse();
+					const files = fs
+						.readdirSync(DAILY_DIR)
+						.filter((f) => f.endsWith(".md"))
+						.sort()
+						.reverse();
 					if (files.length === 0) {
-						return { content: [{ type: "text", text: "No daily logs found." }], details: {} };
+						return {
+							content: [{ type: "text", text: "No daily logs found." }],
+							details: {},
+						};
 					}
 					return {
-						content: [{ type: "text", text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}` }],
+						content: [
+							{
+								type: "text",
+								text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`,
+							},
+						],
 						details: { files },
 					};
 				} catch {
-					return { content: [{ type: "text", text: "No daily logs directory." }], details: {} };
+					return {
+						content: [{ type: "text", text: "No daily logs directory." }],
+						details: {},
+					};
 				}
 			}
 
@@ -963,7 +1050,10 @@ export default function (pi: ExtensionAPI) {
 				const filePath = dailyPath(d);
 				const content = readFileSafe(filePath);
 				if (!content) {
-					return { content: [{ type: "text", text: `No daily log for ${d}.` }], details: {} };
+					return {
+						content: [{ type: "text", text: `No daily log for ${d}.` }],
+						details: {},
+					};
 				}
 				return {
 					content: [{ type: "text", text: content }],
@@ -974,7 +1064,15 @@ export default function (pi: ExtensionAPI) {
 			if (target === "scratchpad") {
 				const content = readFileSafe(SCRATCHPAD_FILE);
 				if (!content?.trim()) {
-					return { content: [{ type: "text", text: "SCRATCHPAD.md is empty or does not exist." }], details: {} };
+					return {
+						content: [
+							{
+								type: "text",
+								text: "SCRATCHPAD.md is empty or does not exist.",
+							},
+						],
+						details: {},
+					};
 				}
 				return {
 					content: [{ type: "text", text: content }],
@@ -985,7 +1083,10 @@ export default function (pi: ExtensionAPI) {
 			// long_term
 			const content = readFileSafe(MEMORY_FILE);
 			if (!content) {
-				return { content: [{ type: "text", text: "MEMORY.md is empty or does not exist." }], details: {} };
+				return {
+					content: [{ type: "text", text: "MEMORY.md is empty or does not exist." }],
+					details: {},
+				};
 			}
 			return {
 				content: [{ type: "text", text: content }],
@@ -1062,7 +1163,12 @@ export default function (pi: ExtensionAPI) {
 
 				if (results.length === 0) {
 					return {
-						content: [{ type: "text", text: `No results found for "${params.query}" (mode: ${mode}).` }],
+						content: [
+							{
+								type: "text",
+								text: `No results found for "${params.query}" (mode: ${mode}).`,
+							},
+						],
 						details: { mode, query: params.query, count: 0 },
 					};
 				}

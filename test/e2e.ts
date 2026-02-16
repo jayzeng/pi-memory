@@ -167,7 +167,10 @@ function test(name: string, fn: () => void) {
 
 function checkPi(): boolean {
 	try {
-		const result = runPi("Say exactly: PREFLIGHT_OK", { timeout: 60_000, textMode: true });
+		const result = runPi("Say exactly: PREFLIGHT_OK", {
+			timeout: 60_000,
+			textMode: true,
+		});
 		return result.exitCode === 0 && result.textOutput.includes("PREFLIGHT_OK");
 	} catch {
 		return false;
@@ -185,7 +188,10 @@ function checkQmdAvailable(): boolean {
 
 function checkQmdCollection(name: string): boolean {
 	try {
-		const stdout = execSync("qmd collection list --json", { encoding: "utf-8", timeout: 10_000 });
+		const stdout = execSync("qmd collection list --json", {
+			encoding: "utf-8",
+			timeout: 10_000,
+		});
 		const parsed = JSON.parse(stdout);
 		if (Array.isArray(parsed)) {
 			return parsed.some((c: any) => c.name === name || c === name);
@@ -249,7 +255,7 @@ function testMemoryWriteAndRecall() {
 
 	// Session 1: Ask pi to remember facts using the tool
 	const writeResult = runPi(
-		"Use the memory_write tool to write the following to long_term memory (target: \"long_term\"): \"User lives in Seattle. User's favorite drink is tea.\" Do not add anything else, just call the tool.",
+		'Use the memory_write tool to write the following to long_term memory (target: "long_term"): "User lives in Seattle. User\'s favorite drink is tea." Do not add anything else, just call the tool.',
 	);
 
 	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
@@ -276,7 +282,10 @@ function testMemoryWriteAndRecall() {
 	assert(recallResult.exitCode === 0, `pi (recall) exited with code ${recallResult.exitCode}`);
 
 	const recallText = recallResult.textOutput.toLowerCase();
-	assert(recallText.includes("seattle"), `Recall does not mention "seattle". Got: ${recallResult.textOutput.slice(0, 300)}`);
+	assert(
+		recallText.includes("seattle"),
+		`Recall does not mention "seattle". Got: ${recallResult.textOutput.slice(0, 300)}`,
+	);
 	assert(recallText.includes("tea"), `Recall does not mention "tea". Got: ${recallResult.textOutput.slice(0, 300)}`);
 }
 
@@ -286,7 +295,7 @@ function testScratchpadCycle() {
 
 	// Add an item
 	const addResult = runPi(
-		"Use the scratchpad tool with action \"add\" and text \"Fix the login bug\". Just call the tool.",
+		'Use the scratchpad tool with action "add" and text "Fix the login bug". Just call the tool.',
 	);
 	assert(addResult.exitCode === 0, `pi (add) exited with code ${addResult.exitCode}`);
 
@@ -301,18 +310,14 @@ function testScratchpadCycle() {
 	assert(afterAdd.includes("[ ]"), "Item should be unchecked");
 
 	// Mark done
-	const doneResult = runPi(
-		"Use the scratchpad tool with action \"done\" and text \"login bug\". Just call the tool.",
-	);
+	const doneResult = runPi('Use the scratchpad tool with action "done" and text "login bug". Just call the tool.');
 	assert(doneResult.exitCode === 0, `pi (done) exited with code ${doneResult.exitCode}`);
 
 	const afterDone = fs.readFileSync(SCRATCHPAD_FILE, "utf-8");
 	assert(afterDone.includes("[x]"), "Item should be checked after done");
 
 	// List
-	const listResult = runPi(
-		"Use the scratchpad tool with action \"list\". Report what items you see.",
-	);
+	const listResult = runPi('Use the scratchpad tool with action "list". Report what items you see.');
 	assert(listResult.exitCode === 0, `pi (list) exited with code ${listResult.exitCode}`);
 	assert(
 		listResult.textOutput.toLowerCase().includes("login bug"),
@@ -329,13 +334,11 @@ function testDailyLog() {
 	if (fs.existsSync(dailyFile)) fs.unlinkSync(dailyFile);
 
 	const result = runPi(
-		"Use the memory_write tool with target \"daily\" and content \"Worked on pi-memory extension today\". Just call the tool.",
+		'Use the memory_write tool with target "daily" and content "Worked on pi-memory extension today". Just call the tool.',
 	);
 	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
 
-	const toolCalls = result.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
-	);
+	const toolCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_write");
 	assert(toolCalls.length > 0, "memory_write tool was not called for daily log");
 
 	assert(fs.existsSync(dailyFile), `Daily log file not created: ${dailyFile}`);
@@ -345,19 +348,15 @@ function testDailyLog() {
 
 function testMemorySearchGraceful() {
 	const result = runPi(
-		"Use the memory_search tool with query \"test query\" and mode \"keyword\". Report what the tool returns.",
+		'Use the memory_search tool with query "test query" and mode "keyword". Report what the tool returns.',
 	);
 	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
 
-	const searchCalls = result.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
-	);
+	const searchCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_search");
 	assert(searchCalls.length > 0, "memory_search tool was not called");
 
 	// Tool should complete (not crash) — either with results or a helpful error
-	const toolEnds = result.events.filter(
-		(e) => e.type === "tool_execution_end" && e.toolName === "memory_search",
-	);
+	const toolEnds = result.events.filter((e) => e.type === "tool_execution_end" && e.toolName === "memory_search");
 	assert(toolEnds.length > 0, "memory_search tool execution did not complete");
 }
 
@@ -453,7 +452,7 @@ function testTagsInSearch() {
 
 	// Search by tag
 	const tagResult = runPi(
-		"Use the memory_search tool with query \"#preference\" and mode \"keyword\". Report what the tool returns.",
+		'Use the memory_search tool with query "#preference" and mode "keyword". Report what the tool returns.',
 	);
 	assert(tagResult.exitCode === 0, `pi (tag search) exited with code ${tagResult.exitCode}`);
 	assert(
@@ -463,7 +462,7 @@ function testTagsInSearch() {
 
 	// Search by wiki-link text
 	const linkResult = runPi(
-		"Use the memory_search tool with query \"editor-choice\" and mode \"keyword\". Report what the tool returns.",
+		'Use the memory_search tool with query "editor-choice" and mode "keyword". Report what the tool returns.',
 	);
 	assert(linkResult.exitCode === 0, `pi (link search) exited with code ${linkResult.exitCode}`);
 	assert(

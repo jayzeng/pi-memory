@@ -63,11 +63,13 @@ const CORPUS: MemoryEntry[] = [
 	// Long-term: decisions and preferences
 	{
 		target: "long_term",
-		content: "#decision [[database-choice]] Chose PostgreSQL for all backend services. Evaluated MySQL and MongoDB but PostgreSQL won for JSON support and reliability.",
+		content:
+			"#decision [[database-choice]] Chose PostgreSQL for all backend services. Evaluated MySQL and MongoDB but PostgreSQL won for JSON support and reliability.",
 	},
 	{
 		target: "long_term",
-		content: "#decision [[auth-strategy]] Using JWT tokens with refresh rotation. Access tokens expire in 15 minutes, refresh tokens in 7 days.",
+		content:
+			"#decision [[auth-strategy]] Using JWT tokens with refresh rotation. Access tokens expire in 15 minutes, refresh tokens in 7 days.",
 	},
 	{
 		target: "long_term",
@@ -75,39 +77,48 @@ const CORPUS: MemoryEntry[] = [
 	},
 	{
 		target: "long_term",
-		content: "#decision [[deployment]] Deploying to Fly.io for production. Staging runs on Railway. Considered Render but latency was worse.",
+		content:
+			"#decision [[deployment]] Deploying to Fly.io for production. Staging runs on Railway. Considered Render but latency was worse.",
 	},
 	{
 		target: "long_term",
-		content: "#preference [[language]] Primary language is TypeScript. Uses Bun as runtime, not Node. Avoids Python for backend work.",
+		content:
+			"#preference [[language]] Primary language is TypeScript. Uses Bun as runtime, not Node. Avoids Python for backend work.",
 	},
 	{
 		target: "long_term",
-		content: "#decision [[css-framework]] Using Tailwind CSS v4. No component library — building custom components. Rejected shadcn for this project.",
+		content:
+			"#decision [[css-framework]] Using Tailwind CSS v4. No component library — building custom components. Rejected shadcn for this project.",
 	},
 	{
 		target: "long_term",
-		content: "#lesson [[api-versioning]] API versioning via URL prefix (/v1/, /v2/) not headers. Learned this after header-based versioning caused CDN cache issues.",
+		content:
+			"#lesson [[api-versioning]] API versioning via URL prefix (/v1/, /v2/) not headers. Learned this after header-based versioning caused CDN cache issues.",
 	},
 	{
 		target: "long_term",
-		content: "#preference [[testing]] Prefers integration tests over unit tests. Uses Playwright for e2e. Vitest for unit/integration when needed.",
+		content:
+			"#preference [[testing]] Prefers integration tests over unit tests. Uses Playwright for e2e. Vitest for unit/integration when needed.",
 	},
 	{
 		target: "long_term",
-		content: "#decision [[state-management]] Using Zustand for client state. No Redux. Server state via TanStack Query.",
+		content:
+			"#decision [[state-management]] Using Zustand for client state. No Redux. Server state via TanStack Query.",
 	},
 	{
 		target: "long_term",
-		content: "#preference [[git-workflow]] Uses trunk-based development. Short-lived feature branches, squash merges to main. No release branches.",
+		content:
+			"#preference [[git-workflow]] Uses trunk-based development. Short-lived feature branches, squash merges to main. No release branches.",
 	},
 	{
 		target: "long_term",
-		content: "#decision [[email-provider]] SendGrid for transactional email. Resend was considered but SendGrid had better deliverability in testing.",
+		content:
+			"#decision [[email-provider]] SendGrid for transactional email. Resend was considered but SendGrid had better deliverability in testing.",
 	},
 	{
 		target: "long_term",
-		content: "#lesson [[caching]] Redis for session cache and rate limiting. Tried in-memory caching first but it didn't survive deploys on Fly.io.",
+		content:
+			"#lesson [[caching]] Redis for session cache and rate limiting. Tried in-memory caching first but it didn't survive deploys on Fly.io.",
 	},
 	{
 		target: "long_term",
@@ -115,65 +126,77 @@ const CORPUS: MemoryEntry[] = [
 	},
 	{
 		target: "long_term",
-		content: "#decision [[monitoring]] Using Grafana Cloud for metrics and Sentry for error tracking. PagerDuty for on-call alerts.",
+		content:
+			"#decision [[monitoring]] Using Grafana Cloud for metrics and Sentry for error tracking. PagerDuty for on-call alerts.",
 	},
 	{
 		target: "long_term",
-		content: "#decision [[file-storage]] S3-compatible storage via Cloudflare R2. Cheaper than AWS S3 for egress. Images served through Cloudflare CDN.",
+		content:
+			"#decision [[file-storage]] S3-compatible storage via Cloudflare R2. Cheaper than AWS S3 for egress. Images served through Cloudflare CDN.",
 	},
 
 	// Daily logs — recent
 	{
 		target: "daily",
 		date: todayStr(),
-		content: "## Morning standup\nWorking on user profile page redesign. Need to add avatar upload using R2 bucket.\n\n## Afternoon\nFixed a bug where JWT refresh tokens weren't being rotated on mobile clients.",
+		content:
+			"## Morning standup\nWorking on user profile page redesign. Need to add avatar upload using R2 bucket.\n\n## Afternoon\nFixed a bug where JWT refresh tokens weren't being rotated on mobile clients.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(1),
-		content: "## Tasks completed\n- Migrated email templates from Handlebars to React Email\n- Updated SendGrid integration to use new API key\n- Reviewed PR #87: rate limiting middleware\n\n## Notes\nDiscovered that Playwright tests are flaky on CI — need to add retry logic.",
+		content:
+			"## Tasks completed\n- Migrated email templates from Handlebars to React Email\n- Updated SendGrid integration to use new API key\n- Reviewed PR #87: rate limiting middleware\n\n## Notes\nDiscovered that Playwright tests are flaky on CI — need to add retry logic.",
 	},
 
 	// Daily logs — older (won't be in default injection)
 	{
 		target: "daily",
 		date: daysAgo(3),
-		content: "## Database migration\nAdded full-text search index on posts table using PostgreSQL tsvector. Performance improved 10x for search queries.",
+		content:
+			"## Database migration\nAdded full-text search index on posts table using PostgreSQL tsvector. Performance improved 10x for search queries.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(5),
-		content: "## DevOps\nSet up GitHub Actions CI pipeline. Runs Vitest + Playwright on every PR. Deploy to staging on merge to main via Fly.io CLI.",
+		content:
+			"## DevOps\nSet up GitHub Actions CI pipeline. Runs Vitest + Playwright on every PR. Deploy to staging on merge to main via Fly.io CLI.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(7),
-		content: "## Auth refactor\nMoved from cookie-based sessions to JWT. Had to update all API middleware. CORS config changed for the mobile app.",
+		content:
+			"## Auth refactor\nMoved from cookie-based sessions to JWT. Had to update all API middleware. CORS config changed for the mobile app.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(10),
-		content: "## Performance tuning\nAdded Redis caching layer for frequently accessed user profiles. Cache TTL set to 5 minutes. Reduced p95 latency from 400ms to 50ms.",
+		content:
+			"## Performance tuning\nAdded Redis caching layer for frequently accessed user profiles. Cache TTL set to 5 minutes. Reduced p95 latency from 400ms to 50ms.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(14),
-		content: "## Initial deployment\nFirst deploy to Fly.io. Set up 2 machines in IAD region. Added health check endpoint at /api/health. Configured auto-scaling 1-3 instances.",
+		content:
+			"## Initial deployment\nFirst deploy to Fly.io. Set up 2 machines in IAD region. Added health check endpoint at /api/health. Configured auto-scaling 1-3 instances.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(20),
-		content: "## Project kickoff\nStarted the project with Bun + Hono for the API server. Chose Drizzle ORM for type-safe database access with PostgreSQL.",
+		content:
+			"## Project kickoff\nStarted the project with Bun + Hono for the API server. Chose Drizzle ORM for type-safe database access with PostgreSQL.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(25),
-		content: "## Research\nEvaluated ORMs: Prisma vs Drizzle vs Kysely. Drizzle won — lighter weight, better TypeScript inference, works well with Bun.",
+		content:
+			"## Research\nEvaluated ORMs: Prisma vs Drizzle vs Kysely. Drizzle won — lighter weight, better TypeScript inference, works well with Bun.",
 	},
 	{
 		target: "daily",
 		date: daysAgo(30),
-		content: "## Architecture planning\nDecided on monorepo structure: /apps/web (Next.js), /apps/api (Hono), /packages/shared (types + utils). Using Turborepo for builds.",
+		content:
+			"## Architecture planning\nDecided on monorepo structure: /apps/web (Next.js), /apps/api (Hono), /packages/shared (types + utils). Using Turborepo for builds.",
 	},
 ];
 
@@ -387,9 +410,7 @@ function seedCorpus() {
 
 	// Build MEMORY.md from all long_term entries
 	const longTermEntries = CORPUS.filter((e) => e.target === "long_term");
-	const memoryContent = longTermEntries
-		.map((e, i) => `<!-- entry-${i} -->\n${e.content}`)
-		.join("\n\n");
+	const memoryContent = longTermEntries.map((e, i) => `<!-- entry-${i} -->\n${e.content}`).join("\n\n");
 	fs.writeFileSync(MEMORY_FILE, memoryContent, "utf-8");
 
 	// Write daily logs
@@ -467,12 +488,29 @@ function runEvalRound(): QuestionResult[] {
 
 function printResults(allRuns: QuestionResult[][]) {
 	// Aggregate across runs (majority vote)
-	const aggregated: Record<string, { topic: string; source: string; hitsA: number; hitsB: number; runsA: number; runsB: number }> = {};
+	const aggregated: Record<
+		string,
+		{
+			topic: string;
+			source: string;
+			hitsA: number;
+			hitsB: number;
+			runsA: number;
+			runsB: number;
+		}
+	> = {};
 
 	for (const run of allRuns) {
 		for (const r of run) {
 			if (!aggregated[r.questionId]) {
-				aggregated[r.questionId] = { topic: r.topic, source: r.source, hitsA: 0, hitsB: 0, runsA: 0, runsB: 0 };
+				aggregated[r.questionId] = {
+					topic: r.topic,
+					source: r.source,
+					hitsA: 0,
+					hitsB: 0,
+					runsA: 0,
+					runsB: 0,
+				};
 			}
 			aggregated[r.questionId].runsA++;
 			aggregated[r.questionId].runsB++;
@@ -481,7 +519,7 @@ function printResults(allRuns: QuestionResult[][]) {
 		}
 	}
 
-	console.log("\n\x1b[1m" + "=".repeat(80) + "\x1b[0m");
+	console.log(`\n\x1b[1m${"=".repeat(80)}\x1b[0m`);
 	console.log("\x1b[1mRecall Effectiveness Results\x1b[0m");
 	console.log("=".repeat(80));
 	console.log("");
@@ -502,7 +540,12 @@ function printResults(allRuns: QuestionResult[][]) {
 		const rateA = data.hitsA / data.runsA;
 		const rateB = data.hitsB / data.runsB;
 		const delta = rateA - rateB;
-		const deltaStr = delta > 0 ? `\x1b[32m+${(delta * 100).toFixed(0)}%\x1b[0m` : delta < 0 ? `\x1b[31m${(delta * 100).toFixed(0)}%\x1b[0m` : "0%";
+		const deltaStr =
+			delta > 0
+				? `\x1b[32m+${(delta * 100).toFixed(0)}%\x1b[0m`
+				: delta < 0
+					? `\x1b[31m${(delta * 100).toFixed(0)}%\x1b[0m`
+					: "0%";
 
 		console.log(
 			`${pad(id, 18)} ${pad(data.source, 14)} ${pad(`${data.hitsA}/${data.runsA}`, 14)} ${pad(`${data.hitsB}/${data.runsB}`, 14)} ${deltaStr}`,
@@ -520,7 +563,7 @@ function printResults(allRuns: QuestionResult[][]) {
 
 	console.log("-".repeat(70));
 	console.log(
-		`${pad("TOTAL", 18)} ${pad("", 14)} ${pad(`${totalA}/${totalRuns}`, 14)} ${pad(`${totalB}/${totalRuns}`, 14)} ${totalA > totalB ? "\x1b[32m" : ""}${((totalA - totalB) / totalRuns * 100).toFixed(0)}%\x1b[0m`,
+		`${pad("TOTAL", 18)} ${pad("", 14)} ${pad(`${totalA}/${totalRuns}`, 14)} ${pad(`${totalB}/${totalRuns}`, 14)} ${totalA > totalB ? "\x1b[32m" : ""}${(((totalA - totalB) / totalRuns) * 100).toFixed(0)}%\x1b[0m`,
 	);
 
 	console.log("\n\x1b[1mBy source:\x1b[0m");
@@ -547,10 +590,11 @@ function main() {
 	// Preflight: check pi
 	process.stdout.write("Checking pi CLI ... ");
 	try {
-		const result = execSync(
-			`echo "say OK" | pi -p --mode text -e "${EXTENSION_PATH}" --no-session`,
-			{ timeout: 60_000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-		);
+		const result = execSync(`echo "say OK" | pi -p --mode text -e "${EXTENSION_PATH}" --no-session`, {
+			timeout: 60_000,
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+		});
 		if (!result.includes("OK")) throw new Error("pi did not respond");
 		console.log("\x1b[32mOK\x1b[0m");
 	} catch {

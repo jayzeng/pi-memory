@@ -6,24 +6,21 @@
  */
 
 import * as fs from "node:fs";
-import * as path from "node:path";
 import * as os from "node:os";
-
-import {
-	_setBaseDir,
-	_resetBaseDir,
-	_setQmdAvailable,
+import * as path from "node:path";
+import registerExtension, {
 	_clearUpdateTimer,
+	_resetBaseDir,
+	_setBaseDir,
+	_setQmdAvailable,
 	buildMemoryContext,
-	searchRelevantMemories,
-	parseScratchpad,
-	serializeScratchpad,
 	ensureDirs,
+	parseScratchpad,
+	searchRelevantMemories,
+	serializeScratchpad,
 	todayStr,
 	yesterdayStr,
 } from "../index.ts";
-
-import registerExtension from "../index.ts";
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -68,12 +65,12 @@ function teardown() {
 
 // Mock ExtensionAPI — captures registered handlers and tools
 function createMockPi() {
-	const handlers: Record<string, Function> = {};
+	const handlers: Record<string, (...args: unknown[]) => unknown> = {};
 	const tools: Record<string, any> = {};
 	return {
 		handlers,
 		tools,
-		on(event: string, handler: Function) {
+		on(event: string, handler: (...args: unknown[]) => unknown) {
 			handlers[event] = handler;
 		},
 		registerTool(config: any) {
@@ -125,10 +122,7 @@ function testBuildContextPriorityOrder() {
 		const yesterday = yesterdayStr();
 
 		writeFile("MEMORY.md", "Long-term memory content");
-		writeFile(
-			"SCRATCHPAD.md",
-			"# Scratchpad\n\n<!-- ts -->\n- [ ] Open task alpha\n",
-		);
+		writeFile("SCRATCHPAD.md", "# Scratchpad\n\n<!-- ts -->\n- [ ] Open task alpha\n");
 		writeFile(`daily/${today}.md`, "Today's daily log content");
 		writeFile(`daily/${yesterday}.md`, "Yesterday's daily log content");
 
@@ -236,14 +230,11 @@ function testBuildContextYesterdayLowestPriority() {
 		const yesterday = yesterdayStr();
 
 		writeFile("MEMORY.md", "M".repeat(5_000));
-		writeFile(
-			"SCRATCHPAD.md",
-			"# Scratchpad\n\n<!-- ts -->\n- [ ] " + "S".repeat(2_000) + "\n",
-		);
+		writeFile("SCRATCHPAD.md", `# Scratchpad\n\n<!-- ts -->\n- [ ] ${"S".repeat(2_000)}\n`);
 		writeFile(`daily/${today}.md`, "T".repeat(3_500));
-		writeFile(`daily/${yesterday}.md`, "YESTERDAY_UNIQUE_MARKER " + "Y".repeat(3_500));
+		writeFile(`daily/${yesterday}.md`, `YESTERDAY_UNIQUE_MARKER ${"Y".repeat(3_500)}`);
 
-		const ctx = buildMemoryContext("SEARCH_UNIQUE_MARKER " + "R".repeat(2_500));
+		const ctx = buildMemoryContext(`SEARCH_UNIQUE_MARKER ${"R".repeat(2_500)}`);
 
 		// With all sources filled near their limits, total will exceed 16K.
 		// Since overall truncation uses mode "start" (keeps the beginning),
@@ -328,14 +319,11 @@ async function testHandoffCapturesScratchpadAndDaily() {
 				"- [ ] Review PR #42",
 			].join("\n"),
 		);
-		writeFile(
-			`daily/${today}.md`,
-			"## Morning\nWorked on auth system\n\n## Afternoon\nFixed deployment pipeline",
-		);
+		writeFile(`daily/${today}.md`, "## Morning\nWorked on auth system\n\n## Afternoon\nFixed deployment pipeline");
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx());
+		await pi.handlers.session_before_compact({}, mockCtx());
 
 		const content = readFile(`daily/${today}.md`);
 
@@ -362,7 +350,7 @@ async function testHandoffSkipsWhenNoContext() {
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx());
+		await pi.handlers.session_before_compact({}, mockCtx());
 
 		// Daily file should not have been created
 		assert(!fileExists(`daily/${today}.md`), "Should not create daily file when no context");
@@ -380,7 +368,7 @@ async function testHandoffOnlyDaily() {
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx());
+		await pi.handlers.session_before_compact({}, mockCtx());
 
 		const content = readFile(`daily/${today}.md`);
 		assert(content.includes("HANDOFF"), "Should have handoff with just daily log");
@@ -395,15 +383,12 @@ async function testHandoffOnlyScratchpad() {
 	setup();
 	try {
 		const today = todayStr();
-		writeFile(
-			"SCRATCHPAD.md",
-			"# Scratchpad\n\n<!-- ts -->\n- [ ] Important task\n",
-		);
+		writeFile("SCRATCHPAD.md", "# Scratchpad\n\n<!-- ts -->\n- [ ] Important task\n");
 		// No daily log
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx());
+		await pi.handlers.session_before_compact({}, mockCtx());
 
 		const content = readFile(`daily/${today}.md`);
 		assert(content.includes("HANDOFF"), "Should have handoff with just scratchpad");
@@ -423,7 +408,7 @@ async function testHandoffPreservesExistingDailyContent() {
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx());
+		await pi.handlers.session_before_compact({}, mockCtx());
 
 		const content = readFile(`daily/${today}.md`);
 		assert(content.startsWith(originalContent), "Should preserve original daily log content at start");
@@ -441,7 +426,7 @@ async function testHandoffIncludesSessionId() {
 
 		const pi = createMockPi();
 		registerExtension(pi as any);
-		await pi.handlers["session_before_compact"]({}, mockCtx("deadbeef99887766"));
+		await pi.handlers.session_before_compact({}, mockCtx("deadbeef99887766"));
 
 		const content = readFile(`daily/${today}.md`);
 		assert(content.includes("[deadbeef]"), "Should include short session ID in handoff marker");
