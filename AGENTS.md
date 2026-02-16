@@ -20,6 +20,8 @@ Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `S
 - `pi -p -e ./index.ts "remember: I prefer dark mode"`: manual local run (print mode)
 - `pi install .` (or from the parent folder: `pi install ./pi-memory`): install the extension into pi
 - `bun test/e2e.ts` (or `npx tsx test/e2e.ts`): run E2E tests (requires `pi` on PATH + a configured API key)
+- `npm run build`: typecheck with `tsc` (`--noEmit`)
+- `npm run lint`: lint with ESLint
 - Optional (for `memory_search`, requires Bun): `command -v qmd >/dev/null 2>&1 || bun install -g https://github.com/tobi/qmd`
 - Optional search setup: `qmd collection add ~/.pi/agent/memory --name pi-memory && qmd embed`
 
@@ -36,7 +38,7 @@ Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `S
 
 ## Commit & Pull Request Guidelines
 
-- No established Git history yet—use Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`) and keep messages imperative.
+- Use Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`) and keep messages imperative.
 - PRs: include a short summary, exact test command(s) run, and call out any changes to on-disk memory formats or `qmd` behavior.
 
 ## Security & Configuration Tips

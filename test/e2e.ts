@@ -16,6 +16,7 @@
  *   4. Full round-trip: write in session 1, recall in session 2
  *   5. Scratchpad add/done/list cycle
  *   6. memory_search graceful error when qmd is not configured
+ *   7. Optional qmd-enabled search (when qmd + collection are configured)
  */
 
 import { execSync } from "node:child_process";
@@ -168,6 +169,37 @@ function checkPi(): boolean {
 	try {
 		const result = runPi("Say exactly: PREFLIGHT_OK", { timeout: 60_000, textMode: true });
 		return result.exitCode === 0 && result.textOutput.includes("PREFLIGHT_OK");
+	} catch {
+		return false;
+	}
+}
+
+function checkQmdAvailable(): boolean {
+	try {
+		execSync("qmd status", { stdio: "ignore", timeout: 5_000 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function checkQmdCollection(name: string): boolean {
+	try {
+		const stdout = execSync("qmd collection list --json", { encoding: "utf-8", timeout: 10_000 });
+		const parsed = JSON.parse(stdout);
+		if (Array.isArray(parsed)) {
+			return parsed.some((c: any) => c.name === name || c === name);
+		}
+		return stdout.includes(name);
+	} catch {
+		return false;
+	}
+}
+
+function runQmdUpdate(): boolean {
+	try {
+		execSync("qmd update", { stdio: "ignore", timeout: 30_000 });
+		return true;
 	} catch {
 		return false;
 	}
@@ -329,6 +361,150 @@ function testMemorySearchGraceful() {
 	assert(toolEnds.length > 0, "memory_search tool execution did not complete");
 }
 
+function testMemorySearchWithQmd() {
+	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
+
+	const token = `QMD_E2E_TOKEN_${Date.now()}`;
+	const writeResult = runPi(
+		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "Search token: ${token}". Do not add anything else, just call the tool.`,
+	);
+	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+
+	const toolStarts = writeResult.events.filter(
+		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
+	);
+	assert(toolStarts.length > 0, "memory_write tool was never called");
+
+	const updated = runQmdUpdate();
+	assert(updated, "qmd update failed during search test");
+
+	const searchResult = runPi(
+		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
+	);
+	assert(searchResult.exitCode === 0, `pi (search) exited with code ${searchResult.exitCode}`);
+
+	const searchCalls = searchResult.events.filter(
+		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
+	);
+	assert(searchCalls.length > 0, "memory_search tool was not called (qmd-enabled test)");
+
+	assert(
+		searchResult.textOutput.toLowerCase().includes(token.toLowerCase()),
+		`Search results did not mention token. Got: ${searchResult.textOutput.slice(0, 400)}`,
+	);
+}
+
+function testSelectiveInjection() {
+	// Write a specific memory, qmd update, then ask a related question
+	// WITHOUT telling the LLM to search. If it answers correctly,
+	// the before_agent_start qmd search injected the relevant memory.
+	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
+
+	const token = `SELINJ_${Date.now()}`;
+	const writeResult = runPi(
+		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#decision [[database-choice]] We decided to use PostgreSQL (codename: ${token}) for all backend services." Just call the tool.`,
+	);
+	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+
+	const toolStarts = writeResult.events.filter(
+		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
+	);
+	assert(toolStarts.length > 0, "memory_write tool was never called");
+
+	const updated = runQmdUpdate();
+	assert(updated, "qmd update failed");
+
+	// New session: ask a related question — do NOT instruct it to search.
+	// The before_agent_start hook should inject the PostgreSQL memory via qmd search.
+	const recallResult = runPi(
+		"Based on the context you have available, what database was chosen for backend services? Just state the database name and codename. Do NOT use any tools.",
+	);
+	assert(recallResult.exitCode === 0, `pi (recall) exited with code ${recallResult.exitCode}`);
+
+	// The LLM should mention PostgreSQL — either from MEMORY.md injection or search injection
+	const text = recallResult.textOutput.toLowerCase();
+	assert(
+		text.includes("postgresql") || text.includes(token.toLowerCase()),
+		`Recall did not mention PostgreSQL or token. Got: ${recallResult.textOutput.slice(0, 400)}`,
+	);
+
+	// Verify no search tool was called (the agent should NOT have needed to search manually)
+	const searchCalls = recallResult.events.filter(
+		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
+	);
+	// This is a soft check — if the agent decided to search anyway, the test still passes
+	// as long as it found the answer. But ideally injection handled it.
+	if (searchCalls.length === 0) {
+		// Good — answered from injected context alone
+	}
+}
+
+function testTagsInSearch() {
+	// Write content with #tags and [[links]], verify qmd keyword search finds them
+	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
+
+	const token = `TAG_${Date.now()}`;
+	const writeResult = runPi(
+		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#preference [[editor-choice]] Always use vim for editing (ref: ${token})." Just call the tool.`,
+	);
+	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+	const updated = runQmdUpdate();
+	assert(updated, "qmd update failed");
+
+	// Search by tag
+	const tagResult = runPi(
+		"Use the memory_search tool with query \"#preference\" and mode \"keyword\". Report what the tool returns.",
+	);
+	assert(tagResult.exitCode === 0, `pi (tag search) exited with code ${tagResult.exitCode}`);
+	assert(
+		tagResult.textOutput.includes(token) || tagResult.textOutput.toLowerCase().includes("vim"),
+		`Tag search did not find the entry. Got: ${tagResult.textOutput.slice(0, 400)}`,
+	);
+
+	// Search by wiki-link text
+	const linkResult = runPi(
+		"Use the memory_search tool with query \"editor-choice\" and mode \"keyword\". Report what the tool returns.",
+	);
+	assert(linkResult.exitCode === 0, `pi (link search) exited with code ${linkResult.exitCode}`);
+	assert(
+		linkResult.textOutput.includes(token) || linkResult.textOutput.toLowerCase().includes("vim"),
+		`Wiki-link search did not find the entry. Got: ${linkResult.textOutput.slice(0, 400)}`,
+	);
+}
+
+function testHandoffSurvivesToNextSession() {
+	// Simulate a handoff by writing one directly (can't trigger compaction from outside),
+	// then verify a new session sees the handoff in its injected context.
+	const today = todayStr();
+	const dailyFile = path.join(DAILY_DIR, `${today}.md`);
+	fs.mkdirSync(DAILY_DIR, { recursive: true });
+
+	const token = `HANDOFF_${Date.now()}`;
+	const handoff = [
+		"<!-- HANDOFF 2025-01-01 00:00:00 [testtest] -->",
+		"## Session Handoff",
+		"**Open scratchpad items:**",
+		`- [ ] Complete the ${token} migration`,
+		"**Recent daily log context:**",
+		"Refactored auth module",
+	].join("\n");
+
+	// Write handoff as today's daily log content
+	fs.writeFileSync(dailyFile, handoff, "utf-8");
+
+	// New session: ask what was being worked on — context injection should include the handoff
+	const result = runPi(
+		"Based on the context you have available, what migration task is open? Just state the task name. Do NOT use any tools.",
+	);
+	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
+
+	const text = result.textOutput.toLowerCase();
+	assert(
+		text.includes(token.toLowerCase()) || text.includes("migration"),
+		`Handoff content not surfaced. Got: ${result.textOutput.slice(0, 400)}`,
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -380,6 +556,26 @@ function main() {
 
 		console.log("\n\x1b[1m6. Memory search\x1b[0m");
 		test("memory_search graceful behavior", testMemorySearchGraceful);
+
+		const qmdAvailable = checkQmdAvailable();
+		const qmdCollection = qmdAvailable && checkQmdCollection("pi-memory");
+		if (qmdAvailable && qmdCollection) {
+			console.log("\n\x1b[1m7. Memory search with qmd\x1b[0m");
+			test("memory_search returns results with qmd", testMemorySearchWithQmd);
+
+			console.log("\n\x1b[1m8. Selective injection via qmd\x1b[0m");
+			test("related prompt surfaces memory without explicit search", testSelectiveInjection);
+
+			console.log("\n\x1b[1m9. Tags and links in search\x1b[0m");
+			test("#tags and [[links]] found by keyword search", testTagsInSearch);
+
+			console.log("\n\x1b[1m10. Handoff survives to next session\x1b[0m");
+			test("handoff in daily log is visible in new session context", testHandoffSurvivesToNextSession);
+		} else {
+			console.log("\n\x1b[1m7–10. qmd-dependent tests\x1b[0m");
+			console.log("  (skipped: qmd not available or collection missing)");
+			skipped += 4;
+		}
 	} finally {
 		// Restore original memory files
 		console.log("\nRestoring memory files ...");

@@ -92,6 +92,157 @@ export function dailyPath(date: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Limits + preview helpers
+// ---------------------------------------------------------------------------
+
+const RESPONSE_PREVIEW_MAX_CHARS = 4_000;
+const RESPONSE_PREVIEW_MAX_LINES = 120;
+
+const CONTEXT_LONG_TERM_MAX_CHARS = 4_000;
+const CONTEXT_LONG_TERM_MAX_LINES = 150;
+const CONTEXT_SCRATCHPAD_MAX_CHARS = 2_000;
+const CONTEXT_SCRATCHPAD_MAX_LINES = 120;
+const CONTEXT_DAILY_MAX_CHARS = 3_000;
+const CONTEXT_DAILY_MAX_LINES = 120;
+const CONTEXT_SEARCH_MAX_CHARS = 2_500;
+const CONTEXT_SEARCH_MAX_LINES = 80;
+const CONTEXT_MAX_CHARS = 16_000;
+
+type TruncateMode = "start" | "end" | "middle";
+
+interface PreviewResult {
+	preview: string;
+	truncated: boolean;
+	totalLines: number;
+	totalChars: number;
+	previewLines: number;
+	previewChars: number;
+}
+
+function normalizeContent(content: string): string {
+	return content.trim();
+}
+
+function truncateLines(lines: string[], maxLines: number, mode: TruncateMode) {
+	if (maxLines <= 0 || lines.length <= maxLines) {
+		return { lines, truncated: false };
+	}
+
+	if (mode === "end") {
+		return { lines: lines.slice(-maxLines), truncated: true };
+	}
+
+	if (mode === "middle" && maxLines > 1) {
+		const marker = "... (truncated) ...";
+		const keep = maxLines - 1;
+		const headCount = Math.ceil(keep / 2);
+		const tailCount = Math.floor(keep / 2);
+		const head = lines.slice(0, headCount);
+		const tail = tailCount > 0 ? lines.slice(-tailCount) : [];
+		return { lines: [...head, marker, ...tail], truncated: true };
+	}
+
+	return { lines: lines.slice(0, maxLines), truncated: true };
+}
+
+function truncateText(text: string, maxChars: number, mode: TruncateMode) {
+	if (maxChars <= 0 || text.length <= maxChars) {
+		return { text, truncated: false };
+	}
+
+	if (mode === "end") {
+		return { text: text.slice(-maxChars), truncated: true };
+	}
+
+	if (mode === "middle" && maxChars > 10) {
+		const marker = "... (truncated) ...";
+		const keep = maxChars - marker.length;
+		if (keep > 0) {
+			const headCount = Math.ceil(keep / 2);
+			const tailCount = Math.floor(keep / 2);
+			return {
+				text: text.slice(0, headCount) + marker + text.slice(text.length - tailCount),
+				truncated: true,
+			};
+		}
+	}
+
+	return { text: text.slice(0, maxChars), truncated: true };
+}
+
+function buildPreview(content: string, options: { maxLines: number; maxChars: number; mode: TruncateMode }): PreviewResult {
+	const normalized = normalizeContent(content);
+	if (!normalized) {
+		return { preview: "", truncated: false, totalLines: 0, totalChars: 0, previewLines: 0, previewChars: 0 };
+	}
+
+	const lines = normalized.split("\n");
+	const totalLines = lines.length;
+	const totalChars = normalized.length;
+
+	const lineResult = truncateLines(lines, options.maxLines, options.mode);
+	const text = lineResult.lines.join("\n");
+	const charResult = truncateText(text, options.maxChars, options.mode);
+	const preview = charResult.text;
+
+	const previewLines = preview ? preview.split("\n").length : 0;
+	const previewChars = preview.length;
+
+	return {
+		preview,
+		truncated: lineResult.truncated || charResult.truncated,
+		totalLines,
+		totalChars,
+		previewLines,
+		previewChars,
+	};
+}
+
+function formatPreviewBlock(label: string, content: string, mode: TruncateMode) {
+	const result = buildPreview(content, {
+		maxLines: RESPONSE_PREVIEW_MAX_LINES,
+		maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+		mode,
+	});
+
+	if (!result.preview) {
+		return `${label}: empty.`;
+	}
+
+	const meta = `${label} (${result.totalLines} lines, ${result.totalChars} chars)`;
+	const note = result.truncated
+		? `\n[preview truncated: showing ${result.previewLines}/${result.totalLines} lines, ${result.previewChars}/${result.totalChars} chars]`
+		: "";
+	return `${meta}\n\n${result.preview}${note}`;
+}
+
+function formatContextSection(label: string, content: string, mode: TruncateMode, maxLines: number, maxChars: number) {
+	const result = buildPreview(content, { maxLines, maxChars, mode });
+	if (!result.preview) {
+		return "";
+	}
+	const note = result.truncated
+		? `\n\n[truncated: showing ${result.previewLines}/${result.totalLines} lines, ${result.previewChars}/${result.totalChars} chars]`
+		: "";
+	return `${label}\n\n${result.preview}${note}`;
+}
+
+function getQmdUpdateMode(): "background" | "manual" | "off" {
+	const mode = (process.env.PI_MEMORY_QMD_UPDATE ?? "background").toLowerCase();
+	if (mode === "manual" || mode === "off" || mode === "background") {
+		return mode;
+	}
+	return "background";
+}
+
+async function ensureQmdAvailableForUpdate(): Promise<boolean> {
+	if (qmdAvailable) return true;
+	if (getQmdUpdateMode() !== "background") return false;
+	qmdAvailable = await detectQmd();
+	return qmdAvailable;
+}
+
+// ---------------------------------------------------------------------------
 // Scratchpad helpers
 // ---------------------------------------------------------------------------
 
@@ -138,20 +289,24 @@ export function serializeScratchpad(items: ScratchpadItem[]): string {
 // Context builder
 // ---------------------------------------------------------------------------
 
-export function buildMemoryContext(): string {
+export function buildMemoryContext(searchResults?: string): string {
 	ensureDirs();
+	// Priority order: scratchpad > today's daily > search results > MEMORY.md > yesterday's daily
 	const sections: string[] = [];
-
-	const longTerm = readFileSafe(MEMORY_FILE);
-	if (longTerm?.trim()) {
-		sections.push(`## MEMORY.md (long-term)\n\n${longTerm.trim()}`);
-	}
 
 	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
 	if (scratchpad?.trim()) {
 		const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
 		if (openItems.length > 0) {
-			sections.push(`## SCRATCHPAD.md (working context)\n\n${serializeScratchpad(openItems)}`);
+			const serialized = serializeScratchpad(openItems);
+			const section = formatContextSection(
+				"## SCRATCHPAD.md (working context)",
+				serialized,
+				"start",
+				CONTEXT_SCRATCHPAD_MAX_LINES,
+				CONTEXT_SCRATCHPAD_MAX_CHARS,
+			);
+			if (section) sections.push(section);
 		}
 	}
 
@@ -160,19 +315,69 @@ export function buildMemoryContext(): string {
 
 	const todayContent = readFileSafe(dailyPath(today));
 	if (todayContent?.trim()) {
-		sections.push(`## Daily log: ${today} (today)\n\n${todayContent.trim()}`);
+		const section = formatContextSection(
+			`## Daily log: ${today} (today)`,
+			todayContent,
+			"end",
+			CONTEXT_DAILY_MAX_LINES,
+			CONTEXT_DAILY_MAX_CHARS,
+		);
+		if (section) sections.push(section);
+	}
+
+	if (searchResults?.trim()) {
+		const section = formatContextSection(
+			"## Relevant memories (auto-retrieved)",
+			searchResults,
+			"start",
+			CONTEXT_SEARCH_MAX_LINES,
+			CONTEXT_SEARCH_MAX_CHARS,
+		);
+		if (section) sections.push(section);
+	}
+
+	const longTerm = readFileSafe(MEMORY_FILE);
+	if (longTerm?.trim()) {
+		const section = formatContextSection(
+			"## MEMORY.md (long-term)",
+			longTerm,
+			"middle",
+			CONTEXT_LONG_TERM_MAX_LINES,
+			CONTEXT_LONG_TERM_MAX_CHARS,
+		);
+		if (section) sections.push(section);
 	}
 
 	const yesterdayContent = readFileSafe(dailyPath(yesterday));
 	if (yesterdayContent?.trim()) {
-		sections.push(`## Daily log: ${yesterday} (yesterday)\n\n${yesterdayContent.trim()}`);
+		const section = formatContextSection(
+			`## Daily log: ${yesterday} (yesterday)`,
+			yesterdayContent,
+			"end",
+			CONTEXT_DAILY_MAX_LINES,
+			CONTEXT_DAILY_MAX_CHARS,
+		);
+		if (section) sections.push(section);
 	}
 
 	if (sections.length === 0) {
 		return "";
 	}
 
-	return `# Memory\n\n${sections.join("\n\n---\n\n")}`;
+	const context = `# Memory\n\n${sections.join("\n\n---\n\n")}`;
+	if (context.length > CONTEXT_MAX_CHARS) {
+		const result = buildPreview(context, {
+			maxLines: Number.POSITIVE_INFINITY,
+			maxChars: CONTEXT_MAX_CHARS,
+			mode: "start",
+		});
+		const note = result.truncated
+			? `\n\n[truncated overall context: showing ${result.previewChars}/${result.totalChars} chars]`
+			: "";
+		return `${result.preview}${note}`;
+	}
+
+	return context;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,14 +426,42 @@ export function qmdInstallInstructions(): string {
 	].join("\n");
 }
 
-export function qmdCollectionInstructions(): string {
-	return [
-		"qmd is installed, but the 'pi-memory' collection is not configured.",
-		"",
-		"Run:",
-		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
-		"  qmd embed",
-	].join("\n");
+/** Auto-create the pi-memory collection and path contexts in qmd. */
+export async function setupQmdCollection(): Promise<boolean> {
+	try {
+		await new Promise<void>((resolve, reject) => {
+			execFile(
+				"qmd",
+				["collection", "add", MEMORY_DIR, "--name", "pi-memory"],
+				{ timeout: 10_000 },
+				(err) => (err ? reject(err) : resolve()),
+			);
+		});
+	} catch {
+		// Collection may already exist under a different name — not critical
+		return false;
+	}
+
+	// Add path contexts (best-effort, ignore errors)
+	const contexts: [string, string][] = [
+		["/daily", "Daily append-only work logs organized by date"],
+		["/", "Curated long-term memory: decisions, preferences, facts, lessons"],
+	];
+	for (const [ctxPath, desc] of contexts) {
+		try {
+			await new Promise<void>((resolve, reject) => {
+				execFile(
+					"qmd",
+					["context", "add", ctxPath, desc, "-c", "pi-memory"],
+					{ timeout: 10_000 },
+					(err) => (err ? reject(err) : resolve()),
+				);
+			});
+		} catch {
+			// Ignore — context may already exist
+		}
+	}
+	return true;
 }
 
 export function detectQmd(): Promise<boolean> {
@@ -264,12 +497,49 @@ export function checkCollection(name: string): Promise<boolean> {
 }
 
 export function scheduleQmdUpdate() {
+	if (getQmdUpdateMode() !== "background") return;
 	if (!qmdAvailable) return;
 	if (updateTimer) clearTimeout(updateTimer);
 	updateTimer = setTimeout(() => {
 		updateTimer = null;
 		execFile("qmd", ["update"], { timeout: 30_000 }, () => {});
 	}, 500);
+}
+
+/** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
+export async function searchRelevantMemories(prompt: string): Promise<string> {
+	if (!qmdAvailable || !prompt.trim()) return "";
+
+	// Sanitize: strip control chars, limit to 200 chars for the search query
+	// eslint-disable-next-line no-control-regex
+	const sanitized = prompt.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
+	if (!sanitized) return "";
+
+	try {
+		const hasCollection = await checkCollection("pi-memory");
+		if (!hasCollection) return "";
+
+		const results = await Promise.race([
+			runQmdSearch("keyword", sanitized, 3),
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 3_000)),
+		]);
+
+		if (!results || results.length === 0) return "";
+
+		const snippets = results
+			.map((r) => {
+				const text = r.content ?? r.chunk ?? "";
+				if (!text.trim()) return null;
+				const filePart = r.path ? `_${r.path}_` : "";
+				return `${filePart}\n${text.trim()}`;
+			})
+			.filter(Boolean);
+
+		if (snippets.length === 0) return "";
+		return snippets.join("\n\n---\n\n");
+	} catch {
+		return "";
+	}
 }
 
 export interface QmdSearchResult {
@@ -311,7 +581,7 @@ export function runQmdSearch(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	// --- session_start: detect qmd, check collection ---
+	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		qmdAvailable = await detectQmd();
 		if (!qmdAvailable) {
@@ -322,8 +592,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection && ctx.hasUI) {
-			ctx.ui.notify(qmdCollectionInstructions(), "info");
+		if (!hasCollection) {
+			await setupQmdCollection();
 		}
 	});
 
@@ -337,7 +607,9 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Inject memory context before every agent turn ---
 	pi.on("before_agent_start", async (event, _ctx) => {
-		const memoryContext = buildMemoryContext();
+		const skipSearch = process.env.PI_MEMORY_NO_SEARCH === "1";
+		const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
+		const memoryContext = buildMemoryContext(searchResults);
 		if (!memoryContext) return;
 
 		const memoryInstructions = [
@@ -347,6 +619,7 @@ export default function (pi: ExtensionAPI) {
 			"- Day-to-day notes and running context \u2192 daily/<YYYY-MM-DD>.md",
 			"- Things to fix later or keep in mind \u2192 scratchpad tool",
 			"- Use memory_search to find past context across all memory files (keyword, semantic, or deep search).",
+			"- Use #tags (e.g. #decision, #preference) and [[links]] (e.g. [[auth-strategy]]) in memory content to improve future search recall.",
 			"- If someone says \"remember this,\" write it immediately.",
 			"",
 			memoryContext,
@@ -357,14 +630,47 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// --- Pre-compaction memory flush ---
+	// --- Pre-compaction: auto-capture session handoff ---
 	pi.on("session_before_compact", async (_event, ctx) => {
-		const memoryContext = buildMemoryContext();
-		const hasMemory = memoryContext.length > 0;
+		ensureDirs();
+		const sid = shortSessionId(ctx.sessionManager.getSessionId());
+		const ts = nowTimestamp();
+		const parts: string[] = [];
 
-		if (hasMemory) {
-			ctx.ui.notify("Memory files available \u2014 consider persisting important context before compaction", "info");
+		// Capture open scratchpad items
+		const scratchpad = readFileSafe(SCRATCHPAD_FILE);
+		if (scratchpad?.trim()) {
+			const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
+			if (openItems.length > 0) {
+				parts.push("**Open scratchpad items:**");
+				for (const item of openItems) {
+					parts.push(`- [ ] ${item.text}`);
+				}
+			}
 		}
+
+		// Capture last few lines from today's daily log
+		const todayContent = readFileSafe(dailyPath(todayStr()));
+		if (todayContent?.trim()) {
+			const lines = todayContent.trim().split("\n");
+			const tail = lines.slice(-15).join("\n");
+			parts.push(`**Recent daily log context:**\n${tail}`);
+		}
+
+		if (parts.length === 0) return;
+
+		const handoff = [
+			`<!-- HANDOFF ${ts} [${sid}] -->`,
+			"## Session Handoff",
+			...parts,
+		].join("\n");
+
+		const filePath = dailyPath(todayStr());
+		const existing = readFileSafe(filePath) ?? "";
+		const separator = existing.trim() ? "\n\n" : "";
+		fs.writeFileSync(filePath, existing + separator + handoff, "utf-8");
+		await ensureQmdAvailableForUpdate();
+		scheduleQmdUpdate();
 	});
 
 	// --- memory_write tool ---
@@ -376,6 +682,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
+			"Use #tags (e.g. #decision, #preference, #lesson, #bug) and [[links]] (e.g. [[auth-strategy]]) in content to improve searchability.",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "daily"] as const, {
@@ -397,34 +704,61 @@ export default function (pi: ExtensionAPI) {
 			if (target === "daily") {
 				const filePath = dailyPath(todayStr());
 				const existing = readFileSafe(filePath) ?? "";
-
-				const existingSnippet = existing.trim()
-					? `\n\nExisting daily log content:\n${existing.trim()}`
+				const existingPreview = buildPreview(existing, {
+					maxLines: RESPONSE_PREVIEW_MAX_LINES,
+					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+					mode: "end",
+				});
+				const existingSnippet = existingPreview.preview
+					? `\n\n${formatPreviewBlock("Existing daily log preview", existing, "end")}`
 					: "\n\nDaily log was empty.";
 
 				const separator = existing.trim() ? "\n\n" : "";
 				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
 				fs.writeFileSync(filePath, existing + separator + stamped, "utf-8");
+				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
 					content: [{ type: "text", text: `Appended to daily log: ${filePath}${existingSnippet}` }],
-					details: { path: filePath, target, mode: "append", sessionId: sid, timestamp: ts },
+					details: {
+						path: filePath,
+						target,
+						mode: "append",
+						sessionId: sid,
+						timestamp: ts,
+						qmdUpdateMode: getQmdUpdateMode(),
+						existingPreview,
+					},
 				};
 			}
 
 			// long_term
 			const existing = readFileSafe(MEMORY_FILE) ?? "";
-			const existingSnippet = existing.trim()
-				? `\n\nExisting MEMORY.md content:\n${existing.trim()}`
+			const existingPreview = buildPreview(existing, {
+				maxLines: RESPONSE_PREVIEW_MAX_LINES,
+				maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+				mode: "middle",
+			});
+			const existingSnippet = existingPreview.preview
+				? `\n\n${formatPreviewBlock("Existing MEMORY.md preview", existing, "middle")}`
 				: "\n\nMEMORY.md was empty.";
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
 				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
+				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
 					content: [{ type: "text", text: `Overwrote MEMORY.md${existingSnippet}` }],
-					details: { path: MEMORY_FILE, target, mode: "overwrite", sessionId: sid, timestamp: ts },
+					details: {
+						path: MEMORY_FILE,
+						target,
+						mode: "overwrite",
+						sessionId: sid,
+						timestamp: ts,
+						qmdUpdateMode: getQmdUpdateMode(),
+						existingPreview,
+					},
 				};
 			}
 
@@ -432,10 +766,19 @@ export default function (pi: ExtensionAPI) {
 			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
 			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
+			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 			return {
 				content: [{ type: "text", text: `Appended to MEMORY.md${existingSnippet}` }],
-				details: { path: MEMORY_FILE, target, mode: "append", sessionId: sid, timestamp: ts },
+				details: {
+					path: MEMORY_FILE,
+					target,
+					mode: "append",
+					sessionId: sid,
+					timestamp: ts,
+					qmdUpdateMode: getQmdUpdateMode(),
+					existingPreview,
+				},
 			};
 		},
 	});
@@ -473,9 +816,19 @@ export default function (pi: ExtensionAPI) {
 				if (items.length === 0) {
 					return { content: [{ type: "text", text: "Scratchpad is empty." }], details: {} };
 				}
+				const serialized = serializeScratchpad(items);
+				const preview = buildPreview(serialized, {
+					maxLines: RESPONSE_PREVIEW_MAX_LINES,
+					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+					mode: "start",
+				});
 				return {
-					content: [{ type: "text", text: serializeScratchpad(items) }],
-					details: { count: items.length, open: items.filter((i) => !i.done).length },
+					content: [{ type: "text", text: formatPreviewBlock("Scratchpad preview", serialized, "start") }],
+					details: {
+						count: items.length,
+						open: items.filter((i) => !i.done).length,
+						preview,
+					},
 				};
 			}
 
@@ -484,11 +837,23 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: "Error: 'text' is required for add." }], details: {} };
 				}
 				items.push({ done: false, text, meta: `<!-- ${ts} [${sid}] -->` });
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				const serialized = serializeScratchpad(items);
+				const preview = buildPreview(serialized, {
+					maxLines: RESPONSE_PREVIEW_MAX_LINES,
+					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+					mode: "start",
+				});
+				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
-					content: [{ type: "text", text: `Added: - [ ] ${text}\n\n${serializeScratchpad(items)}` }],
-					details: { action, sessionId: sid, timestamp: ts },
+					content: [
+						{
+							type: "text",
+							text: `Added: - [ ] ${text}\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}`,
+						},
+					],
+					details: { action, sessionId: sid, timestamp: ts, qmdUpdateMode: getQmdUpdateMode(), preview },
 				};
 			}
 
@@ -512,11 +877,18 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				const serialized = serializeScratchpad(items);
+				const preview = buildPreview(serialized, {
+					maxLines: RESPONSE_PREVIEW_MAX_LINES,
+					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+					mode: "start",
+				});
+				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
-					content: [{ type: "text", text: `Updated.\n\n${serializeScratchpad(items)}` }],
-					details: { action, sessionId: sid, timestamp: ts },
+					content: [{ type: "text", text: `Updated.\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}` }],
+					details: { action, sessionId: sid, timestamp: ts, qmdUpdateMode: getQmdUpdateMode(), preview },
 				};
 			}
 
@@ -524,11 +896,23 @@ export default function (pi: ExtensionAPI) {
 				const before = items.length;
 				items = items.filter((i) => !i.done);
 				const removed = before - items.length;
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				const serialized = serializeScratchpad(items);
+				const preview = buildPreview(serialized, {
+					maxLines: RESPONSE_PREVIEW_MAX_LINES,
+					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+					mode: "start",
+				});
+				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
+				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 				return {
-					content: [{ type: "text", text: `Cleared ${removed} done item(s).\n\n${serializeScratchpad(items)}` }],
-					details: { action, removed },
+					content: [
+						{
+							type: "text",
+							text: `Cleared ${removed} done item(s).\n\n${formatPreviewBlock("Scratchpad preview", serialized, "start")}`,
+						},
+					],
+					details: { action, removed, qmdUpdateMode: getQmdUpdateMode(), preview },
 				};
 			}
 
@@ -617,9 +1001,11 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Search across all memory files (MEMORY.md, SCRATCHPAD.md, daily logs).\n" +
 			"Modes:\n" +
-			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names.\n" +
+			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names, #tags, [[links]].\n" +
 			"- 'semantic' (~2s): Meaning-based search. Finds related concepts even with different wording.\n" +
-			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.",
+			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
+			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
+			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			mode: Type.Optional(
@@ -648,10 +1034,21 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const hasCollection = await checkCollection("pi-memory");
+			let hasCollection = await checkCollection("pi-memory");
+			if (!hasCollection) {
+				const created = await setupQmdCollection();
+				if (created) {
+					hasCollection = true;
+				}
+			}
 			if (!hasCollection) {
 				return {
-					content: [{ type: "text", text: qmdCollectionInstructions() }],
+					content: [
+						{
+							type: "text",
+							text: "Could not set up qmd pi-memory collection. Check that qmd is working and the memory directory exists.",
+						},
+					],
 					isError: true,
 					details: {},
 				};
