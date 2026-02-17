@@ -1,6 +1,6 @@
 {
 	"name": "pi-memory",
-	"version": "0.3.2",
+	"version": "0.3.3",
 	"description": "Pi coding agent extension for memory with qmd-powered semantic search across daily logs, long-term memory, and scratchpad",
 	"main": "index.ts",
 	"type": "module",
