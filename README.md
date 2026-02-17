@@ -27,7 +27,9 @@ cp -r pi-memory ~/.pi/agent/extensions/pi-memory
 
 ### Optional: Enable search with qmd
 
-When qmd is installed, the extension **automatically creates** the `pi-memory` collection and path contexts on first session start. No manual setup needed.
+When qmd is installed, the extension **automatically creates** the `pi-memory` collection and path contexts on first session start.
+
+Note: `memory_search` **semantic**/**deep** modes require vector embeddings. If you see a warning like “need embeddings”, run `qmd embed` once and retry.
 
 If you prefer manual setup:
 
@@ -125,6 +127,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 - **Tool response previews**: Write/scratchpad tools return size-capped previews instead of full file contents.
 - **qmd auto-setup**: On first session start with qmd available, the extension creates the collection and path contexts automatically.
 - **qmd re-indexing**: After every write, a debounced `qmd update` runs in the background (fire-and-forget, non-blocking) unless disabled via `PI_MEMORY_QMD_UPDATE`.
+- **qmd embeddings**: Semantic/deep search needs vector embeddings. If you see “need embeddings” warnings, run `qmd embed` once and retry.
 - **Graceful degradation**: If qmd is not installed, core tools work fine. `memory_search` returns install instructions.
 
 ### Configuration

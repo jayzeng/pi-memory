@@ -11,11 +11,14 @@ import * as path from "node:path";
 import registerExtension, {
 	_clearUpdateTimer,
 	_resetBaseDir,
+	_resetExecFileForTest,
 	_setBaseDir,
+	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
 	ensureDirs,
 	parseScratchpad,
+	runQmdSearch,
 	searchRelevantMemories,
 	serializeScratchpad,
 	todayStr,
@@ -59,6 +62,7 @@ function setup() {
 
 function teardown() {
 	_clearUpdateTimer();
+	_resetExecFileForTest();
 	_resetBaseDir();
 	fs.rmSync(tmpDir, { recursive: true, force: true });
 }
@@ -299,6 +303,179 @@ async function testSearchEmptyForControlCharsOnly() {
 }
 
 // ---------------------------------------------------------------------------
+// qmd JSON parsing + result normalization
+// ---------------------------------------------------------------------------
+
+async function testRunQmdSearchParsesNoResultsString() {
+	setup();
+	try {
+		_setExecFileForTest(((file: string, _args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			cb(null, "No results found.", "");
+		}) as any);
+
+		const { results } = await runQmdSearch("keyword", "nope", 5);
+		assert(Array.isArray(results) && results.length === 0, `Expected 0 results, got ${results.length}`);
+	} finally {
+		teardown();
+	}
+}
+
+async function testRunQmdSearchParsesNoisyJsonArray() {
+	setup();
+	try {
+		const noisyStdout = [
+			"\u001b[?25l⠋ Gathering information",
+			"\u001b[2K\u001b[1A\u001b[2K\u001b[G✔ downloaded",
+			"[",
+			`  ${JSON.stringify({ docid: "#abc123", score: 0.42, file: "qmd://pi-memory/MEMORY.md", snippet: "Hello" })},`,
+			`  ${JSON.stringify({ docid: "#def456", score: 0.1, file: "qmd://pi-memory/daily/2026-02-16.md", snippet: "World" })}`,
+			"]",
+		].join("\n");
+
+		_setExecFileForTest(((file: string, args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			if (args[0] !== "search") return cb(new Error(`Unexpected qmd subcommand: ${args[0]}`), "", "");
+			cb(null, noisyStdout, "");
+		}) as any);
+
+		const { results } = await runQmdSearch("keyword", "hello", 5);
+		assert(results.length === 2, `Expected 2 results, got ${results.length}`);
+		assert(results[0].file === "qmd://pi-memory/MEMORY.md", "Expected file field to be preserved");
+		assert(results[0].snippet === "Hello", "Expected snippet field to be preserved");
+	} finally {
+		teardown();
+	}
+}
+
+async function testRunQmdSearchParsesJsonObjectResults() {
+	setup();
+	try {
+		const objStdout = JSON.stringify(
+			{
+				results: [{ docid: "#abc123", score: 0.9, file: "qmd://pi-memory/MEMORY.md", snippet: "Token: XYZ" }],
+			},
+			null,
+			2,
+		);
+
+		_setExecFileForTest(((file: string, _args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			cb(null, objStdout, "");
+		}) as any);
+
+		const { results } = await runQmdSearch("keyword", "xyz", 5);
+		assert(results.length === 1, `Expected 1 result, got ${results.length}`);
+		assert(results[0].snippet === "Token: XYZ", "Expected object.results parsing");
+	} finally {
+		teardown();
+	}
+}
+
+async function testSearchRelevantMemoriesUsesSnippetAndFileFields() {
+	setup();
+	try {
+		_setQmdAvailable(true);
+		_setExecFileForTest(((file: string, args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			if (args[0] === "collection" && args[1] === "list") {
+				return cb(null, JSON.stringify(["pi-memory"]), "");
+			}
+			if (args[0] === "search") {
+				return cb(
+					null,
+					JSON.stringify([{ file: "qmd://pi-memory/MEMORY.md", snippet: "Search snippet: ABC" }]),
+					"",
+				);
+			}
+			return cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
+		}) as any);
+
+		const result = await searchRelevantMemories("Find ABC");
+		assert(result.includes("Search snippet: ABC"), "Expected snippet text in injected results");
+		assert(result.includes("_qmd://pi-memory/MEMORY.md_"), "Expected file path prefix using qmd 'file' field");
+	} finally {
+		_setQmdAvailable(false);
+		teardown();
+	}
+}
+
+async function testMemorySearchFormatsFileAndSnippet() {
+	setup();
+	try {
+		_setQmdAvailable(true);
+		_setExecFileForTest(((file: string, args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			if (args[0] === "collection" && args[1] === "list") {
+				return cb(null, JSON.stringify(["pi-memory"]), "");
+			}
+			if (args[0] === "search") {
+				return cb(
+					null,
+					JSON.stringify([{ file: "qmd://pi-memory/MEMORY.md", score: 0.5, snippet: "Token: UNIT123" }]),
+					"",
+				);
+			}
+			return cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
+		}) as any);
+
+		const pi = createMockPi();
+		registerExtension(pi as any);
+		const tool = pi.tools.memory_search;
+		const res = await tool.execute(
+			"toolcall",
+			{ query: "UNIT123", mode: "keyword", limit: 5 },
+			null,
+			null,
+			mockCtx(),
+		);
+		const text = res.content?.[0]?.text ?? "";
+		assert(text.includes("qmd://pi-memory/MEMORY.md"), "Expected File line to include qmd path");
+		assert(text.includes("Token: UNIT123"), "Expected snippet content to appear");
+	} finally {
+		_setQmdAvailable(false);
+		teardown();
+	}
+}
+
+async function testMemorySearchSemanticNeedsEmbedHint() {
+	setup();
+	try {
+		_setQmdAvailable(true);
+		_setExecFileForTest(((file: string, args: string[], _opts: any, cb: any) => {
+			if (file !== "qmd") return cb(new Error(`Unexpected command: ${file}`), "", "");
+			if (args[0] === "collection" && args[1] === "list") {
+				return cb(null, JSON.stringify(["pi-memory"]), "");
+			}
+			if (args[0] === "vsearch") {
+				return cb(
+					null,
+					"No results found.",
+					"Warning: 4 documents (100%) need embeddings. Run 'qmd embed' for better results.",
+				);
+			}
+			return cb(new Error(`Unexpected qmd args: ${args.join(" ")}`), "", "");
+		}) as any);
+
+		const pi = createMockPi();
+		registerExtension(pi as any);
+		const tool = pi.tools.memory_search;
+		const res = await tool.execute(
+			"toolcall",
+			{ query: "whatever", mode: "semantic", limit: 5 },
+			null,
+			null,
+			mockCtx(),
+		);
+		const text = res.content?.[0]?.text ?? "";
+		assert(text.toLowerCase().includes("qmd embed"), "Expected guidance to run qmd embed");
+	} finally {
+		_setQmdAvailable(false);
+		teardown();
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Handoff (session_before_compact) tests
 // ---------------------------------------------------------------------------
 
@@ -496,7 +673,18 @@ async function main() {
 	await test("returns empty for empty/whitespace prompt", testSearchEmptyForEmptyPrompt);
 	await test("returns empty for control-chars-only prompt", testSearchEmptyForControlCharsOnly);
 
-	console.log("\n\x1b[1m3. Session handoff (compaction)\x1b[0m");
+	console.log("\n\x1b[1m3. qmd parsing + normalization\x1b[0m");
+	await test('runQmdSearch parses "No results found" output', testRunQmdSearchParsesNoResultsString);
+	await test("runQmdSearch parses noisy JSON output", testRunQmdSearchParsesNoisyJsonArray);
+	await test("runQmdSearch parses JSON object results", testRunQmdSearchParsesJsonObjectResults);
+	await test(
+		"searchRelevantMemories uses qmd file/snippet fields",
+		testSearchRelevantMemoriesUsesSnippetAndFileFields,
+	);
+	await test("memory_search formats file + snippet", testMemorySearchFormatsFileAndSnippet);
+	await test("memory_search semantic suggests qmd embed when needed", testMemorySearchSemanticNeedsEmbedHint);
+
+	console.log("\n\x1b[1m4. Session handoff (compaction)\x1b[0m");
 	await test("captures scratchpad and daily log", testHandoffCapturesScratchpadAndDaily);
 	await test("skips when no context available", testHandoffSkipsWhenNoContext);
 	await test("works with only daily log", testHandoffOnlyDaily);
@@ -504,7 +692,7 @@ async function main() {
 	await test("preserves existing daily content", testHandoffPreservesExistingDailyContent);
 	await test("includes session ID in marker", testHandoffIncludesSessionId);
 
-	console.log("\n\x1b[1m4. Scratchpad parsing\x1b[0m");
+	console.log("\n\x1b[1m5. Scratchpad parsing\x1b[0m");
 	await test("parses mixed open/done items with metadata", testParseScratchpadMixed);
 	await test("serialize → parse roundtrip", testSerializeScratchpadRoundtrip);
 

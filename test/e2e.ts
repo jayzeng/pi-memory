@@ -17,6 +17,7 @@
  *   5. Scratchpad add/done/list cycle
  *   6. memory_search graceful error when qmd is not configured
  *   7. Optional qmd-enabled search (when qmd + collection are configured)
+ *   8. qmd no-results parsing (when qmd + collection are configured)
  */
 
 import { execSync } from "node:child_process";
@@ -64,7 +65,7 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 	const modelArg = PI_E2E_MODEL ? ` --model "${PI_E2E_MODEL}"` : "";
 	const cmd =
 		`echo "${promptB64}" | base64 -d | ` +
-		`pi -p --mode ${mode}${providerArg}${modelArg} -e "${EXTENSION_PATH}" --no-session`;
+		`pi -p --mode ${mode}${providerArg}${modelArg} --no-extensions -e "${EXTENSION_PATH}" --no-session`;
 
 	let stdout: string;
 	let exitCode = 0;
@@ -391,6 +392,34 @@ function testMemorySearchWithQmd() {
 		searchResult.textOutput.toLowerCase().includes(token.toLowerCase()),
 		`Search results did not mention token. Got: ${searchResult.textOutput.slice(0, 400)}`,
 	);
+	assert(
+		searchResult.textOutput.includes("qmd://"),
+		`Search results did not include a qmd file path. Got: ${searchResult.textOutput.slice(0, 400)}`,
+	);
+}
+
+function testMemorySearchNoResultsWithQmd() {
+	const token = `QMD_E2E_NORESULT_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+	const searchResult = runPi(
+		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
+	);
+	assert(searchResult.exitCode === 0, `pi (search) exited with code ${searchResult.exitCode}`);
+
+	const searchCalls = searchResult.events.filter(
+		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
+	);
+	assert(searchCalls.length > 0, "memory_search tool was not called (no-results test)");
+
+	const text = searchResult.textOutput.toLowerCase();
+	assert(
+		text.includes("no results found") && text.includes(token.toLowerCase()),
+		`Expected no-results message mentioning token. Got: ${searchResult.textOutput.slice(0, 400)}`,
+	);
+	assert(
+		!text.includes("failed to parse qmd output") && !text.includes("memory_search error"),
+		`Expected no parse error. Got: ${searchResult.textOutput.slice(0, 400)}`,
+	);
 }
 
 function testSelectiveInjection() {
@@ -562,18 +591,21 @@ function main() {
 			console.log("\n\x1b[1m7. Memory search with qmd\x1b[0m");
 			test("memory_search returns results with qmd", testMemorySearchWithQmd);
 
-			console.log("\n\x1b[1m8. Selective injection via qmd\x1b[0m");
+			console.log("\n\x1b[1m8. Memory search no-results parsing\x1b[0m");
+			test("memory_search handles qmd no-results output", testMemorySearchNoResultsWithQmd);
+
+			console.log("\n\x1b[1m9. Selective injection via qmd\x1b[0m");
 			test("related prompt surfaces memory without explicit search", testSelectiveInjection);
 
-			console.log("\n\x1b[1m9. Tags and links in search\x1b[0m");
+			console.log("\n\x1b[1m10. Tags and links in search\x1b[0m");
 			test("#tags and [[links]] found by keyword search", testTagsInSearch);
 
-			console.log("\n\x1b[1m10. Handoff survives to next session\x1b[0m");
+			console.log("\n\x1b[1m11. Handoff survives to next session\x1b[0m");
 			test("handoff in daily log is visible in new session context", testHandoffSurvivesToNextSession);
 		} else {
-			console.log("\n\x1b[1m7–10. qmd-dependent tests\x1b[0m");
+			console.log("\n\x1b[1m7–11. qmd-dependent tests\x1b[0m");
 			console.log("  (skipped: qmd not available or collection missing)");
-			skipped += 4;
+			skipped += 5;
 		}
 	} finally {
 		// Restore original memory files

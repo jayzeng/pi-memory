@@ -397,8 +397,21 @@ export function buildMemoryContext(searchResults?: string): string {
 // QMD integration
 // ---------------------------------------------------------------------------
 
+type ExecFileFn = typeof execFile;
+let execFileFn: ExecFileFn = execFile;
+
 let qmdAvailable = false;
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Override execFile implementation (for testing). */
+export function _setExecFileForTest(fn: ExecFileFn) {
+	execFileFn = fn;
+}
+
+/** Reset execFile implementation (for testing). */
+export function _resetExecFileForTest() {
+	execFileFn = execFile;
+}
 
 /** Set qmd availability flag (for testing). */
 export function _setQmdAvailable(value: boolean) {
@@ -443,7 +456,7 @@ export function qmdInstallInstructions(): string {
 export async function setupQmdCollection(): Promise<boolean> {
 	try {
 		await new Promise<void>((resolve, reject) => {
-			execFile("qmd", ["collection", "add", MEMORY_DIR, "--name", "pi-memory"], { timeout: 10_000 }, (err) =>
+			execFileFn("qmd", ["collection", "add", MEMORY_DIR, "--name", "pi-memory"], { timeout: 10_000 }, (err) =>
 				err ? reject(err) : resolve(),
 			);
 		});
@@ -460,7 +473,7 @@ export async function setupQmdCollection(): Promise<boolean> {
 	for (const [ctxPath, desc] of contexts) {
 		try {
 			await new Promise<void>((resolve, reject) => {
-				execFile("qmd", ["context", "add", ctxPath, desc, "-c", "pi-memory"], { timeout: 10_000 }, (err) =>
+				execFileFn("qmd", ["context", "add", ctxPath, desc, "-c", "pi-memory"], { timeout: 10_000 }, (err) =>
 					err ? reject(err) : resolve(),
 				);
 			});
@@ -474,7 +487,7 @@ export async function setupQmdCollection(): Promise<boolean> {
 export function detectQmd(): Promise<boolean> {
 	return new Promise((resolve) => {
 		// qmd doesn't reliably support --version; use a fast command that exits 0 when available.
-		execFile("qmd", ["status"], { timeout: 5_000 }, (err) => {
+		execFileFn("qmd", ["status"], { timeout: 5_000 }, (err) => {
 			resolve(!err);
 		});
 	});
@@ -482,7 +495,7 @@ export function detectQmd(): Promise<boolean> {
 
 export function checkCollection(name: string): Promise<boolean> {
 	return new Promise((resolve) => {
-		execFile("qmd", ["collection", "list", "--json"], { timeout: 10_000 }, (err, stdout) => {
+		execFileFn("qmd", ["collection", "list", "--json"], { timeout: 10_000 }, (err, stdout) => {
 			if (err) {
 				resolve(false);
 				return;
@@ -517,7 +530,7 @@ export function scheduleQmdUpdate() {
 	if (updateTimer) clearTimeout(updateTimer);
 	updateTimer = setTimeout(() => {
 		updateTimer = null;
-		execFile("qmd", ["update"], { timeout: 30_000 }, () => {});
+		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => {});
 	}, 500);
 }
 
@@ -542,14 +555,15 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 3_000)),
 		]);
 
-		if (!results || results.length === 0) return "";
+		if (!results || results.results.length === 0) return "";
 
-		const snippets = results
+		const snippets = results.results
 			.map((r) => {
-				const text = r.content ?? r.chunk ?? "";
+				const text = getQmdResultText(r);
 				if (!text.trim()) return null;
-				const filePart = r.path ? `_${r.path}_` : "";
-				return `${filePart}\n${text.trim()}`;
+				const filePath = getQmdResultPath(r);
+				const filePart = filePath ? `_${filePath}_` : "";
+				return filePart ? `${filePart}\n${text.trim()}` : text.trim();
 			})
 			.filter(Boolean);
 
@@ -562,32 +576,73 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 
 export interface QmdSearchResult {
 	path?: string;
+	file?: string;
 	score?: number;
 	content?: string;
 	chunk?: string;
+	snippet?: string;
 	title?: string;
 	[key: string]: unknown;
+}
+
+function getQmdResultPath(r: QmdSearchResult): string | undefined {
+	return r.path ?? r.file;
+}
+
+function getQmdResultText(r: QmdSearchResult): string {
+	return r.content ?? r.chunk ?? r.snippet ?? "";
+}
+
+function stripAnsi(text: string): string {
+	// qmd may emit spinners/progress bars even with --json, especially on first model download.
+	// Strip ANSI CSI/OSC sequences so we can reliably find and parse JSON payloads.
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escape sequences
+	return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, "");
+}
+
+function parseQmdJson(stdout: string): unknown {
+	const trimmed = stdout.trim();
+	if (!trimmed) return [];
+	if (trimmed === "No results found." || trimmed === "No results found") return [];
+
+	const cleaned = stripAnsi(stdout);
+	const lines = cleaned.split(/\r?\n/);
+	const startLine = lines.findIndex((l) => {
+		const s = l.trimStart();
+		return s.startsWith("[") || s.startsWith("{");
+	});
+	if (startLine === -1) {
+		throw new Error(`Failed to parse qmd output: ${trimmed.slice(0, 200)}`);
+	}
+
+	const jsonText = lines.slice(startLine).join("\n").trim();
+	if (!jsonText) return [];
+	return JSON.parse(jsonText);
 }
 
 export function runQmdSearch(
 	mode: "keyword" | "semantic" | "deep",
 	query: string,
 	limit: number,
-): Promise<QmdSearchResult[]> {
+): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
 	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
 
 	return new Promise((resolve, reject) => {
-		execFile("qmd", args, { timeout: 60_000 }, (err, stdout, stderr) => {
+		execFileFn("qmd", args, { timeout: 60_000 }, (err, stdout, stderr) => {
 			if (err) {
 				reject(new Error(stderr?.trim() || err.message));
 				return;
 			}
 			try {
-				const parsed = JSON.parse(stdout);
-				const results = Array.isArray(parsed) ? parsed : (parsed.results ?? parsed.hits ?? []);
-				resolve(results);
-			} catch {
+				const parsed = parseQmdJson(stdout);
+				const results = Array.isArray(parsed) ? parsed : ((parsed as any).results ?? (parsed as any).hits ?? []);
+				resolve({ results, stderr: stderr ?? "" });
+			} catch (parseErr) {
+				if (parseErr instanceof Error) {
+					reject(parseErr);
+					return;
+				}
 				reject(new Error(`Failed to parse qmd output: ${stdout.slice(0, 200)}`));
 			}
 		});
@@ -1105,6 +1160,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names, #tags, [[links]].\n" +
 			"- 'semantic' (~2s): Meaning-based search. Finds related concepts even with different wording.\n" +
 			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
+			"If semantic/deep warns about missing embeddings, run `qmd embed` once and retry.\n" +
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
 			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
 		parameters: Type.Object({
@@ -1159,9 +1215,27 @@ export default function (pi: ExtensionAPI) {
 			const limit = params.limit ?? 5;
 
 			try {
-				const results = await runQmdSearch(mode, params.query, limit);
+				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
+				const needsEmbed = /need embeddings/i.test(stderr ?? "");
 
 				if (results.length === 0) {
+					if (needsEmbed && (mode === "semantic" || mode === "deep")) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: [
+										`No results found for "${params.query}" (mode: ${mode}).`,
+										"",
+										"qmd reports missing vector embeddings for one or more documents.",
+										"Run this once, then retry:",
+										"  qmd embed",
+									].join("\n"),
+								},
+							],
+							details: { mode, query: params.query, count: 0, needsEmbed: true },
+						};
+					}
 					return {
 						content: [
 							{
@@ -1169,16 +1243,17 @@ export default function (pi: ExtensionAPI) {
 								text: `No results found for "${params.query}" (mode: ${mode}).`,
 							},
 						],
-						details: { mode, query: params.query, count: 0 },
+						details: { mode, query: params.query, count: 0, needsEmbed },
 					};
 				}
 
 				const formatted = results
 					.map((r, i) => {
 						const parts: string[] = [`### Result ${i + 1}`];
-						if (r.path) parts.push(`**File:** ${r.path}`);
+						const filePath = getQmdResultPath(r);
+						if (filePath) parts.push(`**File:** ${filePath}`);
 						if (r.score != null) parts.push(`**Score:** ${r.score}`);
-						const text = r.content ?? r.chunk ?? "";
+						const text = getQmdResultText(r);
 						if (text) parts.push(`\n${text}`);
 						return parts.join("\n");
 					})
@@ -1186,7 +1261,7 @@ export default function (pi: ExtensionAPI) {
 
 				return {
 					content: [{ type: "text", text: formatted }],
-					details: { mode, query: params.query, count: results.length },
+					details: { mode, query: params.query, count: results.length, needsEmbed },
 				};
 			} catch (err) {
 				return {
