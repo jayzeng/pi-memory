@@ -15,7 +15,9 @@ import {
 	_clearUpdateTimer,
 	_getUpdateTimer,
 	_resetBaseDir,
+	_resetExecFileForTest,
 	_setBaseDir,
+	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
 	dailyPath,
@@ -506,7 +508,7 @@ describe("memory_write tool", () => {
 		const content = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
 		expect(content).toContain("Existing content");
 		expect(content).toContain("New fact");
-		expect(result.content[0].text).toContain("Existing MEMORY.md content:");
+		expect(result.content[0].text).toContain("Existing MEMORY.md preview");
 		expect(result.content[0].text).toContain("Existing content");
 	});
 
@@ -870,13 +872,21 @@ describe("memory_search tool", () => {
 	});
 
 	test("returns error with setup instructions when qmd not fully configured", async () => {
-		// The tool re-checks qmd availability on demand. If qmd is installed on the
-		// test machine, it will find it and fall through to the collection check.
-		// Either way, it should return isError with qmd setup instructions.
+		const execStub = ((...args: any[]) => {
+			const callback = args[args.length - 1] as (err: Error | null, stdout: string, stderr: string) => void;
+			callback(new Error("qmd not found"), "", "");
+		}) as any;
+
+		_setExecFileForTest(execStub);
 		_setQmdAvailable(false);
-		const result = await tools.memory_search.execute("c1", { query: "test" }, null, null, {});
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toContain("qmd");
+
+		try {
+			const result = await tools.memory_search.execute("c1", { query: "test" }, null, null, {});
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toContain("qmd");
+		} finally {
+			_resetExecFileForTest();
+		}
 	});
 
 	test("defaults mode to keyword and limit to 5", () => {
@@ -958,11 +968,13 @@ describe("lifecycle hooks", () => {
 
 	// -- session_before_compact --
 
-	test("session_before_compact notifies when memory exists", async () => {
-		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Important data", "utf-8");
+	test("session_before_compact appends handoff when scratchpad has open items", async () => {
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n- [ ] Follow up", "utf-8");
 		const ctx = createMockCtx();
 		await hooks.session_before_compact({}, ctx);
-		expect(ctx.ui.notify).toHaveBeenCalled();
+		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
+		expect(content).toContain("Session Handoff");
+		expect(content).toContain("Follow up");
 	});
 
 	test("session_before_compact does not notify when no memory", async () => {

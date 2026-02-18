@@ -23,8 +23,14 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { complete, type Message, StringEnum } from "@mariozechner/pi-ai";
+import {
+	convertToLlm,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionEntry,
+	serializeConversation,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
@@ -110,6 +116,13 @@ const CONTEXT_DAILY_MAX_LINES = 120;
 const CONTEXT_SEARCH_MAX_CHARS = 2_500;
 const CONTEXT_SEARCH_MAX_LINES = 80;
 const CONTEXT_MAX_CHARS = 16_000;
+
+const EXIT_SUMMARY_MAX_CHARS = 80_000;
+const EXIT_SUMMARY_SYSTEM_PROMPT = [
+	"You are a session recap assistant.",
+	"Read the conversation and extract key decisions, lessons learned, notes, and follow-ups.",
+	"Return ONLY markdown in the specified format, without any extra commentary.",
+].join("\n");
 
 type TruncateMode = "start" | "end" | "middle";
 
@@ -238,6 +251,141 @@ function formatContextSection(label: string, content: string, mode: TruncateMode
 		? `\n\n[truncated: showing ${result.previewLines}/${result.totalLines} lines, ${result.previewChars}/${result.totalChars} chars]`
 		: "";
 	return `${label}\n\n${result.preview}${note}`;
+}
+
+type ExitSummaryReason = "ctrl+d" | "slash-exit";
+
+interface ExitSummaryResult {
+	summary: string | null;
+	error?: string;
+	hasMessages: boolean;
+}
+
+function formatExitSummaryReason(reason: ExitSummaryReason): string {
+	return reason === "ctrl+d" ? "ctrl+d" : "/exit";
+}
+
+function truncateConversationForSummary(conversationText: string): {
+	text: string;
+	truncated: boolean;
+	totalChars: number;
+} {
+	const trimmed = conversationText.trim();
+	if (!trimmed) {
+		return { text: "", truncated: false, totalChars: 0 };
+	}
+	const truncated = truncateText(trimmed, EXIT_SUMMARY_MAX_CHARS, "end");
+	return {
+		text: truncated.text,
+		truncated: truncated.truncated,
+		totalChars: trimmed.length,
+	};
+}
+
+function buildExitSummaryPrompt(conversationText: string, truncated: boolean, totalChars: number): string {
+	const lines = [
+		"Review the conversation and extract important decisions, lessons learned, notes, and follow-ups for a daily log.",
+		"Return markdown only with these exact headings:",
+		"### Decisions",
+		"### Lessons Learned",
+		"### Notes",
+		"### Follow-ups",
+		'Use bullet points under each heading. If there is nothing, write "None.".',
+	];
+
+	if (truncated) {
+		lines.push(
+			`Note: Conversation transcript was truncated to the most recent ${conversationText.length} of ${totalChars} characters.`,
+		);
+	}
+
+	lines.push("", "<conversation>", conversationText, "</conversation>");
+	return lines.join("\n");
+}
+
+function buildExitSummaryFallback(error?: string): string {
+	const note = error ? `- Auto-summary unavailable: ${error}.` : "- Auto-summary unavailable.";
+	return [
+		"### Decisions",
+		"- None.",
+		"### Lessons Learned",
+		"- None.",
+		"### Notes",
+		note,
+		"### Follow-ups",
+		"- None.",
+	].join("\n");
+}
+
+function formatExitSummaryEntry(
+	summary: string,
+	reason: ExitSummaryReason,
+	sessionId: string,
+	timestamp: string,
+): string {
+	const header = `## Session Summary (auto, exit: ${formatExitSummaryReason(reason)})`;
+	return [`<!-- ${timestamp} [${sessionId}] -->`, header, "", summary.trim()].join("\n");
+}
+
+async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
+	const branch = ctx.sessionManager.getBranch();
+	const messages = branch
+		.filter((entry): entry is SessionEntry & { type: "message" } => entry.type === "message")
+		.map((entry) => entry.message);
+
+	if (messages.length === 0) {
+		return { summary: null, hasMessages: false };
+	}
+
+	if (!ctx.model) {
+		return { summary: null, error: "No active model", hasMessages: true };
+	}
+
+	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+	if (!apiKey) {
+		return {
+			summary: null,
+			error: `No API key for ${ctx.model.provider}/${ctx.model.id}`,
+			hasMessages: true,
+		};
+	}
+
+	const llmMessages = convertToLlm(messages);
+	const conversationText = serializeConversation(llmMessages);
+	const { text: truncatedText, truncated, totalChars } = truncateConversationForSummary(conversationText);
+	if (!truncatedText.trim()) {
+		return { summary: null, error: "No conversation text to summarize", hasMessages: true };
+	}
+
+	const summaryMessages: Message[] = [
+		{
+			role: "user",
+			content: [{ type: "text", text: buildExitSummaryPrompt(truncatedText, truncated, totalChars) }],
+			timestamp: Date.now(),
+		},
+	];
+
+	try {
+		const response = await complete(
+			ctx.model,
+			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
+			{ apiKey, reasoningEffort: "low" },
+		);
+
+		const summaryText = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n")
+			.trim();
+
+		if (!summaryText) {
+			return { summary: null, error: "Summary was empty", hasMessages: true };
+		}
+
+		return { summary: summaryText, hasMessages: true };
+	} catch (err) {
+		return { summary: null, error: err instanceof Error ? err.message : String(err), hasMessages: true };
+	}
 }
 
 function getQmdUpdateMode(): "background" | "manual" | "off" {
@@ -402,6 +550,8 @@ let execFileFn: ExecFileFn = execFile;
 
 let qmdAvailable = false;
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
+let exitSummaryReason: ExitSummaryReason | null = null;
+let terminalInputUnsubscribe: (() => void) | null = null;
 
 /** Override execFile implementation (for testing). */
 export function _setExecFileForTest(fn: ExecFileFn) {
@@ -447,6 +597,16 @@ export function qmdInstallInstructions(): string {
 		"  # ensure ~/.bun/bin is in your PATH",
 		"",
 		"Then set up the collection (one-time):",
+		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
+		"  qmd embed",
+	].join("\n");
+}
+
+export function qmdCollectionInstructions(): string {
+	return [
+		"qmd collection pi-memory is not configured.",
+		"",
+		"Set up the collection (one-time):",
 		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
 		"  qmd embed",
 	].join("\n");
@@ -532,6 +692,14 @@ export function scheduleQmdUpdate() {
 		updateTimer = null;
 		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => {});
 	}, 500);
+}
+
+async function runQmdUpdateNow() {
+	if (getQmdUpdateMode() !== "background") return;
+	if (!qmdAvailable) return;
+	await new Promise<void>((resolve) => {
+		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => resolve());
+	});
 }
 
 /** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
@@ -656,6 +824,21 @@ export function runQmdSearch(
 export default function (pi: ExtensionAPI) {
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
+		exitSummaryReason = null;
+		if (terminalInputUnsubscribe) {
+			terminalInputUnsubscribe();
+			terminalInputUnsubscribe = null;
+		}
+		if (ctx.hasUI) {
+			terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
+				if (!data.includes("\u0004")) return undefined;
+				if (!ctx.isIdle()) return undefined;
+				if (ctx.ui.getEditorText().trim()) return undefined;
+				exitSummaryReason = "ctrl+d";
+				return undefined;
+			});
+		}
+
 		qmdAvailable = await detectQmd();
 		if (!qmdAvailable) {
 			if (ctx.hasUI) {
@@ -670,12 +853,47 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- session_shutdown: clean up timer ---
-	pi.on("session_shutdown", async () => {
-		if (updateTimer) {
-			clearTimeout(updateTimer);
-			updateTimer = null;
+	// --- session_shutdown: write exit summary + clean up timer ---
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (terminalInputUnsubscribe) {
+			terminalInputUnsubscribe();
+			terminalInputUnsubscribe = null;
 		}
+
+		const reason = exitSummaryReason;
+		exitSummaryReason = null;
+
+		try {
+			if (reason) {
+				ensureDirs();
+				const result = await generateExitSummary(ctx);
+				if (result.hasMessages) {
+					const summary = result.summary ?? buildExitSummaryFallback(result.error);
+					const sid = shortSessionId(ctx.sessionManager.getSessionId());
+					const ts = nowTimestamp();
+					const entry = formatExitSummaryEntry(summary, reason, sid, ts);
+					const filePath = dailyPath(todayStr());
+					const existing = readFileSafe(filePath) ?? "";
+					const separator = existing.trim() ? "\n\n" : "";
+					fs.writeFileSync(filePath, existing + separator + entry, "utf-8");
+					await ensureQmdAvailableForUpdate();
+					await runQmdUpdateNow();
+				}
+			}
+		} finally {
+			if (updateTimer) {
+				clearTimeout(updateTimer);
+				updateTimer = null;
+			}
+		}
+	});
+
+	// --- input: detect /exit for shutdown summary ---
+	pi.on("input", async (event, _ctx) => {
+		if (event.source !== "extension" && event.text.trim() === "/exit") {
+			exitSummaryReason = "slash-exit";
+		}
+		return { action: "continue" };
 	});
 
 	// --- Inject memory context before every agent turn ---
