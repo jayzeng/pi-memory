@@ -253,7 +253,7 @@ function formatContextSection(label: string, content: string, mode: TruncateMode
 	return `${label}\n\n${result.preview}${note}`;
 }
 
-type ExitSummaryReason = "ctrl+d" | "slash-quit";
+type ExitSummaryReason = "ctrl+d" | "slash-quit" | "session-end";
 
 interface ExitSummaryResult {
 	summary: string | null;
@@ -262,7 +262,9 @@ interface ExitSummaryResult {
 }
 
 function formatExitSummaryReason(reason: ExitSummaryReason): string {
-	return reason === "ctrl+d" ? "ctrl+d" : "/quit";
+	if (reason === "ctrl+d") return "ctrl+d";
+	if (reason === "slash-quit") return "/quit";
+	return "session-end";
 }
 
 function truncateConversationForSummary(conversationText: string): {
@@ -860,7 +862,7 @@ export default function (pi: ExtensionAPI) {
 			terminalInputUnsubscribe = null;
 		}
 
-		const reason = exitSummaryReason;
+		const reason = exitSummaryReason ?? "session-end";
 		exitSummaryReason = null;
 
 		try {
