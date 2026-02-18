@@ -253,7 +253,7 @@ function formatContextSection(label: string, content: string, mode: TruncateMode
 	return `${label}\n\n${result.preview}${note}`;
 }
 
-type ExitSummaryReason = "ctrl+d" | "slash-exit";
+type ExitSummaryReason = "ctrl+d" | "slash-quit";
 
 interface ExitSummaryResult {
 	summary: string | null;
@@ -262,7 +262,7 @@ interface ExitSummaryResult {
 }
 
 function formatExitSummaryReason(reason: ExitSummaryReason): string {
-	return reason === "ctrl+d" ? "ctrl+d" : "/exit";
+	return reason === "ctrl+d" ? "ctrl+d" : "/quit";
 }
 
 function truncateConversationForSummary(conversationText: string): {
@@ -888,10 +888,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- input: detect /exit for shutdown summary ---
+	// --- input: detect /quit for shutdown summary ---
 	pi.on("input", async (event, _ctx) => {
-		if (event.source !== "extension" && event.text.trim() === "/exit") {
-			exitSummaryReason = "slash-exit";
+		if (event.source !== "extension" && event.text.trim() === "/quit") {
+			exitSummaryReason = "slash-quit";
 		}
 		return { action: "continue" };
 	});
