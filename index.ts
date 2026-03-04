@@ -37,7 +37,7 @@ import { Type } from "@sinclair/typebox";
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MEMORY_DIR = path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
+const DEFAULT_MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
 
 let MEMORY_DIR = DEFAULT_MEMORY_DIR;
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");

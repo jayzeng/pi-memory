@@ -653,6 +653,37 @@ function testSerializeScratchpadRoundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// PI_MEMORY_DIR env var
+// ---------------------------------------------------------------------------
+
+async function testPiMemoryDirEnvVar() {
+	// Verify that _setBaseDir (which DEFAULT_MEMORY_DIR feeds into) correctly
+	// redirects reads/writes — this is the mechanism PI_MEMORY_DIR relies on.
+	const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-ch1-"));
+	const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-ch2-"));
+	try {
+		fs.mkdirSync(path.join(dir1, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(dir2, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(dir1, "MEMORY.md"), "channel-1-content", "utf-8");
+		fs.writeFileSync(path.join(dir2, "MEMORY.md"), "channel-2-content", "utf-8");
+
+		_setBaseDir(dir1);
+		const ctx1 = buildMemoryContext();
+		assert(ctx1.includes("channel-1-content"), "Should read from dir1");
+		assert(!ctx1.includes("channel-2-content"), "Should not read from dir2");
+
+		_setBaseDir(dir2);
+		const ctx2 = buildMemoryContext();
+		assert(ctx2.includes("channel-2-content"), "Should read from dir2");
+		assert(!ctx2.includes("channel-1-content"), "Should not read from dir1");
+	} finally {
+		_resetBaseDir();
+		fs.rmSync(dir1, { recursive: true, force: true });
+		fs.rmSync(dir2, { recursive: true, force: true });
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -695,6 +726,9 @@ async function main() {
 	console.log("\n\x1b[1m5. Scratchpad parsing\x1b[0m");
 	await test("parses mixed open/done items with metadata", testParseScratchpadMixed);
 	await test("serialize → parse roundtrip", testSerializeScratchpadRoundtrip);
+
+	console.log("\n\x1b[1m6. PI_MEMORY_DIR env var\x1b[0m");
+	await test("_setBaseDir isolates reads per directory", testPiMemoryDirEnvVar);
 
 	// Summary
 	console.log(`\n\x1b[1mResults: ${passed} passed, ${failed} failed\x1b[0m`);
