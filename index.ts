@@ -37,7 +37,7 @@ import { Type } from "@sinclair/typebox";
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MEMORY_DIR = path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
+const DEFAULT_MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
 
 let MEMORY_DIR = DEFAULT_MEMORY_DIR;
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
@@ -826,6 +826,12 @@ export function runQmdSearch(
 export default function (pi: ExtensionAPI) {
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
+		// Re-apply base dir from env var each session start, so per-channel
+		// dirs set via PI_MEMORY_DIR before session.prompt() take effect.
+		const envDir = process.env.PI_MEMORY_DIR;
+		if (envDir) {
+			_setBaseDir(envDir);
+		}
 		exitSummaryReason = null;
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
@@ -900,6 +906,11 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Inject memory context before every agent turn ---
 	pi.on("before_agent_start", async (event, _ctx) => {
+		// Re-apply base dir from env var each turn so per-channel dirs work.
+		const envDir = process.env.PI_MEMORY_DIR;
+		if (envDir) {
+			_setBaseDir(envDir);
+		}
 		const skipSearch = process.env.PI_MEMORY_NO_SEARCH === "1";
 		const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
 		const memoryContext = buildMemoryContext(searchResults);
