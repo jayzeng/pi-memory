@@ -653,6 +653,94 @@ function testSerializeScratchpadRoundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// PI_MEMORY_DIR env var tests
+// ---------------------------------------------------------------------------
+
+function testPiMemoryDirEnvDefault() {
+	// DEFAULT_MEMORY_DIR is evaluated at module load — this test verifies that
+	// _setBaseDir with a custom path actually redirects reads/writes correctly,
+	// which is the mechanism PI_MEMORY_DIR relies on.
+	setup();
+	try {
+		writeFile("MEMORY.md", "env-dir-test-content");
+		const ctx = buildMemoryContext();
+		assert(ctx.includes("env-dir-test-content"), "Should read from the dir set by _setBaseDir");
+	} finally {
+		teardown();
+	}
+}
+
+async function testBeforeAgentStartAppliesEnvDir() {
+	// Simulate what data-mom does: set PI_MEMORY_DIR before each run.
+	// before_agent_start should pick it up and redirect memory reads.
+	const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-ch1-"));
+	const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-ch2-"));
+	try {
+		// Write different content in each dir
+		const today = todayStr();
+		fs.mkdirSync(path.join(dir1, "daily"), { recursive: true });
+		fs.mkdirSync(path.join(dir2, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(dir1, "MEMORY.md"), "channel-1-memory", "utf-8");
+		fs.writeFileSync(path.join(dir2, "MEMORY.md"), "channel-2-memory", "utf-8");
+
+		const pi = createMockPi();
+		registerExtension(pi as any);
+
+		// Simulate channel 1 run
+		process.env.PI_MEMORY_DIR = dir1;
+		const result1 = await pi.handlers.before_agent_start({ prompt: "hello" }, mockCtx());
+		const systemPrompt1: string = result1?.systemPrompt ?? "";
+		assert(systemPrompt1.includes("channel-1-memory"), "before_agent_start should use PI_MEMORY_DIR=dir1");
+		assert(!systemPrompt1.includes("channel-2-memory"), "Should not include channel-2 content");
+
+		// Simulate channel 2 run
+		process.env.PI_MEMORY_DIR = dir2;
+		const result2 = await pi.handlers.before_agent_start({ prompt: "hello" }, mockCtx());
+		const systemPrompt2: string = result2?.systemPrompt ?? "";
+		assert(systemPrompt2.includes("channel-2-memory"), "before_agent_start should use PI_MEMORY_DIR=dir2");
+		assert(!systemPrompt2.includes("channel-1-memory"), "Should not include channel-1 content");
+	} finally {
+		delete process.env.PI_MEMORY_DIR;
+		_resetBaseDir();
+		fs.rmSync(dir1, { recursive: true, force: true });
+		fs.rmSync(dir2, { recursive: true, force: true });
+	}
+}
+
+async function testSessionStartAppliesEnvDir() {
+	// session_start should also re-apply PI_MEMORY_DIR so qmd setup
+	// targets the right directory.
+	const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-"));
+	try {
+		fs.mkdirSync(path.join(customDir, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(customDir, "MEMORY.md"), "session-start-test", "utf-8");
+
+		process.env.PI_MEMORY_DIR = customDir;
+		_setQmdAvailable(false); // avoid qmd side-effects
+
+		const pi = createMockPi();
+		registerExtension(pi as any);
+
+		// Fire session_start — it should call _setBaseDir(customDir)
+		await pi.handlers.session_start({}, {
+			hasUI: false,
+			sessionManager: { getSessionId: () => "abc123" },
+			ui: { notify: () => {}, onTerminalInput: () => () => {} },
+			isIdle: () => true,
+		});
+
+		// Now buildMemoryContext should read from customDir
+		const ctx = buildMemoryContext();
+		assert(ctx.includes("session-start-test"), "session_start should redirect to PI_MEMORY_DIR");
+	} finally {
+		delete process.env.PI_MEMORY_DIR;
+		_resetBaseDir();
+		_setQmdAvailable(false);
+		fs.rmSync(customDir, { recursive: true, force: true });
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -695,6 +783,11 @@ async function main() {
 	console.log("\n\x1b[1m5. Scratchpad parsing\x1b[0m");
 	await test("parses mixed open/done items with metadata", testParseScratchpadMixed);
 	await test("serialize → parse roundtrip", testSerializeScratchpadRoundtrip);
+
+	console.log("\n\x1b[1m6. PI_MEMORY_DIR env var\x1b[0m");
+	await test("DEFAULT_MEMORY_DIR reads PI_MEMORY_DIR at module eval time", testPiMemoryDirEnvDefault);
+	await test("before_agent_start re-applies PI_MEMORY_DIR each turn", testBeforeAgentStartAppliesEnvDir);
+	await test("session_start re-applies PI_MEMORY_DIR", testSessionStartAppliesEnvDir);
 
 	// Summary
 	console.log(`\n\x1b[1mResults: ${passed} passed, ${failed} failed\x1b[0m`);
