@@ -196,6 +196,11 @@ pi install npm:pi-memory
 
 ## Changelog
 
+### 0.3.6
+
+- Added support for `PI_MEMORY_DIR` so memory storage can be redirected from the default `~/.pi/agent/memory` path.
+- Published npm patch release `0.3.6`.
+
 ### 0.2.0
 
 - **Selective injection**: Before each turn, the user's prompt is searched against memory via qmd. Top results are injected into the system prompt alongside standard context, surfacing relevant past decisions without explicit tool calls.
