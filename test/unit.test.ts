@@ -185,6 +185,10 @@ describe("dailyPath", () => {
 		const result = dailyPath("2026-02-15");
 		expect(result).toContain(path.join("daily", "2026-02-15.md"));
 	});
+
+	test("rejects invalid date input", () => {
+		expect(() => dailyPath("../../outside")).toThrow("Invalid daily date");
+	});
 });
 
 describe("ensureDirs", () => {
@@ -819,6 +823,29 @@ describe("memory_read tool", () => {
 	test("read daily when file does not exist", async () => {
 		const result = await tools.memory_read.execute("c1", { target: "daily", date: "1999-01-01" }, null, null, {});
 		expect(result.content[0].text).toContain("No daily log for 1999-01-01");
+	});
+
+	test("read daily rejects path traversal in date", async () => {
+		const outsideBase = path.join(
+			os.tmpdir(),
+			`pi-memory-outside-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+		);
+		const outsideFile = `${outsideBase}.md`;
+		fs.writeFileSync(outsideFile, "TOP SECRET", "utf-8");
+
+		try {
+			const result = await tools.memory_read.execute(
+				"c1",
+				{ target: "daily", date: `../../${path.basename(outsideBase)}` },
+				null,
+				null,
+				{},
+			);
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toContain("Invalid date format");
+		} finally {
+			fs.rmSync(outsideFile, { force: true });
+		}
 	});
 
 	// -- list --
