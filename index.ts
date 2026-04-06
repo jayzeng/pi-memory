@@ -96,7 +96,19 @@ export function readFileSafe(filePath: string): string | null {
 	}
 }
 
+const DAILY_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+export function isValidDailyDate(date: string): boolean {
+	if (!DAILY_DATE_REGEX.test(date)) return false;
+	const [year, month, day] = date.split("-").map(Number);
+	const parsed = new Date(Date.UTC(year, month - 1, day));
+	return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
+}
+
 export function dailyPath(date: string): string {
+	if (!isValidDailyDate(date)) {
+		throw new Error(`Invalid daily date: ${date}. Expected YYYY-MM-DD.`);
+	}
 	return path.join(DAILY_DIR, `${date}.md`);
 }
 
@@ -1322,6 +1334,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (target === "daily") {
 				const d = date ?? todayStr();
+				if (!isValidDailyDate(d)) {
+					return {
+						content: [{ type: "text", text: `Invalid date format: ${d}. Use YYYY-MM-DD.` }],
+						isError: true,
+						details: { date: d },
+					};
+				}
 				const filePath = dailyPath(d);
 				const content = readFileSafe(filePath);
 				if (!content) {
