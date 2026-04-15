@@ -341,8 +341,41 @@ function formatExitSummaryEntry(
 	return [`<!-- ${timestamp} [${sessionId}] -->`, header, "", summary.trim()].join("\n");
 }
 
+function getSessionBranch(ctx: ExtensionContext): SessionEntry[] | null {
+	const sessionManager = ctx.sessionManager as ExtensionContext["sessionManager"] & {
+		getBranch?: () => SessionEntry[];
+	};
+	if (typeof sessionManager?.getBranch !== "function") {
+		return null;
+	}
+	return sessionManager.getBranch();
+}
+
+async function resolveExitSummaryApiKey(ctx: ExtensionContext): Promise<string | undefined> {
+	if (!ctx.model) return undefined;
+
+	const modelRegistry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+		getApiKey?: (model: NonNullable<ExtensionContext["model"]>) => Promise<string | undefined>;
+		getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
+	};
+
+	if (typeof modelRegistry?.getApiKey === "function") {
+		return modelRegistry.getApiKey(ctx.model);
+	}
+
+	if (typeof modelRegistry?.getApiKeyForProvider === "function") {
+		return modelRegistry.getApiKeyForProvider(ctx.model.provider);
+	}
+
+	return undefined;
+}
+
 async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
-	const branch = ctx.sessionManager.getBranch();
+	const branch = getSessionBranch(ctx);
+	if (!branch) {
+		return { summary: null, error: "Session branch unavailable", hasMessages: false };
+	}
+
 	const messages = branch
 		.filter((entry): entry is SessionEntry & { type: "message" } => entry.type === "message")
 		.map((entry) => entry.message);
@@ -355,11 +388,11 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		return { summary: null, error: "No active model", hasMessages: true };
 	}
 
-	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+	const apiKey = await resolveExitSummaryApiKey(ctx);
 	if (!apiKey) {
 		return {
 			summary: null,
-			error: `No API key for ${ctx.model.provider}/${ctx.model.id}`,
+			error: `API key resolution unavailable for ${ctx.model.provider}/${ctx.model.id}`,
 			hasMessages: true,
 		};
 	}

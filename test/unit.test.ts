@@ -83,6 +83,27 @@ function createMockCtx(sessionId = "abcdef1234567890") {
 	};
 }
 
+function createShutdownCtx(options?: {
+	sessionId?: string;
+	branch?: any[];
+	model?: { provider: string; id: string };
+	modelRegistry?: Record<string, unknown>;
+}) {
+	const sessionId = options?.sessionId ?? "abcdef1234567890";
+	return {
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getBranch: () => options?.branch ?? [],
+		},
+		model: options?.model,
+		modelRegistry: options?.modelRegistry ?? {},
+		hasUI: false,
+		ui: {
+			notify: mock(() => {}),
+		},
+	};
+}
+
 // We need to import the default export to register tools
 import registerExtension from "../index.js";
 
@@ -983,7 +1004,7 @@ describe("lifecycle hooks", () => {
 		_setQmdAvailable(true);
 		scheduleQmdUpdate();
 		expect(_getUpdateTimer()).not.toBeNull();
-		await hooks.session_shutdown({}, {});
+		await hooks.session_shutdown({}, createShutdownCtx());
 		expect(_getUpdateTimer()).toBeNull();
 	});
 
@@ -991,6 +1012,38 @@ describe("lifecycle hooks", () => {
 		_clearUpdateTimer();
 		// Should not throw
 		await hooks.session_shutdown({}, {});
+	});
+
+	test("session_shutdown writes fallback summary when getApiKey is unavailable", async () => {
+		const ctx = createShutdownCtx({
+			branch: [
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Please remember we chose SQLite." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Noted." }],
+						timestamp: Date.now(),
+					},
+				},
+			],
+			model: { provider: "openai", id: "gpt-4o-mini" },
+			modelRegistry: {},
+		});
+
+		await hooks.session_shutdown({}, ctx);
+
+		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
+		expect(content).toContain("## Session Summary (auto, exit: session-end)");
+		expect(content).toContain("Auto-summary unavailable");
+		expect(content).toContain("API key resolution unavailable");
 	});
 
 	// -- session_before_compact --

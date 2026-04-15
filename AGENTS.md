@@ -33,6 +33,11 @@ Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `S
 
 ## Testing Guidelines
 
+- Enforce TDD for every behavior change: follow `red -> green -> refactor`.
+- Start by establishing a verifiable baseline: run the relevant existing tests before edits, and record the exact command + outcome in the PR/commit notes.
+- Add or update a failing test first that reproduces the bug or captures the new requirement; implement code only after the test fails for the expected reason.
+- Keep tests green after implementation and after any refactor; do not merge with skipped failing tests.
+- Every bug fix must include a regression test that fails before the fix and passes after it.
 - Tests touch `~/.pi/agent/memory/`; ensure backups/restores remain intact and new tests don’t leak user data.
 - Prefer behavior-focused assertions (tool availability, file contents, cross-session recall). Keep timeouts generous for model latency.
 
