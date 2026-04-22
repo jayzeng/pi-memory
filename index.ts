@@ -901,10 +901,17 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- session_shutdown: write exit summary + clean up timer ---
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async (event, ctx) => {
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
+		}
+
+		// /reload emits session_shutdown with reason "reload" before rebuilding the
+		// runtime. Generating an exit summary here would make every /reload block
+		// for several seconds on a live LLM call. Skip it — the session continues.
+		if (event.reason === "reload") {
+			return;
 		}
 
 		const reason = exitSummaryReason ?? "session-end";
