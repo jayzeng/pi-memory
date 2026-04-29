@@ -443,6 +443,17 @@ function getQmdUpdateMode(): "background" | "manual" | "off" {
 	return "background";
 }
 
+export function shouldSummarizeLifecycleTransitions(): boolean {
+	const value = (process.env.PI_MEMORY_SUMMARIZE_TRANSITIONS ?? "").toLowerCase();
+	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
+	if (!reason) return false;
+	if (shouldSummarizeLifecycleTransitions()) return false;
+	return ["reload", "new", "resume", "fork"].includes(reason);
+}
+
 async function ensureQmdAvailableForUpdate(): Promise<boolean> {
 	if (qmdAvailable) return true;
 	if (getQmdUpdateMode() !== "background") return false;
@@ -596,6 +607,9 @@ type ExecFileFn = typeof execFile;
 let execFileFn: ExecFileFn = execFile;
 
 let qmdAvailable = false;
+let qmdAvailabilityCheckedAt = 0;
+const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
+const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
 let terminalInputUnsubscribe: (() => void) | null = null;
@@ -613,6 +627,7 @@ export function _resetExecFileForTest() {
 /** Set qmd availability flag (for testing). */
 export function _setQmdAvailable(value: boolean) {
 	qmdAvailable = value;
+	qmdAvailabilityCheckedAt = Date.now();
 }
 
 /** Get current qmd availability flag (for testing). */
@@ -631,6 +646,12 @@ export function _clearUpdateTimer() {
 		clearTimeout(updateTimer);
 		updateTimer = null;
 	}
+}
+
+/** Clear qmd status caches (for testing). */
+export function _clearQmdStatusCaches() {
+	qmdAvailabilityCheckedAt = 0;
+	qmdCollectionStatusCache.clear();
 }
 
 const QMD_REPO_URL = "https://github.com/tobi/qmd";
@@ -692,41 +713,53 @@ export async function setupQmdCollection(): Promise<boolean> {
 }
 
 export function detectQmd(): Promise<boolean> {
+	const now = Date.now();
+	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < QMD_STATUS_CACHE_TTL_MS) {
+		return Promise.resolve(qmdAvailable);
+	}
+
 	return new Promise((resolve) => {
 		// qmd doesn't reliably support --version; use a fast command that exits 0 when available.
 		execFileFn("qmd", ["status"], { timeout: 5_000 }, (err) => {
-			resolve(!err);
+			qmdAvailable = !err;
+			qmdAvailabilityCheckedAt = Date.now();
+			resolve(qmdAvailable);
 		});
 	});
 }
 
 export function checkCollection(name: string): Promise<boolean> {
+	const cached = qmdCollectionStatusCache.get(name);
+	const now = Date.now();
+	if (cached && now - cached.checkedAt < QMD_STATUS_CACHE_TTL_MS) {
+		return Promise.resolve(cached.exists);
+	}
+
 	return new Promise((resolve) => {
 		execFileFn("qmd", ["collection", "list", "--json"], { timeout: 10_000 }, (err, stdout) => {
-			if (err) {
-				resolve(false);
-				return;
-			}
-			try {
-				const collections = JSON.parse(stdout);
-				if (Array.isArray(collections)) {
-					resolve(
-						collections.some((entry) => {
+			let exists = false;
+			if (!err) {
+				try {
+					const collections = JSON.parse(stdout);
+					if (Array.isArray(collections)) {
+						exists = collections.some((entry) => {
 							if (typeof entry === "string") return entry === name;
 							if (entry && typeof entry === "object" && "name" in entry) {
 								return (entry as { name?: string }).name === name;
 							}
 							return false;
-						}),
-					);
-				} else {
-					// qmd may output an object with a collections array or similar
-					resolve(stdout.includes(name));
+						});
+					} else {
+						// qmd may output an object with a collections array or similar
+						exists = stdout.includes(name);
+					}
+				} catch {
+					// Fallback: just check if the name appears in the output
+					exists = stdout.includes(name);
 				}
-			} catch {
-				// Fallback: just check if the name appears in the output
-				resolve(stdout.includes(name));
 			}
+			qmdCollectionStatusCache.set(name, { checkedAt: Date.now(), exists });
+			resolve(exists);
 		});
 	});
 }
@@ -905,6 +938,21 @@ export default function (pi: ExtensionAPI) {
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
+		}
+
+		// Lifecycle transitions are usually not final session exits. By default,
+		// avoid generating LLM summaries and running qmd updates during /reload,
+		// /new, /resume, and /fork because that makes those transitions slow.
+		// Users who prefer the old behavior can opt in with
+		// PI_MEMORY_SUMMARIZE_TRANSITIONS=1.
+		const shutdownReason = (_event as { reason?: string }).reason;
+		if (shouldSkipExitSummaryForReason(shutdownReason)) {
+			exitSummaryReason = null;
+			if (updateTimer) {
+				clearTimeout(updateTimer);
+				updateTimer = null;
+			}
+			return;
 		}
 
 		const reason = exitSummaryReason ?? "session-end";
