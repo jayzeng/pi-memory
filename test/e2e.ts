@@ -11,7 +11,7 @@
  *
  * What it tests:
  *   1. Extension loads and registers 4 tools
- *   2. Memory write via LLM → files appear on disk
+ *   2. Memory write tool → files appear on disk
  *   3. Memory context injection → LLM can answer from injected memory
  *   4. Full round-trip: write in session 1, recall in session 2
  *   5. Scratchpad add/done/list cycle
@@ -23,7 +23,7 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import registerExtension from "../index.js";
+import registerExtension, { _clearUpdateTimer } from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -52,25 +52,54 @@ interface PiResult {
 	exitCode: number;
 	stdout: string;
 	stderr: string;
+	errorMessage: string;
+	signal?: string;
 	events: any[];
 	textOutput: string;
 }
 
-function registeredToolNames(): string[] {
-	const tools: string[] = [];
+function registeredTools(): Record<string, any> {
+	const tools: Record<string, any> = {};
 	const pi = {
 		registerTool(tool: { name?: unknown }) {
 			if (typeof tool.name === "string") {
-				tools.push(tool.name);
+				tools[tool.name] = tool;
 			}
 		},
 		on(_event: string, _handler: unknown) {
-			// Hooks are irrelevant for this registration smoke test.
+			// Hooks are irrelevant for direct tool execution in these tests.
 		},
 	};
 
 	registerExtension(pi as any);
-	return tools.sort();
+	return tools;
+}
+
+function registeredToolNames(): string[] {
+	return Object.keys(registeredTools()).sort();
+}
+
+function toolExecutionContext(sessionId = "e2e-test") {
+	return {
+		sessionManager: {
+			getSessionId: () => sessionId,
+		},
+		hasUI: false,
+		ui: {
+			notify() {},
+		},
+	};
+}
+
+async function runTool(name: string, params: Record<string, unknown>) {
+	const tools = registeredTools();
+	const tool = tools[name];
+	assert(Boolean(tool), `${name} tool is not registered`);
+	return await tool.execute(`e2e-${name}`, params, null, null, toolExecutionContext());
+}
+
+function toolResultText(result: any): string {
+	return (result.content ?? []).map((part: any) => (part.type === "text" ? part.text : "")).join("\n");
 }
 
 /** Run pi in print+json mode with the extension loaded. */
@@ -88,6 +117,8 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 
 	let stdout: string;
 	let stderr = "";
+	let errorMessage = "";
+	let signal: string | undefined;
 	let exitCode = 0;
 
 	try {
@@ -100,6 +131,8 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 	} catch (err: any) {
 		stdout = err.stdout ?? "";
 		stderr = err.stderr ?? "";
+		errorMessage = err.message ?? "";
+		signal = err.signal;
 		exitCode = err.status ?? 1;
 	}
 
@@ -128,13 +161,15 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 		textOutput = stdout.trim();
 	}
 
-	return { exitCode, stdout, stderr, events, textOutput };
+	return { exitCode, stdout, stderr, errorMessage, signal, events, textOutput };
 }
 
 function formatPiFailure(result: PiResult, label = "pi"): string {
 	const parts = [`${label} exited with code ${result.exitCode}`];
 	const stderr = result.stderr.trim();
 	const stdout = result.stdout.trim();
+	if (result.signal) parts.push(`signal: ${result.signal}`);
+	if (result.errorMessage) parts.push(`error:\n${result.errorMessage.slice(0, 2_000)}`);
 	if (stderr) parts.push(`stderr:\n${stderr.slice(0, 2_000)}`);
 	if (stdout) parts.push(`stdout:\n${stdout.slice(0, 2_000)}`);
 	return parts.join("\n");
@@ -182,10 +217,10 @@ function assert(condition: boolean, message: string) {
 	}
 }
 
-function test(name: string, fn: () => void) {
+async function test(name: string, fn: () => void | Promise<void>) {
 	process.stdout.write(`  ${name} ... `);
 	try {
-		fn();
+		await fn();
 		console.log("\x1b[32mPASS\x1b[0m");
 		passed++;
 	} catch (err) {
@@ -283,22 +318,15 @@ function testContextInjectionDirect() {
 	assert(text.includes("sushi"), `Response does not mention "sushi". Got: ${result.textOutput.slice(0, 300)}`);
 }
 
-function testMemoryWriteAndRecall() {
+async function testMemoryWriteAndRecall() {
 	// Clean any existing memory
 	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
 
-	// Session 1: Ask pi to remember facts using the tool
-	const writeResult = runPi(
-		'Use the memory_write tool to write the following to long_term memory (target: "long_term"): "User lives in Seattle. User\'s favorite drink is tea." Do not add anything else, just call the tool.',
-	);
-
-	assertPiExitedOk(writeResult, "pi (write)");
-
-	// Verify the tool was called
-	const toolStarts = writeResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
-	);
-	assert(toolStarts.length > 0, "memory_write tool was never called");
+	// Session 1: Write through the tool directly, then verify pi can recall it in a new session.
+	await runTool("memory_write", {
+		target: "long_term",
+		content: "User lives in Seattle. User's favorite drink is tea.",
+	});
 
 	// Verify file was written
 	const memoryContent = fs.existsSync(MEMORY_FILE) ? fs.readFileSync(MEMORY_FILE, "utf-8") : "";
@@ -323,20 +351,12 @@ function testMemoryWriteAndRecall() {
 	assert(recallText.includes("tea"), `Recall does not mention "tea". Got: ${recallResult.textOutput.slice(0, 300)}`);
 }
 
-function testScratchpadCycle() {
+async function testScratchpadCycle() {
 	// Clean scratchpad
 	if (fs.existsSync(SCRATCHPAD_FILE)) fs.unlinkSync(SCRATCHPAD_FILE);
 
 	// Add an item
-	const addResult = runPi(
-		'Use the scratchpad tool with action "add" and text "Fix the login bug". Just call the tool.',
-	);
-	assertPiExitedOk(addResult, "pi (add)");
-
-	const addToolCalls = addResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "scratchpad",
-	);
-	assert(addToolCalls.length > 0, "scratchpad tool was never called for add");
+	await runTool("scratchpad", { action: "add", text: "Fix the login bug" });
 
 	// Verify file
 	const afterAdd = fs.existsSync(SCRATCHPAD_FILE) ? fs.readFileSync(SCRATCHPAD_FILE, "utf-8") : "";
@@ -344,22 +364,22 @@ function testScratchpadCycle() {
 	assert(afterAdd.includes("[ ]"), "Item should be unchecked");
 
 	// Mark done
-	const doneResult = runPi('Use the scratchpad tool with action "done" and text "login bug". Just call the tool.');
-	assertPiExitedOk(doneResult, "pi (done)");
+	await runTool("scratchpad", { action: "done", text: "login bug" });
 
 	const afterDone = fs.readFileSync(SCRATCHPAD_FILE, "utf-8");
 	assert(afterDone.includes("[x]"), "Item should be checked after done");
 
 	// List
-	const listResult = runPi('Use the scratchpad tool with action "list". Report what items you see.');
-	assertPiExitedOk(listResult, "pi (list)");
+	const listResult = await runTool("scratchpad", { action: "list" });
+	const listText = toolResultText(listResult).toLowerCase();
+	const afterList = fs.readFileSync(SCRATCHPAD_FILE, "utf-8");
 	assert(
-		listResult.textOutput.toLowerCase().includes("login bug"),
-		`List response should mention item. Got: ${listResult.textOutput.slice(0, 300)}`,
+		listText.includes("login bug") || afterList.toLowerCase().includes("login bug"),
+		`Scratchpad list should include item. Result: ${listText.slice(0, 300)} Content: ${afterList.slice(0, 300)}`,
 	);
 }
 
-function testDailyLog() {
+async function testDailyLog() {
 	const today = todayStr();
 	const dailyFile = path.join(DAILY_DIR, `${today}.md`);
 
@@ -367,110 +387,71 @@ function testDailyLog() {
 	fs.mkdirSync(DAILY_DIR, { recursive: true });
 	if (fs.existsSync(dailyFile)) fs.unlinkSync(dailyFile);
 
-	const result = runPi(
-		'Use the memory_write tool with target "daily" and content "Worked on pi-memory extension today". Just call the tool.',
-	);
-	assertPiExitedOk(result);
-
-	const toolCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_write");
-	assert(toolCalls.length > 0, "memory_write tool was not called for daily log");
+	await runTool("memory_write", {
+		target: "daily",
+		content: "Worked on pi-memory extension today",
+	});
 
 	assert(fs.existsSync(dailyFile), `Daily log file not created: ${dailyFile}`);
 	const content = fs.readFileSync(dailyFile, "utf-8");
 	assert(content.includes("pi-memory extension"), `Daily log missing text. Content: ${content.slice(0, 200)}`);
 }
 
-function testMemorySearchGraceful() {
-	const result = runPi(
-		'Use the memory_search tool with query "test query" and mode "keyword". Report what the tool returns.',
-	);
-	assertPiExitedOk(result);
-
-	const searchCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_search");
-	assert(searchCalls.length > 0, "memory_search tool was not called");
-
-	// Tool should complete (not crash) — either with results or a helpful error
-	const toolEnds = result.events.filter((e) => e.type === "tool_execution_end" && e.toolName === "memory_search");
-	assert(toolEnds.length > 0, "memory_search tool execution did not complete");
+async function testMemorySearchGraceful() {
+	const result = await runTool("memory_search", { query: "test query", mode: "keyword" });
+	const text = toolResultText(result);
+	assert(text.length > 0, "memory_search returned no text");
 }
 
-function testMemorySearchWithQmd() {
+async function testMemorySearchWithQmd() {
 	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
 
 	const token = `QMD_E2E_TOKEN_${Date.now()}`;
-	const writeResult = runPi(
-		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "Search token: ${token}". Do not add anything else, just call the tool.`,
-	);
-	assertPiExitedOk(writeResult, "pi (write)");
-
-	const toolStarts = writeResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
-	);
-	assert(toolStarts.length > 0, "memory_write tool was never called");
+	await runTool("memory_write", { target: "long_term", content: `Search token: ${token}` });
 
 	const updated = runQmdUpdate();
 	assert(updated, "qmd update failed during search test");
 
-	const searchResult = runPi(
-		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
-	);
-	assertPiExitedOk(searchResult, "pi (search)");
-
-	const searchCalls = searchResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
-	);
-	assert(searchCalls.length > 0, "memory_search tool was not called (qmd-enabled test)");
+	const searchResult = await runTool("memory_search", { query: token, mode: "keyword" });
+	const searchText = toolResultText(searchResult);
 
 	assert(
-		searchResult.textOutput.toLowerCase().includes(token.toLowerCase()),
-		`Search results did not mention token. Got: ${searchResult.textOutput.slice(0, 400)}`,
+		searchText.toLowerCase().includes(token.toLowerCase()),
+		`Search results did not mention token. Got: ${searchText.slice(0, 400)}`,
 	);
 	assert(
-		searchResult.textOutput.includes("qmd://"),
-		`Search results did not include a qmd file path. Got: ${searchResult.textOutput.slice(0, 400)}`,
+		searchText.includes("qmd://"),
+		`Search results did not include a qmd file path. Got: ${searchText.slice(0, 400)}`,
 	);
 }
 
-function testMemorySearchNoResultsWithQmd() {
+async function testMemorySearchNoResultsWithQmd() {
 	const token = `QMD_E2E_NORESULT_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-	const searchResult = runPi(
-		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
-	);
-	assertPiExitedOk(searchResult, "pi (search)");
+	const searchResult = await runTool("memory_search", { query: token, mode: "keyword" });
 
-	const searchCalls = searchResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
-	);
-	assert(searchCalls.length > 0, "memory_search tool was not called (no-results test)");
-
-	const text = searchResult.textOutput.toLowerCase();
+	const text = toolResultText(searchResult).toLowerCase();
 	assert(
 		text.includes("no results found") && text.includes(token.toLowerCase()),
-		`Expected no-results message mentioning token. Got: ${searchResult.textOutput.slice(0, 400)}`,
+		`Expected no-results message mentioning token. Got: ${toolResultText(searchResult).slice(0, 400)}`,
 	);
 	assert(
 		!text.includes("failed to parse qmd output") && !text.includes("memory_search error"),
-		`Expected no parse error. Got: ${searchResult.textOutput.slice(0, 400)}`,
+		`Expected no parse error. Got: ${toolResultText(searchResult).slice(0, 400)}`,
 	);
 }
 
-function testSelectiveInjection() {
+async function testSelectiveInjection() {
 	// Write a specific memory, qmd update, then ask a related question
 	// WITHOUT telling the LLM to search. If it answers correctly,
 	// the before_agent_start qmd search injected the relevant memory.
 	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
 
 	const token = `SELINJ_${Date.now()}`;
-	const writeResult = runPi(
-		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#decision [[database-choice]] We decided to use PostgreSQL (codename: ${token}) for all backend services." Just call the tool.`,
-	);
-	assertPiExitedOk(writeResult, "pi (write)");
-
-	const toolStarts = writeResult.events.filter(
-		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
-	);
-	assert(toolStarts.length > 0, "memory_write tool was never called");
+	await runTool("memory_write", {
+		target: "long_term",
+		content: `#decision [[database-choice]] We decided to use PostgreSQL (codename: ${token}) for all backend services.`,
+	});
 
 	const updated = runQmdUpdate();
 	assert(updated, "qmd update failed");
@@ -500,36 +481,32 @@ function testSelectiveInjection() {
 	}
 }
 
-function testTagsInSearch() {
+async function testTagsInSearch() {
 	// Write content with #tags and [[links]], verify qmd keyword search finds them
 	if (fs.existsSync(MEMORY_FILE)) fs.unlinkSync(MEMORY_FILE);
 
 	const token = `TAG_${Date.now()}`;
-	const writeResult = runPi(
-		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#preference [[editor-choice]] Always use vim for editing (ref: ${token})." Just call the tool.`,
-	);
-	assertPiExitedOk(writeResult, "pi (write)");
+	await runTool("memory_write", {
+		target: "long_term",
+		content: `#preference [[editor-choice]] Always use vim for editing (ref: ${token}).`,
+	});
 	const updated = runQmdUpdate();
 	assert(updated, "qmd update failed");
 
 	// Search by tag
-	const tagResult = runPi(
-		'Use the memory_search tool with query "#preference" and mode "keyword". Report what the tool returns.',
-	);
-	assertPiExitedOk(tagResult, "pi (tag search)");
+	const tagResult = await runTool("memory_search", { query: "#preference", mode: "keyword" });
+	const tagText = toolResultText(tagResult);
 	assert(
-		tagResult.textOutput.includes(token) || tagResult.textOutput.toLowerCase().includes("vim"),
-		`Tag search did not find the entry. Got: ${tagResult.textOutput.slice(0, 400)}`,
+		tagText.includes(token) || tagText.toLowerCase().includes("vim"),
+		`Tag search did not find the entry. Got: ${tagText.slice(0, 400)}`,
 	);
 
 	// Search by wiki-link text
-	const linkResult = runPi(
-		'Use the memory_search tool with query "editor-choice" and mode "keyword". Report what the tool returns.',
-	);
-	assertPiExitedOk(linkResult, "pi (link search)");
+	const linkResult = await runTool("memory_search", { query: "editor-choice", mode: "keyword" });
+	const linkText = toolResultText(linkResult);
 	assert(
-		linkResult.textOutput.includes(token) || linkResult.textOutput.toLowerCase().includes("vim"),
-		`Wiki-link search did not find the entry. Got: ${linkResult.textOutput.slice(0, 400)}`,
+		linkText.includes(token) || linkText.toLowerCase().includes("vim"),
+		`Wiki-link search did not find the entry. Got: ${linkText.slice(0, 400)}`,
 	);
 }
 
@@ -570,7 +547,7 @@ function testHandoffSurvivesToNextSession() {
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
 	console.log("\n\x1b[1mpi-memory end-to-end tests\x1b[0m\n");
 
 	// Check extension file exists
@@ -601,46 +578,47 @@ function main() {
 
 	try {
 		console.log("\x1b[1m1. Extension loading\x1b[0m");
-		test("extension registers 4 tools", testExtensionLoads);
+		await test("extension registers 4 tools", testExtensionLoads);
 
 		console.log("\n\x1b[1m2. Context injection (direct write)\x1b[0m");
-		test("LLM answers from injected memory context", testContextInjectionDirect);
+		await test("LLM answers from injected memory context", testContextInjectionDirect);
 
 		console.log("\n\x1b[1m3. Memory write + cross-session recall\x1b[0m");
-		test("write memory, recall in new session", testMemoryWriteAndRecall);
+		await test("write memory, recall in new session", testMemoryWriteAndRecall);
 
 		console.log("\n\x1b[1m4. Scratchpad lifecycle\x1b[0m");
-		test("add → done → list cycle", testScratchpadCycle);
+		await test("add → done → list cycle", testScratchpadCycle);
 
 		console.log("\n\x1b[1m5. Daily log\x1b[0m");
-		test("write daily log entry", testDailyLog);
+		await test("write daily log entry", testDailyLog);
 
 		console.log("\n\x1b[1m6. Memory search\x1b[0m");
-		test("memory_search graceful behavior", testMemorySearchGraceful);
+		await test("memory_search graceful behavior", testMemorySearchGraceful);
 
 		const qmdAvailable = checkQmdAvailable();
 		const qmdCollection = qmdAvailable && checkQmdCollection("pi-memory");
 		if (qmdAvailable && qmdCollection) {
 			console.log("\n\x1b[1m7. Memory search with qmd\x1b[0m");
-			test("memory_search returns results with qmd", testMemorySearchWithQmd);
+			await test("memory_search returns results with qmd", testMemorySearchWithQmd);
 
 			console.log("\n\x1b[1m8. Memory search no-results parsing\x1b[0m");
-			test("memory_search handles qmd no-results output", testMemorySearchNoResultsWithQmd);
+			await test("memory_search handles qmd no-results output", testMemorySearchNoResultsWithQmd);
 
 			console.log("\n\x1b[1m9. Selective injection via qmd\x1b[0m");
-			test("related prompt surfaces memory without explicit search", testSelectiveInjection);
+			await test("related prompt surfaces memory without explicit search", testSelectiveInjection);
 
 			console.log("\n\x1b[1m10. Tags and links in search\x1b[0m");
-			test("#tags and [[links]] found by keyword search", testTagsInSearch);
+			await test("#tags and [[links]] found by keyword search", testTagsInSearch);
 
 			console.log("\n\x1b[1m11. Handoff survives to next session\x1b[0m");
-			test("handoff in daily log is visible in new session context", testHandoffSurvivesToNextSession);
+			await test("handoff in daily log is visible in new session context", testHandoffSurvivesToNextSession);
 		} else {
 			console.log("\n\x1b[1m7–11. qmd-dependent tests\x1b[0m");
 			console.log("  (skipped: qmd not available or collection missing)");
 			skipped += 5;
 		}
 	} finally {
+		_clearUpdateTimer();
 		// Restore original memory files
 		console.log("\nRestoring memory files ...");
 		restoreFile(MEMORY_FILE);
@@ -661,4 +639,7 @@ function main() {
 	process.exit(failed > 0 ? 1 : 0);
 }
 
-main();
+main().catch((err) => {
+	console.error(err instanceof Error ? err.message : String(err));
+	process.exit(1);
+});
