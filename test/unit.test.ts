@@ -1046,6 +1046,61 @@ describe("lifecycle hooks", () => {
 		expect(content).toContain("API key resolution unavailable");
 	});
 
+	test("session_shutdown with reason=reload skips exit summary entirely", async () => {
+		// Regression test for: /reload blocks for several seconds because
+		// session_shutdown fires generateExitSummary() on every reload.
+		const ctx = createShutdownCtx({
+			branch: [
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "hi" }],
+						timestamp: Date.now(),
+					},
+				},
+			],
+			model: { provider: "openai", id: "gpt-4o-mini" },
+		});
+
+		await hooks.session_shutdown({ reason: "reload" }, ctx);
+
+		// No daily log file should have been created — summary was skipped.
+		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+	});
+
+	test("session_shutdown with reason=quit still writes exit summary", async () => {
+		// Ensure the reload-skip guard does not suppress real quit summaries.
+		const ctx = createShutdownCtx({
+			branch: [
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Remember: dark mode preferred" }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Noted." }],
+						timestamp: Date.now(),
+					},
+				},
+			],
+			model: { provider: "openai", id: "gpt-4o-mini" },
+			modelRegistry: {},
+		});
+
+		await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+		// Fallback summary (no real API key) should still be written.
+		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
+		expect(content).toContain("## Session Summary");
+	});
+
 	// -- session_before_compact --
 
 	test("session_before_compact appends handoff when scratchpad has open items", async () => {
