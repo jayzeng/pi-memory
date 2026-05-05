@@ -23,6 +23,7 @@
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import registerExtension from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -50,8 +51,26 @@ const PI_E2E_MODEL = process.env.PI_E2E_MODEL;
 interface PiResult {
 	exitCode: number;
 	stdout: string;
+	stderr: string;
 	events: any[];
 	textOutput: string;
+}
+
+function registeredToolNames(): string[] {
+	const tools: string[] = [];
+	const pi = {
+		registerTool(tool: { name?: unknown }) {
+			if (typeof tool.name === "string") {
+				tools.push(tool.name);
+			}
+		},
+		on(_event: string, _handler: unknown) {
+			// Hooks are irrelevant for this registration smoke test.
+		},
+	};
+
+	registerExtension(pi as any);
+	return tools.sort();
 }
 
 /** Run pi in print+json mode with the extension loaded. */
@@ -68,6 +87,7 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 		`pi -p --mode ${mode}${providerArg}${modelArg} --no-extensions -e "${EXTENSION_PATH}" --no-session`;
 
 	let stdout: string;
+	let stderr = "";
 	let exitCode = 0;
 
 	try {
@@ -79,6 +99,7 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 		});
 	} catch (err: any) {
 		stdout = err.stdout ?? "";
+		stderr = err.stderr ?? "";
 		exitCode = err.status ?? 1;
 	}
 
@@ -107,7 +128,20 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 		textOutput = stdout.trim();
 	}
 
-	return { exitCode, stdout, events, textOutput };
+	return { exitCode, stdout, stderr, events, textOutput };
+}
+
+function formatPiFailure(result: PiResult, label = "pi"): string {
+	const parts = [`${label} exited with code ${result.exitCode}`];
+	const stderr = result.stderr.trim();
+	const stdout = result.stdout.trim();
+	if (stderr) parts.push(`stderr:\n${stderr.slice(0, 2_000)}`);
+	if (stdout) parts.push(`stdout:\n${stdout.slice(0, 2_000)}`);
+	return parts.join("\n");
+}
+
+function assertPiExitedOk(result: PiResult, label = "pi") {
+	assert(result.exitCode === 0, formatPiFailure(result, label));
 }
 
 /** Back up a file if it exists. */
@@ -217,17 +251,16 @@ function runQmdUpdate(): boolean {
 // ---------------------------------------------------------------------------
 
 function testExtensionLoads() {
-	const result = runPi(
-		"List all available tools. Just output their names, one per line. Do not use any tools, just list what you see in your tool list.",
+	const tools = registeredToolNames();
+	const expected = ["memory_read", "memory_search", "memory_write", "scratchpad"];
+
+	assert(
+		tools.length === expected.length,
+		`expected ${expected.length} tools, got ${tools.length}: ${tools.join(", ")}`,
 	);
-
-	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
-
-	const text = result.textOutput.toLowerCase();
-	assert(text.includes("memory_write"), `memory_write not found in response: ${result.textOutput.slice(0, 500)}`);
-	assert(text.includes("memory_read"), `memory_read not found in response: ${result.textOutput.slice(0, 500)}`);
-	assert(text.includes("scratchpad"), `scratchpad not found in response: ${result.textOutput.slice(0, 500)}`);
-	assert(text.includes("memory_search"), `memory_search not found in response: ${result.textOutput.slice(0, 500)}`);
+	for (const name of expected) {
+		assert(tools.includes(name), `${name} not registered. Got: ${tools.join(", ")}`);
+	}
 }
 
 function testContextInjectionDirect() {
@@ -243,7 +276,7 @@ function testContextInjectionDirect() {
 		"Based on the memory context you have, what is the user's favorite color and favorite food? Answer with just the two values separated by a comma, nothing else.",
 	);
 
-	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
+	assertPiExitedOk(result);
 
 	const text = result.textOutput.toLowerCase();
 	assert(text.includes("purple"), `Response does not mention "purple". Got: ${result.textOutput.slice(0, 300)}`);
@@ -259,7 +292,7 @@ function testMemoryWriteAndRecall() {
 		'Use the memory_write tool to write the following to long_term memory (target: "long_term"): "User lives in Seattle. User\'s favorite drink is tea." Do not add anything else, just call the tool.',
 	);
 
-	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+	assertPiExitedOk(writeResult, "pi (write)");
 
 	// Verify the tool was called
 	const toolStarts = writeResult.events.filter(
@@ -280,7 +313,7 @@ function testMemoryWriteAndRecall() {
 		"Based on what you know from memory, answer: 1) Where does the user live? 2) What is the user's favorite drink? Answer with just the facts.",
 	);
 
-	assert(recallResult.exitCode === 0, `pi (recall) exited with code ${recallResult.exitCode}`);
+	assertPiExitedOk(recallResult, "pi (recall)");
 
 	const recallText = recallResult.textOutput.toLowerCase();
 	assert(
@@ -298,7 +331,7 @@ function testScratchpadCycle() {
 	const addResult = runPi(
 		'Use the scratchpad tool with action "add" and text "Fix the login bug". Just call the tool.',
 	);
-	assert(addResult.exitCode === 0, `pi (add) exited with code ${addResult.exitCode}`);
+	assertPiExitedOk(addResult, "pi (add)");
 
 	const addToolCalls = addResult.events.filter(
 		(e) => e.type === "tool_execution_start" && e.toolName === "scratchpad",
@@ -312,14 +345,14 @@ function testScratchpadCycle() {
 
 	// Mark done
 	const doneResult = runPi('Use the scratchpad tool with action "done" and text "login bug". Just call the tool.');
-	assert(doneResult.exitCode === 0, `pi (done) exited with code ${doneResult.exitCode}`);
+	assertPiExitedOk(doneResult, "pi (done)");
 
 	const afterDone = fs.readFileSync(SCRATCHPAD_FILE, "utf-8");
 	assert(afterDone.includes("[x]"), "Item should be checked after done");
 
 	// List
 	const listResult = runPi('Use the scratchpad tool with action "list". Report what items you see.');
-	assert(listResult.exitCode === 0, `pi (list) exited with code ${listResult.exitCode}`);
+	assertPiExitedOk(listResult, "pi (list)");
 	assert(
 		listResult.textOutput.toLowerCase().includes("login bug"),
 		`List response should mention item. Got: ${listResult.textOutput.slice(0, 300)}`,
@@ -337,7 +370,7 @@ function testDailyLog() {
 	const result = runPi(
 		'Use the memory_write tool with target "daily" and content "Worked on pi-memory extension today". Just call the tool.',
 	);
-	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
+	assertPiExitedOk(result);
 
 	const toolCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_write");
 	assert(toolCalls.length > 0, "memory_write tool was not called for daily log");
@@ -351,7 +384,7 @@ function testMemorySearchGraceful() {
 	const result = runPi(
 		'Use the memory_search tool with query "test query" and mode "keyword". Report what the tool returns.',
 	);
-	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
+	assertPiExitedOk(result);
 
 	const searchCalls = result.events.filter((e) => e.type === "tool_execution_start" && e.toolName === "memory_search");
 	assert(searchCalls.length > 0, "memory_search tool was not called");
@@ -368,7 +401,7 @@ function testMemorySearchWithQmd() {
 	const writeResult = runPi(
 		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "Search token: ${token}". Do not add anything else, just call the tool.`,
 	);
-	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+	assertPiExitedOk(writeResult, "pi (write)");
 
 	const toolStarts = writeResult.events.filter(
 		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
@@ -381,7 +414,7 @@ function testMemorySearchWithQmd() {
 	const searchResult = runPi(
 		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
 	);
-	assert(searchResult.exitCode === 0, `pi (search) exited with code ${searchResult.exitCode}`);
+	assertPiExitedOk(searchResult, "pi (search)");
 
 	const searchCalls = searchResult.events.filter(
 		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
@@ -404,7 +437,7 @@ function testMemorySearchNoResultsWithQmd() {
 	const searchResult = runPi(
 		`Use the memory_search tool with query "${token}" and mode "keyword". Report what the tool returns.`,
 	);
-	assert(searchResult.exitCode === 0, `pi (search) exited with code ${searchResult.exitCode}`);
+	assertPiExitedOk(searchResult, "pi (search)");
 
 	const searchCalls = searchResult.events.filter(
 		(e) => e.type === "tool_execution_start" && e.toolName === "memory_search",
@@ -432,7 +465,7 @@ function testSelectiveInjection() {
 	const writeResult = runPi(
 		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#decision [[database-choice]] We decided to use PostgreSQL (codename: ${token}) for all backend services." Just call the tool.`,
 	);
-	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+	assertPiExitedOk(writeResult, "pi (write)");
 
 	const toolStarts = writeResult.events.filter(
 		(e) => e.type === "tool_execution_start" && e.toolName === "memory_write",
@@ -447,7 +480,7 @@ function testSelectiveInjection() {
 	const recallResult = runPi(
 		"Based on the context you have available, what database was chosen for backend services? Just state the database name and codename. Do NOT use any tools.",
 	);
-	assert(recallResult.exitCode === 0, `pi (recall) exited with code ${recallResult.exitCode}`);
+	assertPiExitedOk(recallResult, "pi (recall)");
 
 	// The LLM should mention PostgreSQL — either from MEMORY.md injection or search injection
 	const text = recallResult.textOutput.toLowerCase();
@@ -475,7 +508,7 @@ function testTagsInSearch() {
 	const writeResult = runPi(
 		`Use the memory_write tool to write the following to long_term memory (target: "long_term"): "#preference [[editor-choice]] Always use vim for editing (ref: ${token})." Just call the tool.`,
 	);
-	assert(writeResult.exitCode === 0, `pi (write) exited with code ${writeResult.exitCode}`);
+	assertPiExitedOk(writeResult, "pi (write)");
 	const updated = runQmdUpdate();
 	assert(updated, "qmd update failed");
 
@@ -483,7 +516,7 @@ function testTagsInSearch() {
 	const tagResult = runPi(
 		'Use the memory_search tool with query "#preference" and mode "keyword". Report what the tool returns.',
 	);
-	assert(tagResult.exitCode === 0, `pi (tag search) exited with code ${tagResult.exitCode}`);
+	assertPiExitedOk(tagResult, "pi (tag search)");
 	assert(
 		tagResult.textOutput.includes(token) || tagResult.textOutput.toLowerCase().includes("vim"),
 		`Tag search did not find the entry. Got: ${tagResult.textOutput.slice(0, 400)}`,
@@ -493,7 +526,7 @@ function testTagsInSearch() {
 	const linkResult = runPi(
 		'Use the memory_search tool with query "editor-choice" and mode "keyword". Report what the tool returns.',
 	);
-	assert(linkResult.exitCode === 0, `pi (link search) exited with code ${linkResult.exitCode}`);
+	assertPiExitedOk(linkResult, "pi (link search)");
 	assert(
 		linkResult.textOutput.includes(token) || linkResult.textOutput.toLowerCase().includes("vim"),
 		`Wiki-link search did not find the entry. Got: ${linkResult.textOutput.slice(0, 400)}`,
@@ -524,7 +557,7 @@ function testHandoffSurvivesToNextSession() {
 	const result = runPi(
 		"Based on the context you have available, what migration task is open? Just state the task name. Do NOT use any tools.",
 	);
-	assert(result.exitCode === 0, `pi exited with code ${result.exitCode}`);
+	assertPiExitedOk(result);
 
 	const text = result.textOutput.toLowerCase();
 	assert(
