@@ -17,6 +17,11 @@ pi install ./pi-memory
 
 # Optional (enables `memory_search` + selective injection, requires Bun)
 command -v qmd >/dev/null 2>&1 || bun install -g https://github.com/tobi/qmd
+n> **Windows users**: After installing qmd, verify it works from a standard Command Prompt
+> (`cmd.exe /c qmd status`).  If you see "The system cannot find the path specified",
+> edit `%APPDATA%
+pmqmd.cmd` and replace `/bin/sh` with the full path to Git Bashs
+> `sh.exe` (typically `C:Program FilesGitusrbinsh.exe`).
 ```
 
 Or copy to your extensions directory:
@@ -195,6 +200,12 @@ pi install npm:pi-memory
 ```
 
 ## Changelog
+
+### 0.3.10
+
+- **Windows compatibility**: Fixed two issues that prevented `memory_search` from working on Windows:
+  - `execFile` cannot spawn `.cmd` files directly on Windows; qmd invocations are now wrapped with `cmd.exe /c`.
+  - `HOME` is often unset in Node.js on Windows; the memory directory now falls back to `USERPROFILE` so files land in the correct location instead of a literal `~` subdirectory.
 
 ### 0.3.6
 

@@ -37,7 +37,20 @@ import { Type } from "@sinclair/typebox";
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
+/**
+ * Resolve the memory directory cross-platform.
+ *
+ * PI_MEMORY_DIR, if set, is used as the full path.  Otherwise we join the
+ * user's home directory with `.pi/agent/memory`.  On Windows `HOME` is often
+ * unset; we fall back to `USERPROFILE` which is the canonical equivalent.
+ */
+function resolveMemoryDir(): string {
+	if (process.env.PI_MEMORY_DIR) return process.env.PI_MEMORY_DIR;
+	const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
+	return path.join(home, ".pi", "agent", "memory");
+}
+
+const DEFAULT_MEMORY_DIR = resolveMemoryDir();
 
 let MEMORY_DIR = DEFAULT_MEMORY_DIR;
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
@@ -593,7 +606,24 @@ export function buildMemoryContext(searchResults?: string): string {
 // ---------------------------------------------------------------------------
 
 type ExecFileFn = typeof execFile;
-let execFileFn: ExecFileFn = execFile;
+
+/**
+ * On Windows, Node's child_process.execFile cannot directly spawn .cmd / .bat
+ * files — it needs a shell.  We wrap qmd invocations so they go through
+ * `cmd.exe /c qmd …` which works reliably.
+ */
+function wrapExecFileForQmd(fn: typeof execFile): ExecFileFn {
+	if (process.platform !== "win32") return fn;
+	return (cmd, args, opts, cb) => {
+		if (cmd === "qmd") {
+			fn("cmd.exe", ["/c", cmd, ...args], opts ?? {}, cb);
+		} else {
+			fn(cmd, args, opts, cb);
+		}
+	};
+}
+
+let execFileFn: ExecFileFn = wrapExecFileForQmd(execFile);
 
 let qmdAvailable = false;
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -607,7 +637,7 @@ export function _setExecFileForTest(fn: ExecFileFn) {
 
 /** Reset execFile implementation (for testing). */
 export function _resetExecFileForTest() {
-	execFileFn = execFile;
+	execFileFn = wrapExecFileForQmd(execFile);
 }
 
 /** Set qmd availability flag (for testing). */
