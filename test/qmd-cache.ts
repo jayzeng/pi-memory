@@ -7,6 +7,7 @@ import {
 	_setQmdAvailable,
 	checkCollection,
 	detectQmd,
+	setupQmdCollection,
 	shouldSkipExitSummaryForReason,
 } from "../index.ts";
 
@@ -29,7 +30,7 @@ try {
 	_clearQmdStatusCaches();
 	const qmdCalls = mockExecFile((cmd, args) => {
 		assert.equal(cmd, "qmd");
-		assert.deepEqual(args, ["status"]);
+		assert.deepEqual(args, ["collection", "list"]);
 		return {};
 	});
 
@@ -50,6 +51,35 @@ try {
 
 	_setQmdAvailable(false);
 	assert.equal(await detectQmd(), false, "_setQmdAvailable should seed the cached status");
+
+	// setupQmdCollection should seed the cache so a subsequent checkCollection
+	// doesn't redundantly re-run the setup flow within the negative-cache window.
+	_clearQmdStatusCaches();
+	let setupCalls = 0;
+	let postSetupListCalls = 0;
+	_setExecFileForTest(((cmd: string, args: readonly string[], _options: unknown, callback: ExecCallback) => {
+		assert.equal(cmd, "qmd");
+		if (args[0] === "collection" && args[1] === "add") {
+			setupCalls++;
+			queueMicrotask(() => callback(null, "", ""));
+			return;
+		}
+		if (args[0] === "context" && args[1] === "add") {
+			queueMicrotask(() => callback(null, "", ""));
+			return;
+		}
+		if (args[0] === "collection" && args[1] === "list") {
+			postSetupListCalls++;
+			queueMicrotask(() => callback(null, JSON.stringify([{ name: "pi-memory" }]), ""));
+			return;
+		}
+		queueMicrotask(() => callback(new Error(`unexpected args: ${args.join(" ")}`), "", ""));
+	}) as ExecFileFn);
+
+	assert.equal(await setupQmdCollection(), true);
+	assert.equal(setupCalls, 1);
+	assert.equal(await checkCollection("pi-memory"), true);
+	assert.equal(postSetupListCalls, 0, "setupQmdCollection should seed the collection cache");
 
 	const originalSummarizeTransitions = process.env.PI_MEMORY_SUMMARIZE_TRANSITIONS;
 	try {

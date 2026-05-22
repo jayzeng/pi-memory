@@ -608,8 +608,16 @@ let execFileFn: ExecFileFn = execFile;
 
 let qmdAvailable = false;
 let qmdAvailabilityCheckedAt = 0;
+// Positive results are stable for the session; negative results should refresh
+// quickly so users who install qmd (or run setupQmdCollection) mid-session
+// don't have to wait through a long TTL before retries succeed.
 const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
+const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
 const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
+
+function qmdStatusTtl(positive: boolean): number {
+	return positive ? QMD_STATUS_CACHE_TTL_MS : QMD_STATUS_NEGATIVE_CACHE_TTL_MS;
+}
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
 let terminalInputUnsubscribe: (() => void) | null = null;
@@ -709,12 +717,15 @@ export async function setupQmdCollection(): Promise<boolean> {
 			// Ignore — context may already exist
 		}
 	}
+	// Seed the cache so checkCollection("pi-memory") doesn't redundantly re-run
+	// setupQmdCollection during the short negative-cache window.
+	qmdCollectionStatusCache.set("pi-memory", { checkedAt: Date.now(), exists: true });
 	return true;
 }
 
 export function detectQmd(): Promise<boolean> {
 	const now = Date.now();
-	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < QMD_STATUS_CACHE_TTL_MS) {
+	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < qmdStatusTtl(qmdAvailable)) {
 		return Promise.resolve(qmdAvailable);
 	}
 
@@ -733,7 +744,7 @@ export function detectQmd(): Promise<boolean> {
 export function checkCollection(name: string): Promise<boolean> {
 	const cached = qmdCollectionStatusCache.get(name);
 	const now = Date.now();
-	if (cached && now - cached.checkedAt < QMD_STATUS_CACHE_TTL_MS) {
+	if (cached && now - cached.checkedAt < qmdStatusTtl(cached.exists)) {
 		return Promise.resolve(cached.exists);
 	}
 
