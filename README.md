@@ -81,17 +81,31 @@ Before every agent turn, the following are injected into the system prompt (in p
 
 1. **Open scratchpad items** (up to 2K chars)
 2. **Today's daily log** (up to 3K chars, tail)
-3. **Relevant memories via qmd search** (up to 2.5K chars) — searches using the user's current prompt to surface related past context
-4. **MEMORY.md** (up to 4K chars, middle-truncated)
-5. **Yesterday's daily log** (up to 3K chars, tail — lowest priority, trimmed first)
+3. **MEMORY.md** (up to 4K chars, middle-truncated)
+4. **Yesterday's daily log** (up to 3K chars, tail — lowest priority, trimmed first)
 
-Total injection is capped at 16K chars. When qmd is unavailable, step 3 is skipped and the rest works as before.
+Total injection is capped at 16K chars.
 
-### Selective injection
+### KV cache-stable snapshot (default)
 
-When qmd is available, the extension automatically searches memory using the user's prompt before each turn. The top 3 keyword results are injected alongside the standard context. This surfaces relevant past decisions, preferences, and notes — even from daily logs older than yesterday — without the agent needing to explicitly call `memory_search`.
+Local prefix-caching runtimes (llama.cpp, vLLM, MLX) invalidate from the first divergent token onward. If the injected memory block changes turn-to-turn, every subsequent user / assistant / tool token gets reprocessed — effectively the entire conversation history each turn.
 
-The search has a 3-second timeout and fails silently. If qmd is down or the query returns nothing, injection falls back to the standard behavior.
+To keep the prefix byte-stable, the extension snapshots the memory context at deliberate checkpoints and emits the same bytes for every turn in between. Snapshots refresh on:
+
+- **`session_start`** — fresh snapshot per session
+- **`session_before_compact`** — handoff is written then snapshot refreshes (one intentional cache boundary at compaction)
+- **`memory_write` with `target: long_term`** — marks the snapshot dirty so the next turn refreshes (long-term writes are rare, intentional, and the user expects them to stick as ambient context)
+- **Day rollover** — snapshot's captured date no longer matches today
+
+`memory_write` with `target: daily` and `scratchpad` writes do **not** mark dirty — they're high-frequency and the write content is already echoed via tool-call args. The model can always call `memory_read` / `memory_search` for the authoritative latest state.
+
+Set `PI_MEMORY_SNAPSHOT=per-turn` to opt out and restore the old per-turn rebuild behavior, including automatic per-prompt qmd search injection.
+
+### Selective injection (opt-in via `per-turn` mode)
+
+When `PI_MEMORY_SNAPSHOT=per-turn` is set and qmd is available, the extension automatically searches memory using the user's prompt before each turn. The top 3 keyword results are injected alongside the standard context. This surfaces relevant past decisions without an explicit `memory_search` call, at the cost of busting the KV cache every turn (the search is prompt-dependent and cannot be cached).
+
+The search has a 3-second timeout and fails silently. In the default `stable` mode, the model gets the same capability by calling `memory_search` on demand.
 
 ### Tags and links
 
@@ -134,8 +148,10 @@ This ensures in-progress context survives compaction and is visible in the next 
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
+| `PI_MEMORY_DIR` | path | `~/.pi/agent/memory` | Override the memory storage directory |
+| `PI_MEMORY_SNAPSHOT` | `stable`, `per-turn` | `stable` | `stable` snapshots memory at checkpoints for KV cache stability; `per-turn` rebuilds every turn (legacy behavior) |
 | `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` after writes |
-| `PI_MEMORY_NO_SEARCH` | `1` | unset | Disable selective injection (for A/B testing) |
+| `PI_MEMORY_NO_SEARCH` | `1` | unset | Disable selective injection in `per-turn` mode (no effect in `stable` mode) |
 
 ## Running tests
 
@@ -195,6 +211,12 @@ pi install npm:pi-memory
 ```
 
 ## Changelog
+
+### Unreleased
+
+- **KV cache-stable memory snapshot** (default `PI_MEMORY_SNAPSHOT=stable`): the injected memory block is now byte-stable across turns. Snapshot refreshes only at deliberate checkpoints — `session_start`, `session_before_compact`, `memory_write(target: long_term)`, and day rollover — so local prefix caches (llama.cpp, vLLM, MLX) hit on every normal turn instead of reprocessing the entire conversation tail each turn.
+- **Per-turn qmd search no longer auto-injected by default**. The model retains on-demand recall via `memory_search`. Set `PI_MEMORY_SNAPSHOT=per-turn` to restore the old behavior (busts the cache every turn).
+- Snapshot system-prompt header now includes the snapshot reason and timestamp so the model knows when ambient context was captured and that `memory_read` / `memory_search` give the authoritative latest state.
 
 ### 0.3.6
 

@@ -16,6 +16,7 @@ import {
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
+	_resetMemorySnapshot,
 	_setBaseDir,
 	_setExecFileForTest,
 	_setQmdAvailable,
@@ -957,6 +958,7 @@ describe("lifecycle hooks", () => {
 		setupTmpDir();
 		ensureDirs();
 		_setQmdAvailable(false);
+		_resetMemorySnapshot();
 		const mockPi = createMockPi();
 		hooks = mockPi.hooks;
 		registerExtension(mockPi.pi as any);
@@ -1116,6 +1118,198 @@ describe("lifecycle hooks", () => {
 		const ctx = createMockCtx();
 		await hooks.session_before_compact({}, ctx);
 		expect(ctx.ui.notify).not.toHaveBeenCalled();
+	});
+});
+
+// ==========================================================================
+// 9b. KV cache stability (Option P snapshot behavior)
+// ==========================================================================
+
+describe("KV cache stability: memory snapshot", () => {
+	let hooks: Record<string, (...args: unknown[]) => unknown>;
+	let tools: Record<string, any>;
+	const prevSnapshotEnv = process.env.PI_MEMORY_SNAPSHOT;
+	const prevNoSearchEnv = process.env.PI_MEMORY_NO_SEARCH;
+
+	beforeEach(() => {
+		setupTmpDir();
+		ensureDirs();
+		_setQmdAvailable(false);
+		_resetMemorySnapshot();
+		// Default to stable mode for these tests; per-turn test overrides locally.
+		delete process.env.PI_MEMORY_SNAPSHOT;
+		// Avoid implicit search calls bleeding in.
+		process.env.PI_MEMORY_NO_SEARCH = "1";
+		const mockPi = createMockPi();
+		hooks = mockPi.hooks;
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		if (prevSnapshotEnv === undefined) delete process.env.PI_MEMORY_SNAPSHOT;
+		else process.env.PI_MEMORY_SNAPSHOT = prevSnapshotEnv;
+		if (prevNoSearchEnv === undefined) delete process.env.PI_MEMORY_NO_SEARCH;
+		else process.env.PI_MEMORY_NO_SEARCH = prevNoSearchEnv;
+		cleanupTmpDir();
+	});
+
+	test("byte-stable systemPrompt across turns despite mid-session file mutations", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Initial long-term content", "utf-8");
+		fs.writeFileSync(
+			path.join(tmpDir, "SCRATCHPAD.md"),
+			"# Scratchpad\n\n<!-- ts -->\n- [ ] initial item\n",
+			"utf-8",
+		);
+
+		const event1 = { systemPrompt: "base prompt", prompt: "first user query" };
+		const result1 = await hooks.before_agent_start(event1, {});
+		expect(result1).toBeDefined();
+		expect(result1.systemPrompt).toContain("Initial long-term content");
+
+		// Mutate disk state mid-session (simulates external edits, scratchpad/daily writes via tools, etc.)
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "MUTATED long-term content XYZ", "utf-8");
+		fs.writeFileSync(
+			path.join(tmpDir, "SCRATCHPAD.md"),
+			"# Scratchpad\n\n<!-- ts2 -->\n- [ ] new mutated item\n",
+			"utf-8",
+		);
+		fs.writeFileSync(dailyPath(todayStr()), "Brand new daily log mid-session", "utf-8");
+
+		const event2 = { systemPrompt: "base prompt", prompt: "completely different second query" };
+		const result2 = await hooks.before_agent_start(event2, {});
+		expect(result2).toBeDefined();
+		// The whole point: prompt must be byte-identical for KV cache.
+		expect(result2.systemPrompt).toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("MUTATED");
+		expect(result2.systemPrompt).not.toContain("Brand new daily log");
+	});
+
+	test("session_before_compact refreshes snapshot even when no handoff is written", async () => {
+		// Snapshot captures an open scratchpad item plus some long-term content
+		// so the post-refresh snapshot is still non-empty (and we get a result).
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Stable long-term content", "utf-8");
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n<!-- ts -->\n- [ ] stale item\n", "utf-8");
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("stale item");
+
+		// User completes the item via scratchpad tool (does not mark dirty by design).
+		fs.writeFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "# Scratchpad\n\n<!-- ts -->\n- [x] stale item\n", "utf-8");
+
+		// Compaction fires with no open scratchpad items and no daily log → empty handoff.
+		await hooks.session_before_compact({}, createMockCtx());
+
+		// Next turn must reflect the new on-disk state because tool history was compacted away.
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2).toBeDefined();
+		expect(result2.systemPrompt).not.toContain("stale item");
+		expect(result2.systemPrompt).toContain("Stable long-term content");
+	});
+
+	test("session_before_compact refreshes snapshot so handoff is visible next turn", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "SCRATCHPAD.md"),
+			"# Scratchpad\n\n<!-- ts -->\n- [ ] follow up later\n",
+			"utf-8",
+		);
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("follow up later");
+		expect(result1.systemPrompt).not.toContain("Session Handoff");
+
+		await hooks.session_before_compact({}, createMockCtx());
+
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toContain("Session Handoff");
+		// And it must now differ from the pre-compaction snapshot — that's the intentional cache boundary.
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+	});
+
+	test("memory_write target=long_term marks snapshot dirty so next turn refreshes", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("OLD_FACT");
+
+		await tools.memory_write.execute(
+			"tc1",
+			{ target: "long_term", content: "NEW_FACT_ABOUT_X", mode: "append" },
+			null,
+			null,
+			createMockCtx(),
+		);
+
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toContain("NEW_FACT_ABOUT_X");
+		// Snapshot did refresh, so previous bytes are no longer identical.
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+	});
+
+	test("memory_write target=daily does NOT mark snapshot dirty (cache stays warm)", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Stable long-term content", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+
+		await tools.memory_write.execute(
+			"tc1",
+			{ target: "daily", content: "DAILY_NOTE_ABOUT_Y", mode: "append" },
+			null,
+			null,
+			createMockCtx(),
+		);
+
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		// Daily writes are echoed via tool-call args; snapshot must NOT churn.
+		expect(result2.systemPrompt).toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("DAILY_NOTE_ABOUT_Y");
+	});
+
+	test("PI_MEMORY_SNAPSHOT=per-turn restores per-turn rebuild behavior", async () => {
+		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "First content", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("First content");
+
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Second content REPLACED", "utf-8");
+
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toContain("Second content REPLACED");
+		expect(result2.systemPrompt).not.toContain("First content");
+	});
+
+	test("session_start refreshes snapshot (resets module state across sessions)", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-1 content", "utf-8");
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("session-1 content");
+
+		// Simulate a new session: file changes, then session_start fires before next turn.
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "session-2 content", "utf-8");
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(new Error("not available"), "", "");
+		}) as any);
+		try {
+			await hooks.session_start(
+				{},
+				{
+					hasUI: false,
+					sessionManager: { getSessionId: () => "newsess0" },
+					ui: { notify: () => {} },
+				},
+			);
+			const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+			expect(result2.systemPrompt).toContain("session-2 content");
+			expect(result2.systemPrompt).not.toContain("session-1 content");
+		} finally {
+			_resetExecFileForTest();
+		}
+	});
+
+	test("snapshot caveat is included in stable mode header", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "anything", "utf-8");
+		const result = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		// Reader-facing hint that ambient context may lag behind disk.
+		expect(result.systemPrompt.toLowerCase()).toContain("snapshot");
 	});
 });
 

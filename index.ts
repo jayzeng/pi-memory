@@ -865,6 +865,44 @@ export function runQmdSearch(
 }
 
 // ---------------------------------------------------------------------------
+// Memory snapshot (Option P: KV cache-stable context injection)
+//
+// The system prompt must be byte-stable across turns so local prefix caches
+// (llama.cpp, vLLM, MLX) don't invalidate the entire conversation tail on each
+// turn. We snapshot the memory context at deliberate checkpoints
+// (session_start, session_before_compact, long_term writes, day rollover) and
+// emit the same bytes for every turn in between.
+// ---------------------------------------------------------------------------
+
+let memorySnapshot: string | null = null;
+let snapshotTakenAt: string | null = null;
+let snapshotTakenOnDate: string | null = null;
+let snapshotReason: string | null = null;
+let snapshotDirty = false;
+
+function refreshMemorySnapshot(reason: string) {
+	memorySnapshot = buildMemoryContext("");
+	snapshotTakenAt = nowTimestamp();
+	snapshotTakenOnDate = todayStr();
+	snapshotReason = reason;
+	snapshotDirty = false;
+}
+
+function getSnapshotMode(): "stable" | "per-turn" {
+	const mode = (process.env.PI_MEMORY_SNAPSHOT ?? "stable").toLowerCase();
+	return mode === "per-turn" ? "per-turn" : "stable";
+}
+
+/** Reset snapshot state (for testing). */
+export function _resetMemorySnapshot() {
+	memorySnapshot = null;
+	snapshotTakenAt = null;
+	snapshotTakenOnDate = null;
+	snapshotReason = null;
+	snapshotDirty = false;
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -891,6 +929,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(qmdInstallInstructions(), "info");
 			}
+			refreshMemorySnapshot("session_start");
 			return;
 		}
 
@@ -898,6 +937,7 @@ export default function (pi: ExtensionAPI) {
 		if (!hasCollection) {
 			await setupQmdCollection();
 		}
+		refreshMemorySnapshot("session_start");
 	});
 
 	// --- session_shutdown: write exit summary + clean up timer ---
@@ -954,13 +994,35 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Inject memory context before every agent turn ---
 	pi.on("before_agent_start", async (event, _ctx) => {
-		const skipSearch = process.env.PI_MEMORY_NO_SEARCH === "1";
-		const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
-		const memoryContext = buildMemoryContext(searchResults);
+		const mode = getSnapshotMode();
+
+		let memoryContext: string;
+		let snapshotCaveat = "";
+
+		if (mode === "per-turn") {
+			const skipSearch = process.env.PI_MEMORY_NO_SEARCH === "1";
+			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
+			memoryContext = buildMemoryContext(searchResults);
+		} else {
+			const today = todayStr();
+			const needsRefresh = memorySnapshot === null || snapshotDirty || snapshotTakenOnDate !== today;
+			if (needsRefresh) {
+				const reason =
+					memorySnapshot === null ? "before_agent_start" : snapshotDirty ? "long_term_write" : "day_rollover";
+				refreshMemorySnapshot(reason);
+			}
+			memoryContext = memorySnapshot ?? "";
+			snapshotCaveat =
+				`Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
+				"Use memory_read / memory_search for the authoritative latest state; " +
+				"recent writes may also be visible in tool-call history.";
+		}
+
 		if (!memoryContext) return;
 
-		const memoryInstructions = [
-			"\n\n## Memory",
+		const headerLines = ["\n\n## Memory"];
+		if (snapshotCaveat) headerLines.push(`(${snapshotCaveat})`);
+		headerLines.push(
 			"The following memory files have been loaded. Use the memory_write tool to persist important information.",
 			"- Decisions, preferences, and durable facts \u2192 MEMORY.md",
 			"- Day-to-day notes and running context \u2192 daily/<YYYY-MM-DD>.md",
@@ -970,10 +1032,10 @@ export default function (pi: ExtensionAPI) {
 			'- If someone says "remember this," write it immediately.',
 			"",
 			memoryContext,
-		].join("\n");
+		);
 
 		return {
-			systemPrompt: event.systemPrompt + memoryInstructions,
+			systemPrompt: event.systemPrompt + headerLines.join("\n"),
 		};
 	});
 
@@ -1004,16 +1066,25 @@ export default function (pi: ExtensionAPI) {
 			parts.push(`**Recent daily log context:**\n${tail}`);
 		}
 
-		if (parts.length === 0) return;
+		// Intentional cache boundary: compaction drops tool history, so the
+		// snapshot must catch up to disk on every compaction — even when no
+		// handoff is written. Otherwise stale pre-compaction state (e.g. a
+		// completed scratchpad item that no longer appears in the snapshot
+		// source files) would keep being injected.
+		try {
+			if (parts.length === 0) return;
 
-		const handoff = [`<!-- HANDOFF ${ts} [${sid}] -->`, "## Session Handoff", ...parts].join("\n");
+			const handoff = [`<!-- HANDOFF ${ts} [${sid}] -->`, "## Session Handoff", ...parts].join("\n");
 
-		const filePath = dailyPath(todayStr());
-		const existing = readFileSafe(filePath) ?? "";
-		const separator = existing.trim() ? "\n\n" : "";
-		fs.writeFileSync(filePath, existing + separator + handoff, "utf-8");
-		await ensureQmdAvailableForUpdate();
-		scheduleQmdUpdate();
+			const filePath = dailyPath(todayStr());
+			const existing = readFileSafe(filePath) ?? "";
+			const separator = existing.trim() ? "\n\n" : "";
+			fs.writeFileSync(filePath, existing + separator + handoff, "utf-8");
+			await ensureQmdAvailableForUpdate();
+			scheduleQmdUpdate();
+		} finally {
+			refreshMemorySnapshot("session_before_compact");
+		}
 	});
 
 	// --- memory_write tool ---
@@ -1090,6 +1161,12 @@ export default function (pi: ExtensionAPI) {
 			const existingSnippet = existingPreview.preview
 				? `\n\n${formatPreviewBlock("Existing MEMORY.md preview", existing, "middle")}`
 				: "\n\nMEMORY.md was empty.";
+
+			// Long-term writes change the ambient "background context" the model
+			// should always see. Mark snapshot dirty so the next turn refreshes.
+			// Daily writes are high-frequency and already echoed via tool-call
+			// args — they are intentionally NOT marked dirty.
+			snapshotDirty = true;
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
