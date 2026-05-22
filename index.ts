@@ -693,8 +693,10 @@ export async function setupQmdCollection(): Promise<boolean> {
 
 export function detectQmd(): Promise<boolean> {
 	return new Promise((resolve) => {
-		// qmd doesn't reliably support --version; use a fast command that exits 0 when available.
-		execFileFn("qmd", ["status"], { timeout: 5_000 }, (err) => {
+		// `qmd status` can trigger slow model/device probing on some systems (e.g. Vulkan fallback),
+		// which may exceed short startup timeouts and produce false negatives.
+		// `qmd collection list` is much lighter and still validates the binary is callable.
+		execFileFn("qmd", ["collection", "list"], { timeout: 15_000 }, (err) => {
 			resolve(!err);
 		});
 	});
