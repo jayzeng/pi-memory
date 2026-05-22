@@ -625,13 +625,32 @@ function isQmdCommand(file: string | URL): boolean {
 	return basename === "qmd" || basename === "qmd.cmd" || basename === "qmd.exe";
 }
 
-export function qmdExecFileOptions(
-	file: string | URL,
-	options: ExecFileOptions,
+// PowerShell single-quoted literal: a literal single quote is escaped by doubling.
+// `$`, backticks, and other PS metacharacters are inert inside single quotes.
+function quoteForPowerShell(s: string): string {
+	return `'${String(s).replace(/'/g, "''")}'`;
+}
+
+// On Windows, route qmd through PowerShell so it resolves regardless of which
+// shim type npm produced — .cmd, .exe, or .ps1. cmd.exe's PATHEXT does not
+// include .PS1, so `shell: true` (which uses cmd) fails when npm only creates
+// qmd.ps1 (observed with npm 11 + Node 22 on github actions runners).
+export function buildQmdSpawn(
+	file: string,
+	args: readonly string[],
 	platform: NodeJS.Platform = process.platform,
-): ExecFileOptions {
-	if (platform !== "win32" || !isQmdCommand(file) || options.shell) return options;
-	return { ...options, shell: true };
+	shellOverride?: string,
+): { file: string; args: string[] } {
+	if (platform !== "win32" || !isQmdCommand(file)) {
+		return { file, args: [...args] };
+	}
+	const psShell = shellOverride ?? process.env.PI_QMD_POWERSHELL ?? "powershell.exe";
+	const quoted = args.map(quoteForPowerShell).join(" ");
+	const command = quoted.length > 0 ? `& qmd ${quoted}; exit $LASTEXITCODE` : "& qmd; exit $LASTEXITCODE";
+	return {
+		file: psShell,
+		args: ["-NoProfile", "-NoLogo", "-Command", command],
+	};
 }
 
 const execFileWithQmdOptions: ExecFileFn = ((
@@ -639,7 +658,10 @@ const execFileWithQmdOptions: ExecFileFn = ((
 	args: readonly string[],
 	options: ExecFileOptions,
 	callback: (...args: any[]) => void,
-) => execFile(file, args as string[], qmdExecFileOptions(file, options), callback as any)) as ExecFileFn;
+) => {
+	const spawn = buildQmdSpawn(file, args ?? []);
+	return execFile(spawn.file, spawn.args, options, callback as any);
+}) as ExecFileFn;
 
 let execFileFn: ExecFileFn = execFileWithQmdOptions;
 

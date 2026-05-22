@@ -21,12 +21,12 @@ import {
 	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
+	buildQmdSpawn,
 	dailyPath,
 	ensureDirs,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
-	qmdExecFileOptions,
 	qmdInstallInstructions,
 	readFileSafe,
 	resolveMemoryDir,
@@ -171,20 +171,44 @@ describe("resolveMemoryDir", () => {
 	});
 });
 
-describe("qmdExecFileOptions", () => {
-	test("uses the shell for qmd on Windows", () => {
-		const options = { timeout: 10_000 };
-
-		expect(qmdExecFileOptions("qmd", options, "win32")).toEqual({
-			timeout: 10_000,
-			shell: true,
-		});
+describe("buildQmdSpawn", () => {
+	test("wraps qmd in PowerShell on Windows", () => {
+		const out = buildQmdSpawn("qmd", ["collection", "list"], "win32", "powershell.exe");
+		expect(out.file).toBe("powershell.exe");
+		expect(out.args).toEqual(["-NoProfile", "-NoLogo", "-Command", "& qmd 'collection' 'list'; exit $LASTEXITCODE"]);
 	});
 
-	test("leaves non-qmd commands unchanged", () => {
-		const options = { timeout: 10_000 };
+	test("no-arg qmd invocation still routes through PowerShell on Windows", () => {
+		const out = buildQmdSpawn("qmd", [], "win32", "powershell.exe");
+		expect(out.file).toBe("powershell.exe");
+		expect(out.args[3]).toBe("& qmd; exit $LASTEXITCODE");
+	});
 
-		expect(qmdExecFileOptions("node", options, "win32")).toBe(options);
+	test("escapes embedded single quotes in args", () => {
+		const out = buildQmdSpawn("qmd", ["it's fine"], "win32", "powershell.exe");
+		expect(out.args[3]).toBe("& qmd 'it''s fine'; exit $LASTEXITCODE");
+	});
+
+	test("paths with spaces and `$` pass through as literals", () => {
+		const out = buildQmdSpawn("qmd", ["collection", "add", "C:\\Users\\Foo Bar\\$mem"], "win32", "powershell.exe");
+		expect(out.args[3]).toBe("& qmd 'collection' 'add' 'C:\\Users\\Foo Bar\\$mem'; exit $LASTEXITCODE");
+	});
+
+	test("recognizes qmd.cmd and qmd.exe as qmd commands on Windows", () => {
+		expect(buildQmdSpawn("qmd.cmd", ["update"], "win32", "powershell.exe").file).toBe("powershell.exe");
+		expect(buildQmdSpawn("qmd.exe", ["update"], "win32", "powershell.exe").file).toBe("powershell.exe");
+	});
+
+	test("passes through unchanged on non-Windows", () => {
+		const out = buildQmdSpawn("qmd", ["update"], "linux");
+		expect(out.file).toBe("qmd");
+		expect(out.args).toEqual(["update"]);
+	});
+
+	test("passes through unchanged for non-qmd commands on Windows", () => {
+		const out = buildQmdSpawn("node", ["-v"], "win32");
+		expect(out.file).toBe("node");
+		expect(out.args).toEqual(["-v"]);
 	});
 });
 

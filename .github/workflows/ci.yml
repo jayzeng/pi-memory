@@ -87,8 +87,17 @@ jobs:
       - name: Confirm qmd is on PATH
         shell: pwsh
         run: |
-          Get-Command qmd
-          cmd /c qmd --version
+          $prefix = (npm prefix -g).Trim()
+          Write-Host "--- npm prefix shims ($prefix) ---"
+          Get-ChildItem -Path $prefix -Filter "qmd*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Name, Length
+          Write-Host "--- Get-Command qmd -All ---"
+          Get-Command qmd -All | Format-Table -AutoSize
+          Write-Host "--- qmd --version (resolved via pwsh, same path the wrapper uses) ---"
+          qmd --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "qmd --version failed (exit $LASTEXITCODE)"
+            exit 1
+          }
 
       # Captures stock Node execFile behavior for the runner's qmd shim. This
       # is informational because shim behavior varies by package manager.
