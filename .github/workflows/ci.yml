@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,7 +24,11 @@ jobs:
       - run: npm run lint
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,6 +37,97 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: npm ci
+      - name: Run unit tests
+        run: bun test test/unit.test.ts
+
+  windows-qmd-smoke:
+    name: windows-qmd-smoke (PR #11 verification)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: npm ci
+
+      - name: Install qmd via Bun
+        shell: pwsh
+        run: bun install -g https://github.com/tobi/qmd
+
+      - name: Ensure bun global bin is on PATH
+        shell: pwsh
+        run: |
+          $bunBin = Join-Path $env:USERPROFILE ".bun\bin"
+          Write-Host "Adding to PATH: $bunBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bunBin
+
+      - name: Confirm qmd is on PATH
+        shell: pwsh
+        run: |
+          Get-Command qmd
+          qmd --version
+
+      # Demonstrates the original bug: Node's stock execFile cannot launch
+      # qmd.cmd on Windows. We expect this step to FAIL on a vanilla Node
+      # install — it's informational, so we don't fail the job on it.
+      - name: Smoke (informational) — stock Node execFile -> qmd
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          node -e "const { execFile } = require('node:child_process'); execFile('qmd', ['--version'], (err, stdout, stderr) => { if (err) { console.error('STOCK execFile FAILED (expected on Windows):', err.code, err.message); process.exit(1); } console.log('STOCK execFile OK:', stdout.trim()); });"
+
+      # Exercises the PR's wrapExecFileForQmd path. The extension's
+      # setupQmdCollection() calls qmd via the wrapped execFile, so a
+      # successful run here verifies the .cmd wrapper actually works.
+      - name: Smoke — extension wrapper -> qmd (must succeed)
+        shell: pwsh
+        run: |
+          bun -e "import('./index.ts').then(async (m) => { const ok = await m.setupQmdCollection(); if (!ok) { console.error('setupQmdCollection returned false — wrapper did not fix .cmd invocation'); process.exit(1); } console.log('OK: extension wrapper successfully invoked qmd through cmd.exe /c'); }).catch((e) => { console.error('FAILED:', e); process.exit(1); });"
+
+      # Verifies resolveMemoryDir() falls back to USERPROFILE when HOME
+      # is unset (the second bug PR #11 fixes). We import the module in a
+      # subprocess with HOME deliberately removed, then have it create the
+      # default memory directory and print its location.
+      - name: Smoke — resolveMemoryDir USERPROFILE fallback
+        shell: pwsh
+        run: |
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:PI_MEMORY_DIR -ErrorAction SilentlyContinue
+          if (-not $env:USERPROFILE) { Write-Error "USERPROFILE is not set on this runner"; exit 1 }
+          $expectedPrefix = Join-Path $env:USERPROFILE ".pi\agent\memory"
+          Write-Host "Expected prefix: $expectedPrefix"
+          $actual = bun -e "import('./index.ts').then(m => { console.log(m.dailyPath('2026-01-01')); });"
+          Write-Host "ensureDirs/dailyPath returned: $actual"
+          if ($actual -notlike "$expectedPrefix*") {
+            Write-Error "FAILED: resolveMemoryDir did not honor USERPROFILE fallback. Got: $actual"
+            exit 1
+          }
+          if ($actual -like "*~\.pi*") {
+            Write-Error "FAILED: literal '~' subdirectory still present in resolved path"
+            exit 1
+          }
+          Write-Host "OK: memory directory resolved under USERPROFILE"
 
   test:
     runs-on: ubuntu-latest
