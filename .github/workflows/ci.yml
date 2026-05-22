@@ -66,21 +66,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
       - run: npm ci
 
-      - name: Install qmd via Bun
+      - name: Install qmd via npm
         shell: pwsh
-        run: bun install -g https://github.com/tobi/qmd
+        run: npm install -g @tobilu/qmd
 
       - name: Ensure qmd prerequisites are on PATH
         shell: pwsh
         run: |
-          $bunBin = Join-Path $env:USERPROFILE ".bun\bin"
-          Write-Host "Adding to PATH: $bunBin"
-          Add-Content -Path $env:GITHUB_PATH -Value $bunBin
+          $npmPrefix = npm prefix -g
+          Write-Host "Adding to PATH: $npmPrefix"
+          Add-Content -Path $env:GITHUB_PATH -Value $npmPrefix
           $gitUsrBin = Join-Path $env:ProgramFiles "Git\usr\bin"
           if (Test-Path $gitUsrBin) {
             Write-Host "Adding to PATH: $gitUsrBin"
@@ -91,7 +88,7 @@ jobs:
         shell: pwsh
         run: |
           Get-Command qmd
-          qmd --version
+          cmd /c qmd --version
 
       # Captures stock Node execFile behavior for the runner's qmd shim. This
       # is informational because shim behavior varies by package manager.
