@@ -84,7 +84,7 @@ jobs:
             Add-Content -Path $env:GITHUB_PATH -Value $gitUsrBin
           }
 
-      - name: Confirm qmd is on PATH
+      - name: Confirm qmd is callable (via the same direct-node path the wrapper uses)
         shell: pwsh
         run: |
           $prefix = (npm prefix -g).Trim()
@@ -92,10 +92,19 @@ jobs:
           Get-ChildItem -Path $prefix -Filter "qmd*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Name, Length
           Write-Host "--- Get-Command qmd -All ---"
           Get-Command qmd -All | Format-Table -AutoSize
-          Write-Host "--- qmd --version (resolved via pwsh, same path the wrapper uses) ---"
-          qmd --version
+          # cmd-shim writes literal `/bin/sh` into both qmd.cmd and qmd.ps1 on
+          # Windows, so neither shim is callable directly. The extension bypasses
+          # this by invoking qmd's JS entry with node. Verify that path exists
+          # and works.
+          $qmdJs = Join-Path $prefix "node_modules\@tobilu\qmd\dist\cli\qmd.js"
+          Write-Host "--- expected qmd.js: $qmdJs ---"
+          if (-not (Test-Path $qmdJs)) {
+            Write-Error "qmd.js not found at $qmdJs"
+            exit 1
+          }
+          node $qmdJs --version
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "qmd --version failed (exit $LASTEXITCODE)"
+            Write-Error "node $qmdJs --version failed (exit $LASTEXITCODE)"
             exit 1
           }
 

@@ -625,32 +625,51 @@ function isQmdCommand(file: string | URL): boolean {
 	return basename === "qmd" || basename === "qmd.cmd" || basename === "qmd.exe";
 }
 
-// PowerShell single-quoted literal: a literal single quote is escaped by doubling.
-// `$`, backticks, and other PS metacharacters are inert inside single quotes.
-function quoteForPowerShell(s: string): string {
-	return `'${String(s).replace(/'/g, "''")}'`;
+const QMD_JS_REL = path.join("node_modules", "@tobilu", "qmd", "dist", "cli", "qmd.js");
+
+let cachedQmdJsPath: string | null | undefined;
+
+// On Windows, cmd-shim writes the literal `/bin/sh` (the package's shebang
+// interpreter) into both qmd.cmd and qmd.ps1, so both shims fail with
+// "system cannot find the path specified" / "'/bin/sh.exe' is not recognized"
+// outside cygwin/git-bash trees. Bypass the shims by locating qmd's JS entry
+// in a sibling node_modules directory of a PATH entry and invoking it with
+// node directly — the same thing the sh script in bin/qmd does when launched
+// via npm.
+export function resolveQmdJsPath(env: NodeJS.ProcessEnv = process.env): string | null {
+	if (cachedQmdJsPath !== undefined) return cachedQmdJsPath;
+	const pathStr = env.PATH ?? env.Path ?? "";
+	const entries = pathStr.split(path.delimiter).filter(Boolean);
+	for (const dir of entries) {
+		try {
+			const candidate = path.join(dir, QMD_JS_REL);
+			if (fs.statSync(candidate).isFile()) {
+				cachedQmdJsPath = candidate;
+				return candidate;
+			}
+		} catch {
+			// keep scanning
+		}
+	}
+	cachedQmdJsPath = null;
+	return null;
 }
 
-// On Windows, route qmd through PowerShell so it resolves regardless of which
-// shim type npm produced — .cmd, .exe, or .ps1. cmd.exe's PATHEXT does not
-// include .PS1, so `shell: true` (which uses cmd) fails when npm only creates
-// qmd.ps1 (observed with npm 11 + Node 22 on github actions runners).
+/** Clear the resolved qmd.js cache (for testing). */
+export function _resetQmdJsResolutionForTest() {
+	cachedQmdJsPath = undefined;
+}
+
 export function buildQmdSpawn(
 	file: string,
 	args: readonly string[],
 	platform: NodeJS.Platform = process.platform,
-	shellOverride?: string,
+	qmdJsPath: string | null = null,
 ): { file: string; args: string[] } {
-	if (platform !== "win32" || !isQmdCommand(file)) {
+	if (platform !== "win32" || !isQmdCommand(file) || !qmdJsPath) {
 		return { file, args: [...args] };
 	}
-	const psShell = shellOverride ?? process.env.PI_QMD_POWERSHELL ?? "powershell.exe";
-	const quoted = args.map(quoteForPowerShell).join(" ");
-	const command = quoted.length > 0 ? `& qmd ${quoted}; exit $LASTEXITCODE` : "& qmd; exit $LASTEXITCODE";
-	return {
-		file: psShell,
-		args: ["-NoProfile", "-NoLogo", "-Command", command],
-	};
+	return { file: "node", args: [qmdJsPath, ...args] };
 }
 
 const execFileWithQmdOptions: ExecFileFn = ((
@@ -659,7 +678,8 @@ const execFileWithQmdOptions: ExecFileFn = ((
 	options: ExecFileOptions,
 	callback: (...args: any[]) => void,
 ) => {
-	const spawn = buildQmdSpawn(file, args ?? []);
+	const qmdJs = process.platform === "win32" && isQmdCommand(file) ? resolveQmdJsPath() : null;
+	const spawn = buildQmdSpawn(file, args ?? [], process.platform, qmdJs);
 	return execFile(spawn.file, spawn.args, options, callback as any);
 }) as ExecFileFn;
 
