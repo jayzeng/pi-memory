@@ -26,8 +26,10 @@ import {
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
+	qmdExecFileOptions,
 	qmdInstallInstructions,
 	readFileSafe,
+	resolveMemoryDir,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
 	serializeScratchpad,
@@ -146,6 +148,43 @@ describe("nowTimestamp", () => {
 		const result = nowTimestamp();
 		expect(result).not.toContain("T");
 		expect(result).not.toContain("Z");
+	});
+});
+
+describe("resolveMemoryDir", () => {
+	test("prefers PI_MEMORY_DIR", () => {
+		const env = {
+			PI_MEMORY_DIR: path.join("custom", "memory"),
+			HOME: path.join("home", "ignored"),
+			USERPROFILE: path.join("profile", "ignored"),
+		};
+
+		expect(resolveMemoryDir(env)).toBe(env.PI_MEMORY_DIR);
+	});
+
+	test("falls back to USERPROFILE when HOME is unset", () => {
+		const env = {
+			USERPROFILE: path.join("Users", "runneradmin"),
+		};
+
+		expect(resolveMemoryDir(env)).toBe(path.join(env.USERPROFILE, ".pi", "agent", "memory"));
+	});
+});
+
+describe("qmdExecFileOptions", () => {
+	test("uses the shell for qmd on Windows", () => {
+		const options = { timeout: 10_000 };
+
+		expect(qmdExecFileOptions("qmd", options, "win32")).toEqual({
+			timeout: 10_000,
+			shell: true,
+		});
+	});
+
+	test("leaves non-qmd commands unchanged", () => {
+		const options = { timeout: 10_000 };
+
+		expect(qmdExecFileOptions("node", options, "win32")).toBe(options);
 	});
 });
 

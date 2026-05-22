@@ -20,7 +20,7 @@
  *   - MEMORY.md + SCRATCHPAD.md + today's + yesterday's daily logs injected into every turn
  */
 
-import { execFile } from "node:child_process";
+import { type ExecFileOptions, execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { complete, type Message, StringEnum } from "@mariozechner/pi-ai";
@@ -37,9 +37,23 @@ import { Type } from "@sinclair/typebox";
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
+type MemoryEnv = Partial<
+	Record<"PI_MEMORY_DIR" | "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH", string | undefined>
+> & {
+	[key: string]: string | undefined;
+};
 
-let MEMORY_DIR = DEFAULT_MEMORY_DIR;
+export function resolveMemoryDir(env: MemoryEnv = process.env): string {
+	if (env.PI_MEMORY_DIR) return env.PI_MEMORY_DIR;
+	const home =
+		env.HOME ??
+		env.USERPROFILE ??
+		(env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : undefined) ??
+		"~";
+	return path.join(home, ".pi", "agent", "memory");
+}
+
+let MEMORY_DIR = resolveMemoryDir();
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 let SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
 let DAILY_DIR = path.join(MEMORY_DIR, "daily");
@@ -54,7 +68,7 @@ export function _setBaseDir(baseDir: string) {
 
 /** Reset to default paths (for testing). */
 export function _resetBaseDir() {
-	_setBaseDir(DEFAULT_MEMORY_DIR);
+	_setBaseDir(resolveMemoryDir());
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +618,30 @@ export function buildMemoryContext(searchResults?: string): string {
 // ---------------------------------------------------------------------------
 
 type ExecFileFn = typeof execFile;
-let execFileFn: ExecFileFn = execFile;
+
+function isQmdCommand(file: string | URL): boolean {
+	if (typeof file !== "string") return false;
+	const basename = file.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+	return basename === "qmd" || basename === "qmd.cmd" || basename === "qmd.exe";
+}
+
+export function qmdExecFileOptions(
+	file: string | URL,
+	options: ExecFileOptions,
+	platform: NodeJS.Platform = process.platform,
+): ExecFileOptions {
+	if (platform !== "win32" || !isQmdCommand(file) || options.shell) return options;
+	return { ...options, shell: true };
+}
+
+const execFileWithQmdOptions: ExecFileFn = ((
+	file: string,
+	args: readonly string[],
+	options: ExecFileOptions,
+	callback: (...args: any[]) => void,
+) => execFile(file, args as string[], qmdExecFileOptions(file, options), callback as any)) as ExecFileFn;
+
+let execFileFn: ExecFileFn = execFileWithQmdOptions;
 
 let qmdAvailable = false;
 let qmdAvailabilityCheckedAt = 0;
@@ -629,7 +666,7 @@ export function _setExecFileForTest(fn: ExecFileFn) {
 
 /** Reset execFile implementation (for testing). */
 export function _resetExecFileForTest() {
-	execFileFn = execFile;
+	execFileFn = execFileWithQmdOptions;
 }
 
 /** Set qmd availability flag (for testing). */

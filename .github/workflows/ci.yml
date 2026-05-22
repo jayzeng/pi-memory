@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - uses: oven-sh/setup-bun@v2
         with:
@@ -75,12 +75,17 @@ jobs:
         shell: pwsh
         run: bun install -g https://github.com/tobi/qmd
 
-      - name: Ensure bun global bin is on PATH
+      - name: Ensure qmd prerequisites are on PATH
         shell: pwsh
         run: |
           $bunBin = Join-Path $env:USERPROFILE ".bun\bin"
           Write-Host "Adding to PATH: $bunBin"
           Add-Content -Path $env:GITHUB_PATH -Value $bunBin
+          $gitUsrBin = Join-Path $env:ProgramFiles "Git\usr\bin"
+          if (Test-Path $gitUsrBin) {
+            Write-Host "Adding to PATH: $gitUsrBin"
+            Add-Content -Path $env:GITHUB_PATH -Value $gitUsrBin
+          }
 
       - name: Confirm qmd is on PATH
         shell: pwsh
@@ -88,22 +93,21 @@ jobs:
           Get-Command qmd
           qmd --version
 
-      # Demonstrates the original bug: Node's stock execFile cannot launch
-      # qmd.cmd on Windows. We expect this step to FAIL on a vanilla Node
-      # install — it's informational, so we don't fail the job on it.
+      # Captures stock Node execFile behavior for the runner's qmd shim. This
+      # is informational because shim behavior varies by package manager.
       - name: Smoke (informational) — stock Node execFile -> qmd
         shell: pwsh
         continue-on-error: true
         run: |
           node -e "const { execFile } = require('node:child_process'); execFile('qmd', ['--version'], (err, stdout, stderr) => { if (err) { console.error('STOCK execFile FAILED (expected on Windows):', err.code, err.message); process.exit(1); } console.log('STOCK execFile OK:', stdout.trim()); });"
 
-      # Exercises the PR's wrapExecFileForQmd path. The extension's
+      # Exercises the extension's qmd execFile wrapper under Node. The
       # setupQmdCollection() calls qmd via the wrapped execFile, so a
-      # successful run here verifies the .cmd wrapper actually works.
+      # successful run here verifies Windows shell invocation.
       - name: Smoke — extension wrapper -> qmd (must succeed)
         shell: pwsh
         run: |
-          bun -e "import('./index.ts').then(async (m) => { const ok = await m.setupQmdCollection(); if (!ok) { console.error('setupQmdCollection returned false — wrapper did not fix .cmd invocation'); process.exit(1); } console.log('OK: extension wrapper successfully invoked qmd through cmd.exe /c'); }).catch((e) => { console.error('FAILED:', e); process.exit(1); });"
+          node --import tsx -e "import('./index.ts').then(async (m) => { m.ensureDirs(); const ok = await m.setupQmdCollection(); if (!ok) { console.error('setupQmdCollection returned false — wrapper did not fix qmd invocation'); process.exit(1); } console.log('OK: extension wrapper successfully invoked qmd through the Windows shell'); }).catch((e) => { console.error('FAILED:', e); process.exit(1); });"
 
       # Verifies resolveMemoryDir() falls back to USERPROFILE when HOME
       # is unset (the second bug PR #11 fixes). We import the module in a
@@ -117,7 +121,7 @@ jobs:
           if (-not $env:USERPROFILE) { Write-Error "USERPROFILE is not set on this runner"; exit 1 }
           $expectedPrefix = Join-Path $env:USERPROFILE ".pi\agent\memory"
           Write-Host "Expected prefix: $expectedPrefix"
-          $actual = bun -e "import('./index.ts').then(m => { console.log(m.dailyPath('2026-01-01')); });"
+          $actual = node --import tsx -e "import('./index.ts').then(m => { console.log(m.dailyPath('2026-01-01')); });"
           Write-Host "ensureDirs/dailyPath returned: $actual"
           if ($actual -notlike "$expectedPrefix*") {
             Write-Error "FAILED: resolveMemoryDir did not honor USERPROFILE fallback. Got: $actual"
