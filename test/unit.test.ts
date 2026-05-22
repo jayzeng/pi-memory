@@ -17,10 +17,12 @@ import {
 	_resetBaseDir,
 	_resetExecFileForTest,
 	_resetMemorySnapshot,
+	_resetQmdJsResolutionForTest,
 	_setBaseDir,
 	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
+	buildQmdSpawn,
 	dailyPath,
 	ensureDirs,
 	nowTimestamp,
@@ -28,6 +30,8 @@ import {
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
 	readFileSafe,
+	resolveMemoryDir,
+	resolveQmdJsPath,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
 	serializeScratchpad,
@@ -146,6 +150,113 @@ describe("nowTimestamp", () => {
 		const result = nowTimestamp();
 		expect(result).not.toContain("T");
 		expect(result).not.toContain("Z");
+	});
+});
+
+describe("resolveMemoryDir", () => {
+	test("prefers PI_MEMORY_DIR", () => {
+		const env = {
+			PI_MEMORY_DIR: path.join("custom", "memory"),
+			HOME: path.join("home", "ignored"),
+			USERPROFILE: path.join("profile", "ignored"),
+		};
+
+		expect(resolveMemoryDir(env)).toBe(env.PI_MEMORY_DIR);
+	});
+
+	test("falls back to USERPROFILE when HOME is unset", () => {
+		const env = {
+			USERPROFILE: path.join("Users", "runneradmin"),
+		};
+
+		expect(resolveMemoryDir(env)).toBe(path.join(env.USERPROFILE, ".pi", "agent", "memory"));
+	});
+});
+
+describe("buildQmdSpawn", () => {
+	const QMD_JS = "C:\\npm\\prefix\\node_modules\\@tobilu\\qmd\\dist\\cli\\qmd.js";
+
+	test("invokes qmd's JS entry via node on Windows when resolution succeeds", () => {
+		const out = buildQmdSpawn("qmd", ["collection", "list"], "win32", QMD_JS);
+		expect(out.file).toBe("node");
+		expect(out.args).toEqual([QMD_JS, "collection", "list"]);
+	});
+
+	test("no-arg qmd invocation still uses node + resolved JS path on Windows", () => {
+		const out = buildQmdSpawn("qmd", [], "win32", QMD_JS);
+		expect(out.file).toBe("node");
+		expect(out.args).toEqual([QMD_JS]);
+	});
+
+	test("paths with spaces and `$` in user args pass through as literal argv", () => {
+		const arg = "C:\\Users\\Foo Bar\\$mem";
+		const out = buildQmdSpawn("qmd", ["collection", "add", arg], "win32", QMD_JS);
+		expect(out.args).toEqual([QMD_JS, "collection", "add", arg]);
+	});
+
+	test("recognizes qmd.cmd and qmd.exe as qmd commands on Windows", () => {
+		expect(buildQmdSpawn("qmd.cmd", ["update"], "win32", QMD_JS).file).toBe("node");
+		expect(buildQmdSpawn("qmd.exe", ["update"], "win32", QMD_JS).file).toBe("node");
+	});
+
+	test("falls through to bare qmd when resolution returns null", () => {
+		const out = buildQmdSpawn("qmd", ["update"], "win32", null);
+		expect(out.file).toBe("qmd");
+		expect(out.args).toEqual(["update"]);
+	});
+
+	test("passes through unchanged on non-Windows even with a resolved path", () => {
+		const out = buildQmdSpawn("qmd", ["update"], "linux", QMD_JS);
+		expect(out.file).toBe("qmd");
+		expect(out.args).toEqual(["update"]);
+	});
+
+	test("passes through unchanged for non-qmd commands on Windows", () => {
+		const out = buildQmdSpawn("node", ["-v"], "win32", QMD_JS);
+		expect(out.file).toBe("node");
+		expect(out.args).toEqual(["-v"]);
+	});
+});
+
+describe("resolveQmdJsPath", () => {
+	let scratchDir: string;
+	beforeEach(() => {
+		scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-qmd-resolve-"));
+		_resetQmdJsResolutionForTest();
+	});
+	afterEach(() => {
+		fs.rmSync(scratchDir, { recursive: true, force: true });
+		_resetQmdJsResolutionForTest();
+	});
+
+	test("returns the sibling node_modules path for a PATH entry that contains the install", () => {
+		const prefix = path.join(scratchDir, "prefix");
+		const qmdJs = path.join(prefix, "node_modules", "@tobilu", "qmd", "dist", "cli", "qmd.js");
+		fs.mkdirSync(path.dirname(qmdJs), { recursive: true });
+		fs.writeFileSync(qmdJs, "// stub", "utf-8");
+
+		const found = resolveQmdJsPath({ PATH: prefix } as NodeJS.ProcessEnv);
+		expect(found).toBe(qmdJs);
+	});
+
+	test("returns null when no PATH entry has a sibling install", () => {
+		const empty = path.join(scratchDir, "empty");
+		fs.mkdirSync(empty, { recursive: true });
+		const found = resolveQmdJsPath({ PATH: empty } as NodeJS.ProcessEnv);
+		expect(found).toBeNull();
+	});
+
+	test("caches the resolved path across calls", () => {
+		const prefix = path.join(scratchDir, "prefix");
+		const qmdJs = path.join(prefix, "node_modules", "@tobilu", "qmd", "dist", "cli", "qmd.js");
+		fs.mkdirSync(path.dirname(qmdJs), { recursive: true });
+		fs.writeFileSync(qmdJs, "// stub", "utf-8");
+
+		const first = resolveQmdJsPath({ PATH: prefix } as NodeJS.ProcessEnv);
+		// Second call with an empty PATH still returns the cached value
+		const second = resolveQmdJsPath({ PATH: "" } as NodeJS.ProcessEnv);
+		expect(first).toBe(qmdJs);
+		expect(second).toBe(qmdJs);
 	});
 });
 
