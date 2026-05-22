@@ -443,6 +443,17 @@ function getQmdUpdateMode(): "background" | "manual" | "off" {
 	return "background";
 }
 
+export function shouldSummarizeLifecycleTransitions(): boolean {
+	const value = (process.env.PI_MEMORY_SUMMARIZE_TRANSITIONS ?? "").toLowerCase();
+	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
+	if (!reason) return false;
+	if (shouldSummarizeLifecycleTransitions()) return false;
+	return ["reload", "new", "resume", "fork"].includes(reason);
+}
+
 async function ensureQmdAvailableForUpdate(): Promise<boolean> {
 	if (qmdAvailable) return true;
 	if (getQmdUpdateMode() !== "background") return false;
@@ -596,6 +607,17 @@ type ExecFileFn = typeof execFile;
 let execFileFn: ExecFileFn = execFile;
 
 let qmdAvailable = false;
+let qmdAvailabilityCheckedAt = 0;
+// Positive results are stable for the session; negative results should refresh
+// quickly so users who install qmd (or run setupQmdCollection) mid-session
+// don't have to wait through a long TTL before retries succeed.
+const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
+const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
+const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
+
+function qmdStatusTtl(positive: boolean): number {
+	return positive ? QMD_STATUS_CACHE_TTL_MS : QMD_STATUS_NEGATIVE_CACHE_TTL_MS;
+}
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
 let terminalInputUnsubscribe: (() => void) | null = null;
@@ -613,6 +635,7 @@ export function _resetExecFileForTest() {
 /** Set qmd availability flag (for testing). */
 export function _setQmdAvailable(value: boolean) {
 	qmdAvailable = value;
+	qmdAvailabilityCheckedAt = Date.now();
 }
 
 /** Get current qmd availability flag (for testing). */
@@ -631,6 +654,12 @@ export function _clearUpdateTimer() {
 		clearTimeout(updateTimer);
 		updateTimer = null;
 	}
+}
+
+/** Clear qmd status caches (for testing). */
+export function _clearQmdStatusCaches() {
+	qmdAvailabilityCheckedAt = 0;
+	qmdCollectionStatusCache.clear();
 }
 
 const QMD_REPO_URL = "https://github.com/tobi/qmd";
@@ -688,47 +717,62 @@ export async function setupQmdCollection(): Promise<boolean> {
 			// Ignore — context may already exist
 		}
 	}
+	// Seed the cache so checkCollection("pi-memory") doesn't redundantly re-run
+	// setupQmdCollection during the short negative-cache window.
+	qmdCollectionStatusCache.set("pi-memory", { checkedAt: Date.now(), exists: true });
 	return true;
 }
 
 export function detectQmd(): Promise<boolean> {
+	const now = Date.now();
+	if (qmdAvailabilityCheckedAt && now - qmdAvailabilityCheckedAt < qmdStatusTtl(qmdAvailable)) {
+		return Promise.resolve(qmdAvailable);
+	}
+
 	return new Promise((resolve) => {
 		// `qmd status` can trigger slow model/device probing on some systems (e.g. Vulkan fallback),
 		// which may exceed short startup timeouts and produce false negatives.
 		// `qmd collection list` is much lighter and still validates the binary is callable.
 		execFileFn("qmd", ["collection", "list"], { timeout: 15_000 }, (err) => {
-			resolve(!err);
+			qmdAvailable = !err;
+			qmdAvailabilityCheckedAt = Date.now();
+			resolve(qmdAvailable);
 		});
 	});
 }
 
 export function checkCollection(name: string): Promise<boolean> {
+	const cached = qmdCollectionStatusCache.get(name);
+	const now = Date.now();
+	if (cached && now - cached.checkedAt < qmdStatusTtl(cached.exists)) {
+		return Promise.resolve(cached.exists);
+	}
+
 	return new Promise((resolve) => {
 		execFileFn("qmd", ["collection", "list", "--json"], { timeout: 10_000 }, (err, stdout) => {
-			if (err) {
-				resolve(false);
-				return;
-			}
-			try {
-				const collections = JSON.parse(stdout);
-				if (Array.isArray(collections)) {
-					resolve(
-						collections.some((entry) => {
+			let exists = false;
+			if (!err) {
+				try {
+					const collections = JSON.parse(stdout);
+					if (Array.isArray(collections)) {
+						exists = collections.some((entry) => {
 							if (typeof entry === "string") return entry === name;
 							if (entry && typeof entry === "object" && "name" in entry) {
 								return (entry as { name?: string }).name === name;
 							}
 							return false;
-						}),
-					);
-				} else {
-					// qmd may output an object with a collections array or similar
-					resolve(stdout.includes(name));
+						});
+					} else {
+						// qmd may output an object with a collections array or similar
+						exists = stdout.includes(name);
+					}
+				} catch {
+					// Fallback: just check if the name appears in the output
+					exists = stdout.includes(name);
 				}
-			} catch {
-				// Fallback: just check if the name appears in the output
-				resolve(stdout.includes(name));
 			}
+			qmdCollectionStatusCache.set(name, { checkedAt: Date.now(), exists });
+			resolve(exists);
 		});
 	});
 }
@@ -951,10 +995,17 @@ export default function (pi: ExtensionAPI) {
 			terminalInputUnsubscribe = null;
 		}
 
-		// /reload emits session_shutdown with reason "reload" before rebuilding the
-		// runtime. Generating an exit summary here would make every /reload block
-		// for several seconds on a live LLM call. Skip it — the session continues.
-		if (shutdownReason === "reload") {
+		// Lifecycle transitions are usually not final session exits. By default,
+		// avoid generating LLM summaries and running qmd updates during /reload,
+		// /new, /resume, and /fork because that makes those transitions slow.
+		// Users who prefer the old behavior can opt in with
+		// PI_MEMORY_SUMMARIZE_TRANSITIONS=1.
+		if (shouldSkipExitSummaryForReason(shutdownReason)) {
+			exitSummaryReason = null;
+			if (updateTimer) {
+				clearTimeout(updateTimer);
+				updateTimer = null;
+			}
 			return;
 		}
 
