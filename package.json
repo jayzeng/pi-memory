@@ -33,6 +33,7 @@
 		"index.ts",
 		"scripts",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"publishConfig": {

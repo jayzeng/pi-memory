@@ -197,48 +197,21 @@ cat ~/.pi/agent/memory/MEMORY.md
 
 ## Publishing (maintainers)
 
+Releases are tag-driven. Pushing a `v*` tag runs the publish workflow, which
+lints, builds, runs the unit tests, verifies the tag matches `package.json`,
+and then publishes to npm.
+
 ```bash
-# Confirm package name is available
-npm view pi-memory
+# Bump version + create the matching git tag (updates package.json)
+npm version patch   # or minor / major
 
-# Bump version (choose patch/minor/major)
-npm version patch
+# Push the commit and tag — this triggers .github/workflows/publish-npm.yml
+git push --follow-tags
 
-# Publish to npm (public)
-npm publish --access public
-
-# Verify install
+# Verify the published install
 pi install npm:pi-memory
 ```
 
 ## Changelog
 
-### Unreleased
-
-- **KV cache-stable memory snapshot** (default `PI_MEMORY_SNAPSHOT=stable`): the injected memory block is now byte-stable across turns. Snapshot refreshes only at deliberate checkpoints — `session_start`, `session_before_compact`, `memory_write(target: long_term)`, and day rollover — so local prefix caches (llama.cpp, vLLM, MLX) hit on every normal turn instead of reprocessing the entire conversation tail each turn.
-- **Per-turn qmd search no longer auto-injected by default**. The model retains on-demand recall via `memory_search`. Set `PI_MEMORY_SNAPSHOT=per-turn` to restore the old behavior (busts the cache every turn).
-- Snapshot system-prompt header now includes the snapshot reason and timestamp so the model knows when ambient context was captured and that `memory_read` / `memory_search` give the authoritative latest state.
-
-### 0.3.6
-
-- Added support for `PI_MEMORY_DIR` so memory storage can be redirected from the default `~/.pi/agent/memory` path.
-- Published npm patch release `0.3.6`.
-
-### 0.2.0
-
-- **Selective injection**: Before each turn, the user's prompt is searched against memory via qmd. Top results are injected into the system prompt alongside standard context, surfacing relevant past decisions without explicit tool calls.
-- **qmd auto-setup**: The extension automatically creates the `pi-memory` collection and path contexts on session start when qmd is available. No manual `qmd collection add` needed.
-- **Tags and links**: `memory_write` and context injection now encourage `#tags` and `[[wiki-links]]` as searchable content conventions.
-- **Session handoff on compaction**: `session_before_compact` automatically writes a handoff entry to today's daily log with open scratchpad items and recent context, preserving in-progress state across context compaction.
-- **Improved memory_search description**: Encourages iterative search (rephrasing, mode-switching) and mentions tags/links in keyword mode.
-- **Context priority reordering**: Injection order is now scratchpad > today > search results > MEMORY.md > yesterday (previously MEMORY.md was first). MEMORY.md budget reduced from 6K to 4K to make room for search results (2.5K).
-- **`PI_MEMORY_NO_SEARCH` env var**: Disable selective injection for A/B testing.
-- **Unit tests**: Added `test/unit.ts` with 18 deterministic tests (no LLM/qmd needed).
-- **Recall eval**: Added `test/eval-recall.ts` for measuring recall effectiveness with/without selective injection.
-
-### 0.1.0
-
-- Initial release: `memory_write`, `memory_read`, `scratchpad`, `memory_search` tools.
-- Context injection of MEMORY.md, scratchpad, and today/yesterday daily logs.
-- qmd integration for keyword, semantic, and hybrid search.
-- Debounced background `qmd update` after writes.
+See [CHANGELOG.md](./CHANGELOG.md).
