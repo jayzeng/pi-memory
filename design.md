@@ -263,13 +263,13 @@ We don't need to maintain our own chunk boundaries or entry delimiters.
 
 ## Verification
 
-### Level 1: Deterministic Unit Tests (18 tests)
+### Level 1: Deterministic Unit Tests
 
 No LLM, no qmd, no network. Tests use temp directories and a mock ExtensionAPI
 to verify core logic:
 
 ```
-  bun test/unit.ts
+  npm test   # bun test test/unit.test.ts
 
   buildMemoryContext
     empty dirs -> empty string                                         PASS

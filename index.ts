@@ -747,11 +747,12 @@ export function qmdInstallInstructions(): string {
 	return [
 		"memory_search requires qmd.",
 		"",
-		"Install qmd (requires Bun):",
-		`  bun install -g ${QMD_REPO_URL}`,
-		"  # ensure ~/.bun/bin is in your PATH",
+		"Install qmd (either works):",
+		"  npm install -g @tobilu/qmd        # no Bun needed",
+		`  bun install -g ${QMD_REPO_URL}   # ensure ~/.bun/bin is on PATH`,
 		"",
-		"Then set up the collection (one-time):",
+		"The extension auto-creates the collection on next session start.",
+		"To set it up manually instead:",
 		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
 		"  qmd embed",
 	].join("\n");
