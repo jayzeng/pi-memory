@@ -55,7 +55,7 @@ jobs:
           bun-version: latest
       - run: npm ci
       - name: Run unit tests
-        run: bun test test/unit.test.ts
+        run: npm test
 
   windows-qmd-smoke:
     name: windows-qmd-smoke (PR #11 verification)
