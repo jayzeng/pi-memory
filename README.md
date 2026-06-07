@@ -50,6 +50,7 @@ Without qmd, all core tools (write/read/scratchpad) work normally. Only `memory_
 | `memory_read` | Read any memory file or list daily logs |
 | `scratchpad` | Add/done/undo/clear/list checklist items |
 | `memory_search` | Search across all memory files (requires qmd) |
+| `memory_status` | Health check: where files live, qmd/collection/embeddings state, active config |
 
 ### memory_search modes
 

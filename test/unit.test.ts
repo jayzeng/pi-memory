@@ -1058,6 +1058,46 @@ describe("memory_search tool", () => {
 	});
 });
 
+describe("memory_status tool", () => {
+	let tools: Record<string, any>;
+
+	beforeEach(() => {
+		setupTmpDir();
+		ensureDirs();
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		cleanupTmpDir();
+	});
+
+	test("registers with correct name", () => {
+		expect(tools.memory_status).toBeDefined();
+		expect(tools.memory_status.name).toBe("memory_status");
+	});
+
+	test("reports file inventory and qmd-unavailable state without throwing", async () => {
+		const execStub = ((...args: any[]) => {
+			const callback = args[args.length - 1] as (err: Error | null, stdout: string, stderr: string) => void;
+			callback(new Error("qmd not found"), "", "");
+		}) as any;
+		_setExecFileForTest(execStub);
+		_setQmdAvailable(false);
+
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "remember this");
+
+		const result = await tools.memory_status.execute("c1", {}, null, null, {});
+		const text = result.content[0].text;
+		expect(text).toContain("Memory status");
+		expect(text).toContain("qmd available: ✗");
+		expect(result.details.qmd).toBe(false);
+		expect(result.details.longTermChars).toBeGreaterThan(0);
+	});
+});
+
 // ==========================================================================
 // 9. Lifecycle hooks
 // ==========================================================================
@@ -1429,14 +1469,15 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 4 tools", () => {
+	test("registers all 5 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(4);
+		expect(Object.keys(mockPi.tools)).toHaveLength(5);
 		expect(mockPi.tools.memory_write).toBeDefined();
 		expect(mockPi.tools.memory_read).toBeDefined();
 		expect(mockPi.tools.scratchpad).toBeDefined();
 		expect(mockPi.tools.memory_search).toBeDefined();
+		expect(mockPi.tools.memory_status).toBeDefined();
 	});
 
 	test("registers all 4 lifecycle hooks", () => {
@@ -1451,7 +1492,7 @@ describe("extension registration", () => {
 	test("tools have labels and descriptions", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		for (const name of ["memory_write", "memory_read", "scratchpad", "memory_search"]) {
+		for (const name of ["memory_write", "memory_read", "scratchpad", "memory_search", "memory_status"]) {
 			expect(mockPi.tools[name].label).toBeTruthy();
 			expect(mockPi.tools[name].description).toBeTruthy();
 		}
