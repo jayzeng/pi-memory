@@ -26,9 +26,16 @@ jobs:
           bun-version: latest
       - run: npm ci
       - name: Verify tag matches package.json version
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "Publishing requires a v* tag ref; got $GITHUB_REF." >&2
+              echo "For manual runs, dispatch the workflow from the release tag." >&2
+              exit 1
+              ;;
+          esac
           tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p "require('./package.json').version")"
           if [ "$tag" != "$pkg" ]; then

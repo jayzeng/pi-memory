@@ -8,6 +8,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Peer dependency floors raised**: `@mariozechner/pi-ai` and
+  `@mariozechner/pi-coding-agent` now require `>=0.52.0` (previously
+  `>=0.0.1`). If you run an older pi, stay on 0.3.12. This makes the next
+  release a **minor** version bump.
 - **`postinstall` no longer touches your git config.** It previously ran
   `git config core.hooksPath .githooks` unconditionally, which — when pi-memory
   was installed as a dependency — repointed the *consumer's* repo at a hooks
@@ -19,7 +23,8 @@ follows [Semantic Versioning](https://semver.org/).
 - **`npm test` runs the fast unit suite** (no API key, ~0.5s). End-to-end and
   recall-eval suites moved to `npm run test:e2e` and `npm run test:eval`.
 - The npm publish workflow now runs lint + build + unit tests and verifies the
-  pushed `v*` tag matches `package.json` before publishing.
+  pushed `v*` tag matches `package.json` before publishing. Manual
+  (`workflow_dispatch`) runs must also be dispatched from a release tag.
 
 ### Added
 

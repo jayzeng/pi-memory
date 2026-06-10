@@ -994,18 +994,25 @@ export function runQmdSearch(
  * Best-effort check of whether vector embeddings are ready for semantic/deep
  * search. Bounded by a short timeout because the first semantic query can
  * trigger a model download. Returns "unknown" rather than blocking on it.
+ * "ready" means a probe query ran without qmd's "need embeddings" warning —
+ * it does not prove the index has content.
  */
 export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const { stderr } = await Promise.race([
 			runQmdSearch("semantic", "memory", 1),
-			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 4_000)),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error("timeout")), 4_000);
+			}),
 		]);
 		return /need embeddings/i.test(stderr ?? "") ? "missing" : "ready";
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (/need embeddings/i.test(msg)) return "missing";
 		return "unknown";
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
