@@ -1,44 +1,42 @@
 const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
 const path = require("node:path");
 
-function hasQmd() {
-	const result = spawnSync("qmd", ["status"], {
-		stdio: "ignore",
-		shell: process.platform === "win32",
-	});
-	return result.status === 0;
+const packageRoot = path.resolve(__dirname, "..");
+
+// Distinguish a development checkout of pi-memory from an end-user install.
+// When pi-memory is installed as a dependency it lives under node_modules and
+// is shipped without the `.githooks` directory (see the "files" allowlist in
+// package.json). We must never touch a consumer's repo or VCS config, so all
+// the dev-only setup below is gated on "are we actually in the source repo?".
+function isDevCheckout() {
+	if (packageRoot.split(path.sep).includes("node_modules")) return false;
+	return fs.existsSync(path.join(packageRoot, ".githooks"));
 }
 
-function memoryDir() {
-	const home = process.env.HOME ?? process.env.USERPROFILE ?? "~";
-	return path.join(home, ".pi", "agent", "memory");
-}
-
+// Point git at the repo's tracked hooks (lint + tests on commit). Scoped to the
+// pi-memory working tree only — `git config` here writes to this repo's local
+// config, and we only reach this code in a dev checkout.
 function configureGitHooks() {
-	const result = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+	const insideRepo = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+		cwd: packageRoot,
 		stdio: "ignore",
 		shell: process.platform === "win32",
 	});
-
-	if (result.status !== 0) {
-		return;
-	}
+	if (insideRepo.status !== 0) return;
 
 	spawnSync("git", ["config", "core.hooksPath", ".githooks"], {
+		cwd: packageRoot,
 		stdio: "ignore",
 		shell: process.platform === "win32",
 	});
 }
 
-configureGitHooks();
-
-if (!hasQmd()) {
-	const dir = memoryDir();
-	console.log("\npi-memory: qmd not found (required for `memory_search`).\n");
-	console.log("Install qmd (requires Bun):");
-	console.log("  bun install -g https://github.com/tobi/qmd");
-	console.log("  # ensure ~/.bun/bin is in your PATH\n");
-	console.log("Then set up the collection (one-time):");
-	console.log(`  qmd collection add ${dir} --name pi-memory`);
-	console.log("  qmd embed\n");
+if (isDevCheckout()) {
+	configureGitHooks();
 }
+
+// Note: we intentionally do NOT nag about qmd here. qmd is optional, and the
+// extension already shows install instructions inside pi (via ctx.ui.notify)
+// the first time a session starts without it — printing the same wall of text
+// to every `npm install` / `pi install` is just noise.

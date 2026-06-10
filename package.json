@@ -1,6 +1,6 @@
 {
 	"name": "pi-memory",
-	"version": "0.3.11",
+	"version": "0.3.12",
 	"description": "Pi coding agent extension for memory with qmd-powered semantic search across daily logs, long-term memory, and scratchpad",
 	"main": "index.ts",
 	"type": "module",
@@ -33,6 +33,7 @@
 		"index.ts",
 		"scripts",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"publishConfig": {
@@ -42,16 +43,21 @@
 		"postinstall": "node scripts/postinstall.cjs",
 		"build": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome check .",
-		"test": "npx tsx test/e2e.ts"
+		"test": "bun test test/unit.test.ts",
+		"test:e2e": "npx tsx test/e2e.ts",
+		"test:eval": "bun test/eval-recall.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.0",
 		"tsx": "^4.0.0",
 		"typescript": "^5.9.3"
 	},
+	"engines": {
+		"node": ">=20"
+	},
 	"peerDependencies": {
-		"@mariozechner/pi-ai": ">=0.0.1",
-		"@mariozechner/pi-coding-agent": ">=0.0.1",
+		"@mariozechner/pi-ai": ">=0.52.0",
+		"@mariozechner/pi-coding-agent": ">=0.52.0",
 		"@sinclair/typebox": ">=0.34.0"
 	},
 	"overrides": {

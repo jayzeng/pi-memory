@@ -12,7 +12,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	_clearEmbedInFlight,
 	_clearUpdateTimer,
+	_getEmbedInFlight,
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
@@ -25,6 +27,7 @@ import {
 	buildQmdSpawn,
 	dailyPath,
 	ensureDirs,
+	ensureQmdEmbed,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -589,6 +592,85 @@ describe("scheduleQmdUpdate", () => {
 		expect(firstTimer).not.toBe(secondTimer);
 		_clearUpdateTimer();
 	});
+
+	test("chains qmd embed after the debounced update", async () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			cb(null, "", "");
+		}) as any);
+		try {
+			scheduleQmdUpdate();
+			await new Promise((r) => setTimeout(r, 700));
+			expect(calls).toEqual([["update"], ["embed"]]);
+		} finally {
+			_resetExecFileForTest();
+			_clearEmbedInFlight();
+		}
+	});
+});
+
+describe("ensureQmdEmbed", () => {
+	afterEach(() => {
+		_resetExecFileForTest();
+		_clearEmbedInFlight();
+		_setQmdAvailable(false);
+		delete process.env.PI_MEMORY_QMD_UPDATE;
+	});
+
+	test("returns false when qmd is not available", () => {
+		_setQmdAvailable(false);
+		expect(ensureQmdEmbed()).toBe(false);
+	});
+
+	test("returns false when background updates are disabled", () => {
+		_setQmdAvailable(true);
+		process.env.PI_MEMORY_QMD_UPDATE = "off";
+		expect(ensureQmdEmbed()).toBe(false);
+	});
+
+	test("spawns qmd embed and clears the in-flight flag when it finishes", () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		let finish: (() => void) | null = null;
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			finish = () => cb(null, "", "");
+		}) as any);
+
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+		expect(_getEmbedInFlight()).toBe(true);
+
+		finish?.();
+		expect(_getEmbedInFlight()).toBe(false);
+	});
+
+	test("queues another embed if requested while one is already running", () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		const finishers: (() => void)[] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			finishers.push(() => cb(null, "", ""));
+		}) as any);
+
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+
+		// A second request arrives while the first embed is still running.
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+
+		// Finishing the first embed immediately starts the queued one.
+		finishers[0]?.();
+		expect(calls).toEqual([["embed"], ["embed"]]);
+		expect(_getEmbedInFlight()).toBe(true);
+
+		finishers[1]?.();
+		expect(_getEmbedInFlight()).toBe(false);
+	});
 });
 
 // ==========================================================================
@@ -1058,6 +1140,46 @@ describe("memory_search tool", () => {
 	});
 });
 
+describe("memory_status tool", () => {
+	let tools: Record<string, any>;
+
+	beforeEach(() => {
+		setupTmpDir();
+		ensureDirs();
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		cleanupTmpDir();
+	});
+
+	test("registers with correct name", () => {
+		expect(tools.memory_status).toBeDefined();
+		expect(tools.memory_status.name).toBe("memory_status");
+	});
+
+	test("reports file inventory and qmd-unavailable state without throwing", async () => {
+		const execStub = ((...args: any[]) => {
+			const callback = args[args.length - 1] as (err: Error | null, stdout: string, stderr: string) => void;
+			callback(new Error("qmd not found"), "", "");
+		}) as any;
+		_setExecFileForTest(execStub);
+		_setQmdAvailable(false);
+
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "remember this");
+
+		const result = await tools.memory_status.execute("c1", {}, null, null, {});
+		const text = result.content[0].text;
+		expect(text).toContain("Memory status");
+		expect(text).toContain("qmd available: ✗");
+		expect(result.details.qmd).toBe(false);
+		expect(result.details.longTermChars).toBeGreaterThan(0);
+	});
+});
+
 // ==========================================================================
 // 9. Lifecycle hooks
 // ==========================================================================
@@ -1429,14 +1551,15 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 4 tools", () => {
+	test("registers all 5 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(4);
+		expect(Object.keys(mockPi.tools)).toHaveLength(5);
 		expect(mockPi.tools.memory_write).toBeDefined();
 		expect(mockPi.tools.memory_read).toBeDefined();
 		expect(mockPi.tools.scratchpad).toBeDefined();
 		expect(mockPi.tools.memory_search).toBeDefined();
+		expect(mockPi.tools.memory_status).toBeDefined();
 	});
 
 	test("registers all 4 lifecycle hooks", () => {
@@ -1451,7 +1574,7 @@ describe("extension registration", () => {
 	test("tools have labels and descriptions", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		for (const name of ["memory_write", "memory_read", "scratchpad", "memory_search"]) {
+		for (const name of ["memory_write", "memory_read", "scratchpad", "memory_search", "memory_status"]) {
 			expect(mockPi.tools[name].label).toBeTruthy();
 			expect(mockPi.tools[name].description).toBeTruthy();
 		}

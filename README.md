@@ -4,7 +4,28 @@ Memory extension for [pi](https://github.com/mariozechner/pi-mono) with semantic
 
 Thanks to https://github.com/skyfallsin/pi-mem for inspiration.
 
-Persistent memory across coding sessions — long-term facts, daily logs, and a scratchpad checklist. Core memory works as plain markdown files. Optional qmd integration adds keyword, semantic, and hybrid search across all memory files, plus automatic selective injection of relevant past memories into every turn.
+Your coding agent forgets everything between sessions. pi-memory gives it a memory: durable facts and decisions, a running daily log, and a scratchpad of things to come back to — all as plain markdown files you can read, edit, and commit. With optional [qmd](https://github.com/tobi/qmd) it also gets keyword, semantic, and hybrid **search** across everything it has ever remembered.
+
+## What it feels like
+
+```text
+# Session 1
+you ▸ I always use pnpm in this repo, never npm. Remember that.
+pi  ▸ Got it — saved to long-term memory.   (writes MEMORY.md)
+
+# …days later, brand new session…
+you ▸ add prettier as a dev dependency
+pi  ▸ pnpm add -D prettier
+      (recalled your package-manager preference from memory — no reminder needed)
+```
+
+Everything lives in `~/.pi/agent/memory/` as markdown, so you can also just `cat` it:
+
+```bash
+$ cat ~/.pi/agent/memory/MEMORY.md
+<!-- 2026-06-07 10:12:03 [a1b2c3d4] -->
+#preference [[package-manager]] Always use pnpm in this repo, never npm.
+```
 
 ## Installation
 
@@ -12,26 +33,31 @@ Persistent memory across coding sessions — long-term facts, daily logs, and a 
 # Install from npm (recommended)
 pi install npm:pi-memory
 
-# Install from local checkout
+# …or from a local checkout
 pi install ./pi-memory
-
-# Optional (enables `memory_search` + selective injection, requires Bun)
-command -v qmd >/dev/null 2>&1 || bun install -g https://github.com/tobi/qmd
 ```
 
-Or copy to your extensions directory:
+That's it — the four core tools (`memory_write`, `memory_read`, `scratchpad`,
+`memory_status`) work immediately with no other setup. Search is opt-in below.
+
+### Optional: enable search with qmd
+
+`memory_search` (and selective injection) need [qmd](https://github.com/tobi/qmd). Either install method works:
 
 ```bash
-cp -r pi-memory ~/.pi/agent/extensions/pi-memory
+npm install -g @tobilu/qmd                      # no Bun required
+bun install -g https://github.com/tobi/qmd      # ensure ~/.bun/bin is on PATH
 ```
 
-### Optional: Enable search with qmd
+When qmd is present, the extension **automatically creates** the `pi-memory`
+collection and path contexts on the next session start — no manual step. Run
+`memory_status` any time to confirm qmd, the collection, and embeddings are ready.
 
-When qmd is installed, the extension **automatically creates** the `pi-memory` collection and path contexts on first session start.
-
-Note: `memory_search` **semantic**/**deep** modes require vector embeddings. If you see a warning like “need embeddings”, run `qmd embed` once and retry.
-
-If you prefer manual setup:
+Semantic/deep modes need vector embeddings; the extension keeps them current
+automatically (`qmd embed` runs in the background at session start and after
+writes). The very first embed downloads the embedding model, so semantic search
+may take a minute to come online on a fresh install. To set the collection up
+by hand:
 
 ```bash
 qmd collection add ~/.pi/agent/memory --name pi-memory
@@ -40,7 +66,7 @@ qmd context add / "Curated long-term memory: decisions, preferences, facts, less
 qmd embed
 ```
 
-Without qmd, all core tools (write/read/scratchpad) work normally. Only `memory_search` and selective injection require qmd.
+Without qmd, the core tools still work fully — only `memory_search` and selective injection require it.
 
 ## Tools
 
@@ -50,6 +76,7 @@ Without qmd, all core tools (write/read/scratchpad) work normally. Only `memory_
 | `memory_read` | Read any memory file or list daily logs |
 | `scratchpad` | Add/done/undo/clear/list checklist items |
 | `memory_search` | Search across all memory files (requires qmd) |
+| `memory_status` | Health check: where files live, qmd/collection/embeddings state, active config |
 
 ### memory_search modes
 
@@ -141,7 +168,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 - **Tool response previews**: Write/scratchpad tools return size-capped previews instead of full file contents.
 - **qmd auto-setup**: On first session start with qmd available, the extension creates the collection and path contexts automatically.
 - **qmd re-indexing**: After every write, a debounced `qmd update` runs in the background (fire-and-forget, non-blocking) unless disabled via `PI_MEMORY_QMD_UPDATE`.
-- **qmd embeddings**: Semantic/deep search needs vector embeddings. If you see “need embeddings” warnings, run `qmd embed` once and retry.
+- **qmd embeddings**: Vector embeddings for semantic/deep search are kept current automatically — `qmd embed` (incremental) runs in the background after each re-index and as a catch-up at session start. Disabled along with re-indexing via `PI_MEMORY_QMD_UPDATE`.
 - **Graceful degradation**: If qmd is not installed, core tools work fine. `memory_search` returns install instructions.
 
 ### Configuration
@@ -150,38 +177,51 @@ This ensures in-progress context survives compaction and is visible in the next 
 |----------|--------|---------|-------------|
 | `PI_MEMORY_DIR` | path | `~/.pi/agent/memory` | Override the memory storage directory |
 | `PI_MEMORY_SNAPSHOT` | `stable`, `per-turn` | `stable` | `stable` snapshots memory at checkpoints for KV cache stability; `per-turn` rebuilds every turn (legacy behavior) |
-| `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` after writes |
+| `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` + `qmd embed` after writes |
 | `PI_MEMORY_NO_SEARCH` | `1` | unset | Disable selective injection in `per-turn` mode (no effect in `stable` mode) |
 | `PI_MEMORY_SUMMARIZE_TRANSITIONS` | `1`, `true`, `yes`, `on` | unset | Also write exit summaries during lifecycle transitions (`/reload`, `/new`, `/resume`, `/fork`). By default these transitions skip summaries for speed. |
+
+## Troubleshooting
+
+Run the `memory_status` tool first — it reports most of these at a glance.
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `memory_search` says qmd is required | qmd not installed or not on `PATH` | Install qmd (`npm install -g @tobilu/qmd`); if installed via Bun, ensure `~/.bun/bin` is on `PATH` |
+| Search returns nothing for terms you know exist | Index is stale | A background `qmd update` runs after writes; if disabled (`PI_MEMORY_QMD_UPDATE=off`), run `qmd update` manually |
+| “need embeddings” on semantic/deep search | Vectors not built yet | Embedding starts automatically in the background — retry shortly. If `PI_MEMORY_QMD_UPDATE` is `manual`/`off`, run `qmd embed` yourself |
+| Collection `pi-memory` missing | Auto-setup didn't run (qmd installed mid-session) | Run any `memory_search` (auto-creates it) or `qmd collection add ~/.pi/agent/memory --name pi-memory` |
+| qmd works in the shell but not from pi on Windows | Broken `.cmd`/`.ps1` shims | The extension bypasses them by invoking qmd's JS entry with `node`; make sure the npm global `node_modules` dir is on `PATH` |
+| Memory isn't being injected after a write | Cache-stable snapshot only refreshes at checkpoints | Long-term writes refresh next turn; for daily/scratchpad use `memory_read`, or set `PI_MEMORY_SNAPSHOT=per-turn` |
 
 ## Running tests
 
 ```bash
-# Unit tests (no LLM, no qmd — fast, deterministic)
-bun test/unit.ts
+# Unit tests (no LLM, no qmd — fast, deterministic). Requires Bun.
+npm test
 
 # End-to-end tests (requires pi + API key, optionally qmd)
-bun test/e2e.ts
+npm run test:e2e
 
 # Recall effectiveness eval (requires pi + API key + qmd)
-bun test/eval-recall.ts
+npm run test:eval
 
 # Pin provider/model for cheaper eval runs
-PI_E2E_PROVIDER=openai PI_E2E_MODEL=gpt-4o-mini bun test/eval-recall.ts
+PI_E2E_PROVIDER=openai PI_E2E_MODEL=gpt-4o-mini npm run test:eval
 
 # Multiple runs for statistical robustness
-EVAL_RUNS=3 bun test/eval-recall.ts
+EVAL_RUNS=3 npm run test:eval
 ```
 
 All tests back up and restore existing memory files.
 
 ### Test levels
 
-| Level | File | Requirements | What it tests |
-|-------|------|-------------|---------------|
-| Unit | `test/unit.ts` | None | Context builder, truncation, handoff, scratchpad parsing |
-| E2E | `test/e2e.ts` | pi + API key | Tool registration, write/recall, scratchpad lifecycle, search |
-| Eval | `test/eval-recall.ts` | pi + API key + qmd | Recall accuracy with vs without selective injection |
+| Level | Command | Requirements | What it tests |
+|-------|---------|-------------|---------------|
+| Unit | `npm test` (`test/unit.test.ts`) | Bun | Context builder, truncation, handoff, scratchpad parsing, qmd plumbing |
+| E2E | `npm run test:e2e` (`test/e2e.ts`) | pi + API key | Tool registration, write/recall, scratchpad lifecycle, search |
+| Eval | `npm run test:eval` (`test/eval-recall.ts`) | pi + API key + qmd | Recall accuracy with vs without selective injection |
 
 ## Development
 
@@ -197,48 +237,21 @@ cat ~/.pi/agent/memory/MEMORY.md
 
 ## Publishing (maintainers)
 
+Releases are tag-driven. Pushing a `v*` tag runs the publish workflow, which
+lints, builds, runs the unit tests, verifies the tag matches `package.json`,
+and then publishes to npm.
+
 ```bash
-# Confirm package name is available
-npm view pi-memory
+# Bump version + create the matching git tag (updates package.json)
+npm version patch   # or minor / major
 
-# Bump version (choose patch/minor/major)
-npm version patch
+# Push the commit and tag — this triggers .github/workflows/publish-npm.yml
+git push --follow-tags
 
-# Publish to npm (public)
-npm publish --access public
-
-# Verify install
+# Verify the published install
 pi install npm:pi-memory
 ```
 
 ## Changelog
 
-### Unreleased
-
-- **KV cache-stable memory snapshot** (default `PI_MEMORY_SNAPSHOT=stable`): the injected memory block is now byte-stable across turns. Snapshot refreshes only at deliberate checkpoints — `session_start`, `session_before_compact`, `memory_write(target: long_term)`, and day rollover — so local prefix caches (llama.cpp, vLLM, MLX) hit on every normal turn instead of reprocessing the entire conversation tail each turn.
-- **Per-turn qmd search no longer auto-injected by default**. The model retains on-demand recall via `memory_search`. Set `PI_MEMORY_SNAPSHOT=per-turn` to restore the old behavior (busts the cache every turn).
-- Snapshot system-prompt header now includes the snapshot reason and timestamp so the model knows when ambient context was captured and that `memory_read` / `memory_search` give the authoritative latest state.
-
-### 0.3.6
-
-- Added support for `PI_MEMORY_DIR` so memory storage can be redirected from the default `~/.pi/agent/memory` path.
-- Published npm patch release `0.3.6`.
-
-### 0.2.0
-
-- **Selective injection**: Before each turn, the user's prompt is searched against memory via qmd. Top results are injected into the system prompt alongside standard context, surfacing relevant past decisions without explicit tool calls.
-- **qmd auto-setup**: The extension automatically creates the `pi-memory` collection and path contexts on session start when qmd is available. No manual `qmd collection add` needed.
-- **Tags and links**: `memory_write` and context injection now encourage `#tags` and `[[wiki-links]]` as searchable content conventions.
-- **Session handoff on compaction**: `session_before_compact` automatically writes a handoff entry to today's daily log with open scratchpad items and recent context, preserving in-progress state across context compaction.
-- **Improved memory_search description**: Encourages iterative search (rephrasing, mode-switching) and mentions tags/links in keyword mode.
-- **Context priority reordering**: Injection order is now scratchpad > today > search results > MEMORY.md > yesterday (previously MEMORY.md was first). MEMORY.md budget reduced from 6K to 4K to make room for search results (2.5K).
-- **`PI_MEMORY_NO_SEARCH` env var**: Disable selective injection for A/B testing.
-- **Unit tests**: Added `test/unit.ts` with 18 deterministic tests (no LLM/qmd needed).
-- **Recall eval**: Added `test/eval-recall.ts` for measuring recall effectiveness with/without selective injection.
-
-### 0.1.0
-
-- Initial release: `memory_write`, `memory_read`, `scratchpad`, `memory_search` tools.
-- Context injection of MEMORY.md, scratchpad, and today/yesterday daily logs.
-- qmd integration for keyword, semantic, and hybrid search.
-- Debounced background `qmd update` after writes.
+See [CHANGELOG.md](./CHANGELOG.md).

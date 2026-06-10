@@ -747,11 +747,12 @@ export function qmdInstallInstructions(): string {
 	return [
 		"memory_search requires qmd.",
 		"",
-		"Install qmd (requires Bun):",
-		`  bun install -g ${QMD_REPO_URL}`,
-		"  # ensure ~/.bun/bin is in your PATH",
+		"Install qmd (either works):",
+		"  npm install -g @tobilu/qmd        # no Bun needed",
+		`  bun install -g ${QMD_REPO_URL}   # ensure ~/.bun/bin is on PATH`,
 		"",
-		"Then set up the collection (one-time):",
+		"The extension auto-creates the collection on next session start.",
+		"To set it up manually instead:",
 		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
 		"  qmd embed",
 	].join("\n");
@@ -856,13 +857,57 @@ export function checkCollection(name: string): Promise<boolean> {
 	});
 }
 
+// `qmd embed` is incremental: it only embeds new/changed chunks and no-ops in
+// well under a second when everything is current. The first run ever may
+// download the embedding model, hence the generous timeout.
+const QMD_EMBED_TIMEOUT_MS = 10 * 60 * 1000;
+let embedInFlight = false;
+let embedPending = false;
+
+/**
+ * Ensure a background `qmd embed` is running so semantic/deep search stays
+ * usable without the user ever running it manually. Returns true if an embed
+ * is now running (started here or already in flight), false if embedding is
+ * unavailable (qmd missing or background updates disabled).
+ *
+ * If an embed is already running, the request is queued: another embed runs
+ * immediately after the current one finishes, so chunks written while the
+ * first embed was already underway don't have to wait for the next session.
+ */
+export function ensureQmdEmbed(): boolean {
+	if (getQmdUpdateMode() !== "background") return false;
+	if (!qmdAvailable) return false;
+	if (embedInFlight) {
+		embedPending = true;
+		return true;
+	}
+	embedInFlight = true;
+	execFileFn("qmd", ["embed"], { timeout: QMD_EMBED_TIMEOUT_MS }, () => {
+		embedInFlight = false;
+		if (embedPending) {
+			embedPending = false;
+			ensureQmdEmbed();
+		}
+	});
+	return true;
+}
+
+/** Get/clear the embed-in-flight flag (for testing). */
+export function _getEmbedInFlight(): boolean {
+	return embedInFlight;
+}
+export function _clearEmbedInFlight() {
+	embedInFlight = false;
+	embedPending = false;
+}
+
 export function scheduleQmdUpdate() {
 	if (getQmdUpdateMode() !== "background") return;
 	if (!qmdAvailable) return;
 	if (updateTimer) clearTimeout(updateTimer);
 	updateTimer = setTimeout(() => {
 		updateTimer = null;
-		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => {});
+		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => ensureQmdEmbed());
 	}, 500);
 }
 
@@ -872,6 +917,8 @@ async function runQmdUpdateNow() {
 	await new Promise<void>((resolve) => {
 		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => resolve());
 	});
+	// Embeds for the final writes are picked up by the session_start catch-up
+	// embed; not chained here so shutdown stays fast.
 }
 
 /** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
@@ -989,6 +1036,63 @@ export function runQmdSearch(
 	});
 }
 
+/**
+ * Best-effort check of whether vector embeddings are ready for semantic/deep
+ * search. Bounded by a short timeout because the first semantic query can
+ * trigger a model download. Returns "unknown" rather than blocking on it.
+ * "ready" means a probe query ran without qmd's "need embeddings" warning —
+ * it does not prove the index has content.
+ */
+export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const { stderr } = await Promise.race([
+			runQmdSearch("semantic", "memory", 1),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error("timeout")), 4_000);
+			}),
+		]);
+		return /need embeddings/i.test(stderr ?? "") ? "missing" : "ready";
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (/need embeddings/i.test(msg)) return "missing";
+		return "unknown";
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** Collect a fast on-disk inventory of the memory files (no qmd needed). */
+export function getMemoryInventory(): {
+	dir: string;
+	longTermChars: number;
+	scratchpadOpen: number;
+	scratchpadTotal: number;
+	dailyCount: number;
+	latestDaily: string | null;
+} {
+	const longTerm = readFileSafe(MEMORY_FILE) ?? "";
+	const scratchpad = readFileSafe(SCRATCHPAD_FILE) ?? "";
+	const items = parseScratchpad(scratchpad);
+	let dailyFiles: string[] = [];
+	try {
+		dailyFiles = fs
+			.readdirSync(DAILY_DIR)
+			.filter((f) => f.endsWith(".md"))
+			.sort();
+	} catch {
+		dailyFiles = [];
+	}
+	return {
+		dir: MEMORY_DIR,
+		longTermChars: longTerm.trim().length,
+		scratchpadOpen: items.filter((i) => !i.done).length,
+		scratchpadTotal: items.length,
+		dailyCount: dailyFiles.length,
+		latestDaily: dailyFiles.length ? dailyFiles[dailyFiles.length - 1].replace(/\.md$/, "") : null,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Memory snapshot (Option P: KV cache-stable context injection)
 //
@@ -1062,6 +1166,10 @@ export default function (pi: ExtensionAPI) {
 		if (!hasCollection) {
 			await setupQmdCollection();
 		}
+		// Catch-up embed: covers writes from previous sessions (shutdown skips
+		// embedding) and fresh installs where the collection exists but was
+		// never embedded. Incremental, so a no-op when already current.
+		ensureQmdEmbed();
 		refreshMemorySnapshot("session_start");
 	});
 
@@ -1650,7 +1758,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names, #tags, [[links]].\n" +
 			"- 'semantic' (~2s): Meaning-based search. Finds related concepts even with different wording.\n" +
 			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
-			"If semantic/deep warns about missing embeddings, run `qmd embed` once and retry.\n" +
+			"If semantic/deep warns about missing embeddings, embedding starts automatically in the background — retry shortly.\n" +
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
 			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
 		parameters: Type.Object({
@@ -1707,6 +1815,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
 				const needsEmbed = /need embeddings/i.test(stderr ?? "");
+				// Self-heal: any "need embeddings" warning (even with partial
+				// results) kicks off an incremental background embed.
+				const embedStarted = needsEmbed ? ensureQmdEmbed() : false;
 
 				if (results.length === 0) {
 					if (needsEmbed && (mode === "semantic" || mode === "deep")) {
@@ -1718,12 +1829,16 @@ export default function (pi: ExtensionAPI) {
 										`No results found for "${params.query}" (mode: ${mode}).`,
 										"",
 										"qmd reports missing vector embeddings for one or more documents.",
-										"Run this once, then retry:",
-										"  qmd embed",
+										...(embedStarted
+											? [
+													"Embedding has been started in the background — retry the search shortly.",
+													"(The very first embed may take longer while the embedding model downloads.)",
+												]
+											: ["Run this once, then retry:", "  qmd embed"]),
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, count: 0, needsEmbed: true },
+							details: { mode, query: params.query, count: 0, needsEmbed: true, embedStarted },
 						};
 					}
 					return {
@@ -1765,6 +1880,84 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+		},
+	});
+
+	// --- memory_status tool (doctor) ---
+	pi.registerTool({
+		name: "memory_status",
+		label: "Memory Status",
+		description:
+			"Report the health of the memory system: where files live, what's stored, " +
+			"whether qmd search is available, whether the pi-memory collection exists, " +
+			"whether embeddings are ready, and the active configuration. " +
+			"Use this when search behaves unexpectedly or to confirm setup.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			ensureDirs();
+			const inv = getMemoryInventory();
+
+			const qmdOk = qmdAvailable || (await detectQmd());
+			let collectionOk = false;
+			let embeddings: "ready" | "missing" | "unknown" | "n/a" = "n/a";
+			if (qmdOk) {
+				collectionOk = await checkCollection("pi-memory");
+				embeddings = collectionOk ? await probeEmbeddings() : "n/a";
+			}
+
+			const mark = (ok: boolean) => (ok ? "✓" : "✗");
+			const lines: string[] = [
+				"# Memory status",
+				"",
+				`- Memory dir: ${inv.dir}`,
+				`- MEMORY.md: ${inv.longTermChars} chars`,
+				`- Scratchpad: ${inv.scratchpadOpen} open / ${inv.scratchpadTotal} total`,
+				`- Daily logs: ${inv.dailyCount}${inv.latestDaily ? ` (latest ${inv.latestDaily})` : ""}`,
+				"",
+				"## Search (qmd)",
+				`- qmd available: ${mark(qmdOk)}`,
+			];
+
+			if (qmdOk) {
+				lines.push(`- Collection \`pi-memory\`: ${mark(collectionOk)}`);
+				if (collectionOk) {
+					const embMark = embeddings === "ready" ? "✓" : embeddings === "missing" ? "⚠" : "?";
+					lines.push(`- Embeddings (semantic/deep): ${embMark} ${embeddings}`);
+					if (embeddings === "missing") {
+						if (ensureQmdEmbed()) {
+							lines.push("  - Embedding started in the background — re-run memory_status to confirm.");
+						} else {
+							lines.push("  - Run `qmd embed` once to enable semantic/deep search.");
+						}
+					} else if (embeddings === "unknown") {
+						lines.push("  - Could not verify within the probe timeout; run a semantic search to confirm.");
+					}
+				} else {
+					lines.push("  - Run a `memory_search` (auto-creates it) or `qmd collection add` manually.");
+				}
+			} else {
+				lines.push("", qmdInstallInstructions());
+			}
+
+			lines.push(
+				"",
+				"## Configuration",
+				`- PI_MEMORY_SNAPSHOT: ${getSnapshotMode()}`,
+				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
+				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
+			);
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: {
+					...inv,
+					qmd: qmdOk,
+					collection: collectionOk,
+					embeddings,
+					snapshotMode: getSnapshotMode(),
+					qmdUpdateMode: getQmdUpdateMode(),
+				},
+			};
 		},
 	});
 }
