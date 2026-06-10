@@ -53,8 +53,11 @@ When qmd is present, the extension **automatically creates** the `pi-memory`
 collection and path contexts on the next session start — no manual step. Run
 `memory_status` any time to confirm qmd, the collection, and embeddings are ready.
 
-Semantic/deep modes need vector embeddings; if you see a “need embeddings”
-warning, run `qmd embed` once and retry. To set the collection up by hand:
+Semantic/deep modes need vector embeddings; the extension keeps them current
+automatically (`qmd embed` runs in the background at session start and after
+writes). The very first embed downloads the embedding model, so semantic search
+may take a minute to come online on a fresh install. To set the collection up
+by hand:
 
 ```bash
 qmd collection add ~/.pi/agent/memory --name pi-memory
@@ -165,7 +168,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 - **Tool response previews**: Write/scratchpad tools return size-capped previews instead of full file contents.
 - **qmd auto-setup**: On first session start with qmd available, the extension creates the collection and path contexts automatically.
 - **qmd re-indexing**: After every write, a debounced `qmd update` runs in the background (fire-and-forget, non-blocking) unless disabled via `PI_MEMORY_QMD_UPDATE`.
-- **qmd embeddings**: Semantic/deep search needs vector embeddings. If you see “need embeddings” warnings, run `qmd embed` once and retry.
+- **qmd embeddings**: Vector embeddings for semantic/deep search are kept current automatically — `qmd embed` (incremental) runs in the background after each re-index and as a catch-up at session start. Disabled along with re-indexing via `PI_MEMORY_QMD_UPDATE`.
 - **Graceful degradation**: If qmd is not installed, core tools work fine. `memory_search` returns install instructions.
 
 ### Configuration
@@ -174,7 +177,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 |----------|--------|---------|-------------|
 | `PI_MEMORY_DIR` | path | `~/.pi/agent/memory` | Override the memory storage directory |
 | `PI_MEMORY_SNAPSHOT` | `stable`, `per-turn` | `stable` | `stable` snapshots memory at checkpoints for KV cache stability; `per-turn` rebuilds every turn (legacy behavior) |
-| `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` after writes |
+| `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` + `qmd embed` after writes |
 | `PI_MEMORY_NO_SEARCH` | `1` | unset | Disable selective injection in `per-turn` mode (no effect in `stable` mode) |
 | `PI_MEMORY_SUMMARIZE_TRANSITIONS` | `1`, `true`, `yes`, `on` | unset | Also write exit summaries during lifecycle transitions (`/reload`, `/new`, `/resume`, `/fork`). By default these transitions skip summaries for speed. |
 
@@ -186,7 +189,7 @@ Run the `memory_status` tool first — it reports most of these at a glance.
 |---------|-------|-----|
 | `memory_search` says qmd is required | qmd not installed or not on `PATH` | Install qmd (`npm install -g @tobilu/qmd`); if installed via Bun, ensure `~/.bun/bin` is on `PATH` |
 | Search returns nothing for terms you know exist | Index is stale | A background `qmd update` runs after writes; if disabled (`PI_MEMORY_QMD_UPDATE=off`), run `qmd update` manually |
-| “need embeddings” on semantic/deep search | Vectors not built yet | Run `qmd embed` once, then retry |
+| “need embeddings” on semantic/deep search | Vectors not built yet | Embedding starts automatically in the background — retry shortly. If `PI_MEMORY_QMD_UPDATE` is `manual`/`off`, run `qmd embed` yourself |
 | Collection `pi-memory` missing | Auto-setup didn't run (qmd installed mid-session) | Run any `memory_search` (auto-creates it) or `qmd collection add ~/.pi/agent/memory --name pi-memory` |
 | qmd works in the shell but not from pi on Windows | Broken `.cmd`/`.ps1` shims | The extension bypasses them by invoking qmd's JS entry with `node`; make sure the npm global `node_modules` dir is on `PATH` |
 | Memory isn't being injected after a write | Cache-stable snapshot only refreshes at checkpoints | Long-term writes refresh next turn; for daily/scratchpad use `memory_read`, or set `PI_MEMORY_SNAPSHOT=per-turn` |

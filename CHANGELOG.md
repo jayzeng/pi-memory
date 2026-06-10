@@ -28,6 +28,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Automatic embeddings — no more manual `qmd embed`.** An incremental
+  `qmd embed` now runs in the background after each debounced `qmd update`, as
+  a catch-up at session start, and when `memory_search`/`memory_status` detect
+  missing embeddings. Semantic/deep search comes online without any manual
+  step (the very first embed may take a minute while the model downloads).
+  Disabled together with re-indexing via `PI_MEMORY_QMD_UPDATE=manual|off`.
 - `memory_status` tool — reports qmd availability, collection state, and whether
   embeddings are ready, so search health is one tool call away.
 - `engines.node >= 20`.

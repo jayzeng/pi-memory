@@ -857,13 +857,44 @@ export function checkCollection(name: string): Promise<boolean> {
 	});
 }
 
+// `qmd embed` is incremental: it only embeds new/changed chunks and no-ops in
+// well under a second when everything is current. The first run ever may
+// download the embedding model, hence the generous timeout.
+const QMD_EMBED_TIMEOUT_MS = 10 * 60 * 1000;
+let embedInFlight = false;
+
+/**
+ * Ensure a background `qmd embed` is running so semantic/deep search stays
+ * usable without the user ever running it manually. Returns true if an embed
+ * is now running (started here or already in flight), false if embedding is
+ * unavailable (qmd missing or background updates disabled).
+ */
+export function ensureQmdEmbed(): boolean {
+	if (getQmdUpdateMode() !== "background") return false;
+	if (!qmdAvailable) return false;
+	if (embedInFlight) return true;
+	embedInFlight = true;
+	execFileFn("qmd", ["embed"], { timeout: QMD_EMBED_TIMEOUT_MS }, () => {
+		embedInFlight = false;
+	});
+	return true;
+}
+
+/** Get/clear the embed-in-flight flag (for testing). */
+export function _getEmbedInFlight(): boolean {
+	return embedInFlight;
+}
+export function _clearEmbedInFlight() {
+	embedInFlight = false;
+}
+
 export function scheduleQmdUpdate() {
 	if (getQmdUpdateMode() !== "background") return;
 	if (!qmdAvailable) return;
 	if (updateTimer) clearTimeout(updateTimer);
 	updateTimer = setTimeout(() => {
 		updateTimer = null;
-		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => {});
+		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => ensureQmdEmbed());
 	}, 500);
 }
 
@@ -873,6 +904,8 @@ async function runQmdUpdateNow() {
 	await new Promise<void>((resolve) => {
 		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => resolve());
 	});
+	// Embeds for the final writes are picked up by the session_start catch-up
+	// embed; not chained here so shutdown stays fast.
 }
 
 /** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
@@ -1120,6 +1153,10 @@ export default function (pi: ExtensionAPI) {
 		if (!hasCollection) {
 			await setupQmdCollection();
 		}
+		// Catch-up embed: covers writes from previous sessions (shutdown skips
+		// embedding) and fresh installs where the collection exists but was
+		// never embedded. Incremental, so a no-op when already current.
+		ensureQmdEmbed();
 		refreshMemorySnapshot("session_start");
 	});
 
@@ -1708,7 +1745,7 @@ export default function (pi: ExtensionAPI) {
 			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names, #tags, [[links]].\n" +
 			"- 'semantic' (~2s): Meaning-based search. Finds related concepts even with different wording.\n" +
 			"- 'deep' (~10s): Hybrid search with reranking. Use when other modes don't find what you need.\n" +
-			"If semantic/deep warns about missing embeddings, run `qmd embed` once and retry.\n" +
+			"If semantic/deep warns about missing embeddings, embedding starts automatically in the background — retry shortly.\n" +
 			"If the first search doesn't find what you need, try rephrasing or switching modes. " +
 			"Keyword mode is best for specific terms; semantic mode finds related concepts even with different wording.",
 		parameters: Type.Object({
@@ -1765,6 +1802,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
 				const needsEmbed = /need embeddings/i.test(stderr ?? "");
+				// Self-heal: any "need embeddings" warning (even with partial
+				// results) kicks off an incremental background embed.
+				const embedStarted = needsEmbed ? ensureQmdEmbed() : false;
 
 				if (results.length === 0) {
 					if (needsEmbed && (mode === "semantic" || mode === "deep")) {
@@ -1776,12 +1816,16 @@ export default function (pi: ExtensionAPI) {
 										`No results found for "${params.query}" (mode: ${mode}).`,
 										"",
 										"qmd reports missing vector embeddings for one or more documents.",
-										"Run this once, then retry:",
-										"  qmd embed",
+										...(embedStarted
+											? [
+													"Embedding has been started in the background — retry the search shortly.",
+													"(The very first embed may take longer while the embedding model downloads.)",
+												]
+											: ["Run this once, then retry:", "  qmd embed"]),
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, count: 0, needsEmbed: true },
+							details: { mode, query: params.query, count: 0, needsEmbed: true, embedStarted },
 						};
 					}
 					return {
@@ -1867,7 +1911,11 @@ export default function (pi: ExtensionAPI) {
 					const embMark = embeddings === "ready" ? "✓" : embeddings === "missing" ? "⚠" : "?";
 					lines.push(`- Embeddings (semantic/deep): ${embMark} ${embeddings}`);
 					if (embeddings === "missing") {
-						lines.push("  - Run `qmd embed` once to enable semantic/deep search.");
+						if (ensureQmdEmbed()) {
+							lines.push("  - Embedding started in the background — re-run memory_status to confirm.");
+						} else {
+							lines.push("  - Run `qmd embed` once to enable semantic/deep search.");
+						}
 					} else if (embeddings === "unknown") {
 						lines.push("  - Could not verify within the probe timeout; run a semantic search to confirm.");
 					}

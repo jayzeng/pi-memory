@@ -12,7 +12,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	_clearEmbedInFlight,
 	_clearUpdateTimer,
+	_getEmbedInFlight,
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
@@ -25,6 +27,7 @@ import {
 	buildQmdSpawn,
 	dailyPath,
 	ensureDirs,
+	ensureQmdEmbed,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -588,6 +591,64 @@ describe("scheduleQmdUpdate", () => {
 		expect(secondTimer).not.toBeNull();
 		expect(firstTimer).not.toBe(secondTimer);
 		_clearUpdateTimer();
+	});
+
+	test("chains qmd embed after the debounced update", async () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			cb(null, "", "");
+		}) as any);
+		try {
+			scheduleQmdUpdate();
+			await new Promise((r) => setTimeout(r, 700));
+			expect(calls).toEqual([["update"], ["embed"]]);
+		} finally {
+			_resetExecFileForTest();
+			_clearEmbedInFlight();
+		}
+	});
+});
+
+describe("ensureQmdEmbed", () => {
+	afterEach(() => {
+		_resetExecFileForTest();
+		_clearEmbedInFlight();
+		_setQmdAvailable(false);
+		delete process.env.PI_MEMORY_QMD_UPDATE;
+	});
+
+	test("returns false when qmd is not available", () => {
+		_setQmdAvailable(false);
+		expect(ensureQmdEmbed()).toBe(false);
+	});
+
+	test("returns false when background updates are disabled", () => {
+		_setQmdAvailable(true);
+		process.env.PI_MEMORY_QMD_UPDATE = "off";
+		expect(ensureQmdEmbed()).toBe(false);
+	});
+
+	test("spawns qmd embed and clears the in-flight flag when it finishes", () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		let finish: (() => void) | null = null;
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			finish = () => cb(null, "", "");
+		}) as any);
+
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+		expect(_getEmbedInFlight()).toBe(true);
+
+		// While in flight, a second call reports true but spawns nothing new.
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+
+		finish?.();
+		expect(_getEmbedInFlight()).toBe(false);
 	});
 });
 
