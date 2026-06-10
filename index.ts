@@ -862,20 +862,32 @@ export function checkCollection(name: string): Promise<boolean> {
 // download the embedding model, hence the generous timeout.
 const QMD_EMBED_TIMEOUT_MS = 10 * 60 * 1000;
 let embedInFlight = false;
+let embedPending = false;
 
 /**
  * Ensure a background `qmd embed` is running so semantic/deep search stays
  * usable without the user ever running it manually. Returns true if an embed
  * is now running (started here or already in flight), false if embedding is
  * unavailable (qmd missing or background updates disabled).
+ *
+ * If an embed is already running, the request is queued: another embed runs
+ * immediately after the current one finishes, so chunks written while the
+ * first embed was already underway don't have to wait for the next session.
  */
 export function ensureQmdEmbed(): boolean {
 	if (getQmdUpdateMode() !== "background") return false;
 	if (!qmdAvailable) return false;
-	if (embedInFlight) return true;
+	if (embedInFlight) {
+		embedPending = true;
+		return true;
+	}
 	embedInFlight = true;
 	execFileFn("qmd", ["embed"], { timeout: QMD_EMBED_TIMEOUT_MS }, () => {
 		embedInFlight = false;
+		if (embedPending) {
+			embedPending = false;
+			ensureQmdEmbed();
+		}
 	});
 	return true;
 }
@@ -886,6 +898,7 @@ export function _getEmbedInFlight(): boolean {
 }
 export function _clearEmbedInFlight() {
 	embedInFlight = false;
+	embedPending = false;
 }
 
 export function scheduleQmdUpdate() {

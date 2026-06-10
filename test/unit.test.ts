@@ -643,11 +643,32 @@ describe("ensureQmdEmbed", () => {
 		expect(calls).toEqual([["embed"]]);
 		expect(_getEmbedInFlight()).toBe(true);
 
-		// While in flight, a second call reports true but spawns nothing new.
+		finish?.();
+		expect(_getEmbedInFlight()).toBe(false);
+	});
+
+	test("queues another embed if requested while one is already running", () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		const finishers: (() => void)[] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			finishers.push(() => cb(null, "", ""));
+		}) as any);
+
 		expect(ensureQmdEmbed()).toBe(true);
 		expect(calls).toEqual([["embed"]]);
 
-		finish?.();
+		// A second request arrives while the first embed is still running.
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(calls).toEqual([["embed"]]);
+
+		// Finishing the first embed immediately starts the queued one.
+		finishers[0]?.();
+		expect(calls).toEqual([["embed"], ["embed"]]);
+		expect(_getEmbedInFlight()).toBe(true);
+
+		finishers[1]?.();
 		expect(_getEmbedInFlight()).toBe(false);
 	});
 });
