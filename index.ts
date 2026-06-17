@@ -23,15 +23,15 @@
 import { type ExecFileOptions, execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { complete, type Message, StringEnum } from "@mariozechner/pi-ai";
+import { complete, type Message, StringEnum } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionEntry,
 	serializeConversation,
-} from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
 // Paths (mutable for testing via _setBaseDir / _resetBaseDir)

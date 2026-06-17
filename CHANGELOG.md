@@ -8,8 +8,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Peer dependency floors raised**: `@mariozechner/pi-ai` and
-  `@mariozechner/pi-coding-agent` now require `>=0.52.0` (previously
+- **Peer dependency floors raised**: `@earendil-works/pi-ai` and
+  `@earendil-works/pi-coding-agent` now require `>=0.74.0` (previously
   `>=0.0.1`). If you run an older pi, stay on 0.3.12. This makes the next
   release a **minor** version bump.
 - **`postinstall` no longer touches your git config.** It previously ran

@@ -35,7 +35,7 @@ Key design patterns:
 
 ## Peer Dependencies
 
-Uses `@mariozechner/pi-coding-agent` (ExtensionAPI types), `@mariozechner/pi-ai` (StringEnum), and `@sinclair/typebox` (schema definitions). These are peer deps — provided by the pi runtime.
+Uses `@earendil-works/pi-coding-agent` (ExtensionAPI types), `@earendil-works/pi-ai` (StringEnum), and `typebox` (schema definitions). These are peer deps — provided by the pi runtime.
 
 ## Testing
 
