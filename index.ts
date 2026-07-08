@@ -571,6 +571,38 @@ export function scratchpadClearDone(content: string): { content: string; removed
 }
 
 // ---------------------------------------------------------------------------
+// Forget helper — deletion as a first-class operation
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove every paragraph (blank-line-separated block) containing `match`
+ * (case-insensitive) from `content`. Entry timestamp comments live inside the
+ * same paragraph as their entry, so removing the paragraph removes the stamp.
+ * Returns the surviving content and the removed blocks so callers can echo
+ * them back — a wrong deletion stays recoverable from the conversation.
+ */
+export function forgetBlocks(content: string, match: string): { content: string; removed: string[] } {
+	const needle = match.trim().toLowerCase();
+	if (!needle) return { content, removed: [] };
+	const paragraphs = content.split(/\n{2,}/);
+	const kept: string[] = [];
+	const removed: string[] = [];
+	for (const p of paragraphs) {
+		if (p.trim() && p.toLowerCase().includes(needle)) {
+			removed.push(p.trim());
+		} else {
+			kept.push(p);
+		}
+	}
+	if (removed.length === 0) return { content, removed };
+	const joined = kept
+		.join("\n\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+	return { content: joined ? `${joined}\n` : "", removed };
+}
+
+// ---------------------------------------------------------------------------
 // Context builder
 // ---------------------------------------------------------------------------
 
@@ -1802,6 +1834,100 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: content }],
 				details: { path: MEMORY_FILE },
+			};
+		},
+	});
+
+	// --- memory_forget tool ---
+	pi.registerTool({
+		name: "memory_forget",
+		label: "Memory Forget",
+		description: [
+			"Delete outdated or incorrect facts from memory. Removes every entry/paragraph",
+			"containing the match string (case-insensitive substring) from MEMORY.md, or from",
+			"a daily log when target='daily'. The removed content is returned in the result so",
+			"it can be re-added if the deletion was wrong.",
+			"Use this when the user corrects a stored fact or a memory is no longer true —",
+			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
+		].join("\n"),
+		parameters: Type.Object({
+			match: Type.String({
+				description: "Case-insensitive substring identifying the fact(s) to remove",
+			}),
+			target: Type.Optional(
+				StringEnum(["long_term", "daily"] as const, {
+					description: "Where to delete from: 'long_term' (MEMORY.md, default) or 'daily'",
+				}),
+			),
+			date: Type.Optional(
+				Type.String({ description: "Daily log date (YYYY-MM-DD) when target='daily'. Default: today." }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			ensureDirs();
+			const target = params.target ?? "long_term";
+			if (!params.match.trim()) {
+				return {
+					content: [{ type: "text", text: "Error: 'match' must not be empty." }],
+					isError: true,
+					details: {},
+				};
+			}
+			let filePath: string;
+			if (target === "daily") {
+				const d = params.date ?? todayStr();
+				if (!isValidDailyDate(d)) {
+					return {
+						content: [{ type: "text", text: `Invalid date format: ${d}. Use YYYY-MM-DD.` }],
+						isError: true,
+						details: { date: d },
+					};
+				}
+				filePath = dailyPath(d);
+			} else {
+				filePath = MEMORY_FILE;
+			}
+
+			const existing = readFileSafe(filePath);
+			if (!existing?.trim()) {
+				return {
+					content: [{ type: "text", text: `Nothing stored in ${filePath} — nothing to forget.` }],
+					details: { path: filePath, removed: 0 },
+				};
+			}
+
+			const result = forgetBlocks(existing, params.match);
+			if (result.removed.length === 0) {
+				return {
+					content: [{ type: "text", text: `No entries matching "${params.match}" in ${filePath}.` }],
+					details: { path: filePath, removed: 0 },
+				};
+			}
+
+			fs.writeFileSync(filePath, result.content, "utf-8");
+			// Deleted facts must leave the injected snapshot too, whichever file
+			// they lived in — a forgotten-but-still-injected memory defeats the
+			// point of forgetting.
+			snapshotDirty = true;
+			await ensureQmdAvailableForUpdate();
+			scheduleQmdUpdate();
+
+			const removedPreview = buildPreview(result.removed.join("\n\n"), {
+				maxLines: RESPONSE_PREVIEW_MAX_LINES,
+				maxChars: RESPONSE_PREVIEW_MAX_CHARS,
+				mode: "start",
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Removed ${result.removed.length} entr${result.removed.length === 1 ? "y" : "ies"} from ${filePath}. ` +
+							"Removed content (re-add with memory_write if this was wrong):\n\n" +
+							removedPreview.preview,
+					},
+				],
+				details: { path: filePath, target, removed: result.removed.length, removedPreview },
 			};
 		},
 	});

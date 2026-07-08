@@ -29,6 +29,7 @@ import {
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
+	forgetBlocks,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -1622,11 +1623,12 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 5 tools", () => {
+	test("registers all 6 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(5);
+		expect(Object.keys(mockPi.tools)).toHaveLength(6);
 		expect(mockPi.tools.memory_write).toBeDefined();
+		expect(mockPi.tools.memory_forget).toBeDefined();
 		expect(mockPi.tools.memory_read).toBeDefined();
 		expect(mockPi.tools.scratchpad).toBeDefined();
 		expect(mockPi.tools.memory_search).toBeDefined();
@@ -1760,5 +1762,130 @@ describe("clampSearchLimit", () => {
 		expect(clampSearchLimit(-3)).toBe(1);
 		expect(clampSearchLimit(3.7)).toBe(3);
 		expect(clampSearchLimit(9999)).toBe(25);
+	});
+});
+
+// ==========================================================================
+// forgetBlocks + memory_forget (deletion as a first-class operation)
+// ==========================================================================
+
+describe("forgetBlocks", () => {
+	const file = [
+		"<!-- 2026-07-01 10:00:00 [abc] -->",
+		"Balance is $12.69 #finance",
+		"",
+		"<!-- 2026-07-03 09:00:00 [def] -->",
+		"Prefers dark mode #preference",
+		"",
+		"Hand-written note about deployment.",
+	].join("\n");
+
+	test("removes the matching entry with its timestamp stamp", () => {
+		const { content, removed } = forgetBlocks(file, "$12.69");
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain("Balance is $12.69");
+		expect(removed[0]).toContain("2026-07-01");
+		expect(content).not.toContain("$12.69");
+		expect(content).toContain("Prefers dark mode");
+		expect(content).toContain("Hand-written note about deployment.");
+	});
+
+	test("match is case-insensitive", () => {
+		const { removed } = forgetBlocks(file, "DARK MODE");
+		expect(removed).toHaveLength(1);
+	});
+
+	test("removes multiple matching blocks", () => {
+		const { content, removed } = forgetBlocks(file, "20");
+		expect(removed).toHaveLength(2); // both stamped entries contain 2026 dates
+		expect(content).toContain("Hand-written note");
+	});
+
+	test("no match leaves content untouched", () => {
+		const { content, removed } = forgetBlocks(file, "nonexistent");
+		expect(removed).toHaveLength(0);
+		expect(content).toBe(file);
+	});
+
+	test("empty match removes nothing", () => {
+		expect(forgetBlocks(file, "  ").removed).toHaveLength(0);
+	});
+
+	test("removing the only entry empties the file", () => {
+		const { content, removed } = forgetBlocks("only fact here\n", "only fact");
+		expect(removed).toHaveLength(1);
+		expect(content).toBe("");
+	});
+});
+
+describe("memory_forget tool", () => {
+	let tools: Record<string, any>;
+
+	beforeEach(() => {
+		setupTmpDir();
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(cleanupTmpDir);
+
+	test("registers with correct name", () => {
+		expect(tools.memory_forget).toBeDefined();
+	});
+
+	test("removes matching entry from MEMORY.md and echoes it back", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "MEMORY.md"),
+			"<!-- ts [s] -->\nBalance is $12.69\n\nPrefers tabs over spaces\n",
+			"utf-8",
+		);
+		const result = await tools.memory_forget.execute("c1", { match: "$12.69" }, null, null, {});
+		expect(result.content[0].text).toContain("Removed 1 entry");
+		expect(result.content[0].text).toContain("$12.69"); // recoverable echo
+		const remaining = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
+		expect(remaining).not.toContain("$12.69");
+		expect(remaining).toContain("Prefers tabs");
+	});
+
+	test("reports no match without touching the file", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "a fact\n", "utf-8");
+		const result = await tools.memory_forget.execute("c1", { match: "zzz" }, null, null, {});
+		expect(result.content[0].text).toContain("No entries matching");
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toBe("a fact\n");
+	});
+
+	test("targets a specific daily log by date", async () => {
+		fs.mkdirSync(path.join(tmpDir, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "old wrong fact\n\nkeep me\n", "utf-8");
+		const result = await tools.memory_forget.execute(
+			"c1",
+			{ match: "wrong fact", target: "daily", date: "2026-07-01" },
+			null,
+			null,
+			{},
+		);
+		expect(result.content[0].text).toContain("Removed 1 entry");
+		const remaining = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
+		expect(remaining).toContain("keep me");
+		expect(remaining).not.toContain("wrong fact");
+	});
+
+	test("rejects empty match and bad dates", async () => {
+		const r1 = await tools.memory_forget.execute("c1", { match: "  " }, null, null, {});
+		expect(r1.isError).toBe(true);
+		const r2 = await tools.memory_forget.execute(
+			"c1",
+			{ match: "x", target: "daily", date: "not-a-date" },
+			null,
+			null,
+			{},
+		);
+		expect(r2.isError).toBe(true);
+	});
+
+	test("handles empty memory gracefully", async () => {
+		const result = await tools.memory_forget.execute("c1", { match: "x" }, null, null, {});
+		expect(result.content[0].text).toContain("nothing to forget");
 	});
 });
