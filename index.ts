@@ -80,22 +80,30 @@ export function ensureDirs() {
 	fs.mkdirSync(DAILY_DIR, { recursive: true });
 }
 
+// Daily logs are keyed by the user's LOCAL calendar day. toISOString() is UTC,
+// which filed every evening write (after 5pm PDT) under tomorrow's date and
+// made the injected "today's log" look at the wrong file.
+function pad2(n: number): string {
+	return String(n).padStart(2, "0");
+}
+
+function localDateStr(d: Date): string {
+	return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
 export function todayStr(): string {
-	const d = new Date();
-	return d.toISOString().slice(0, 10);
+	return localDateStr(new Date());
 }
 
 export function yesterdayStr(): string {
 	const d = new Date();
 	d.setDate(d.getDate() - 1);
-	return d.toISOString().slice(0, 10);
+	return localDateStr(d);
 }
 
 export function nowTimestamp(): string {
-	return new Date()
-		.toISOString()
-		.replace("T", " ")
-		.replace(/\.\d+Z$/, "");
+	const d = new Date();
+	return `${localDateStr(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 export function shortSessionId(sessionId: string): string {
@@ -331,20 +339,6 @@ function buildExitSummaryPrompt(conversationText: string, truncated: boolean, to
 	return lines.join("\n");
 }
 
-function buildExitSummaryFallback(error?: string): string {
-	const note = error ? `- Auto-summary unavailable: ${error}.` : "- Auto-summary unavailable.";
-	return [
-		"### Decisions",
-		"- None.",
-		"### Lessons Learned",
-		"- None.",
-		"### Notes",
-		note,
-		"### Follow-ups",
-		"- None.",
-	].join("\n");
-}
-
 function formatExitSummaryEntry(
 	summary: string,
 	reason: ExitSummaryReason,
@@ -516,6 +510,59 @@ export function serializeScratchpad(items: ScratchpadItem[]): string {
 		lines.push(`- ${checkbox} ${item.text}`);
 	}
 	return `${lines.join("\n")}\n`;
+}
+
+// Line-preserving mutations. The old parse→mutate→serialize round-trip kept
+// only checklist lines, silently deleting anything else in SCRATCHPAD.md
+// (hand-written notes, section headers, sub-bullets) on the first write.
+// These operate on the raw lines so unknown content survives.
+
+const SCRATCHPAD_ITEM_REGEX = /^- \[([ xX])\] (.+)$/;
+const META_COMMENT_REGEX = /^<!--.*-->$/;
+
+export function scratchpadAdd(content: string, text: string, meta: string): string {
+	if (!content.trim()) {
+		return serializeScratchpad([{ done: false, text, meta }]);
+	}
+	const base = content.replace(/\n+$/, "");
+	return `${base}\n${meta}\n- [ ] ${text}\n`;
+}
+
+export function scratchpadToggle(
+	content: string,
+	needle: string,
+	done: boolean,
+): { content: string; matched: boolean } {
+	const lines = content.split("\n");
+	const lower = needle.toLowerCase();
+	for (let i = 0; i < lines.length; i++) {
+		const m = lines[i].match(SCRATCHPAD_ITEM_REGEX);
+		if (!m) continue;
+		if ((m[1].toLowerCase() === "x") === done) continue;
+		if (!m[2].toLowerCase().includes(lower)) continue;
+		lines[i] = `- [${done ? "x" : " "}] ${m[2]}`;
+		return { content: lines.join("\n"), matched: true };
+	}
+	return { content, matched: false };
+}
+
+export function scratchpadClearDone(content: string): { content: string; removed: number } {
+	const lines = content.split("\n");
+	const out: string[] = [];
+	let removed = 0;
+	for (const line of lines) {
+		const m = line.match(SCRATCHPAD_ITEM_REGEX);
+		if (m && m[1].toLowerCase() === "x") {
+			removed++;
+			// Drop the item's timestamp comment directly above it, if any.
+			if (out.length > 0 && META_COMMENT_REGEX.test(out[out.length - 1])) {
+				out.pop();
+			}
+			continue;
+		}
+		out.push(line);
+	}
+	return { content: out.join("\n"), removed };
 }
 
 // ---------------------------------------------------------------------------
@@ -933,13 +980,16 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 		.slice(0, 200);
 	if (!sanitized) return "";
 
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const hasCollection = await checkCollection("pi-memory");
 		if (!hasCollection) return "";
 
 		const results = await Promise.race([
 			runQmdSearch("keyword", sanitized, 3),
-			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 3_000)),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error("timeout")), 3_000);
+			}),
 		]);
 
 		if (!results || results.results.length === 0) return "";
@@ -958,7 +1008,16 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 		return snippets.join("\n\n---\n\n");
 	} catch {
 		return "";
+	} finally {
+		clearTimeout(timer);
 	}
+}
+
+// The limit reaches `qmd -n` as a CLI argument; NaN/0/negative/huge values
+// from a confused model would produce broken qmd invocations.
+export function clampSearchLimit(value: number | undefined, fallback = 5, max = 25): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.min(max, Math.max(1, Math.floor(value)));
 }
 
 export interface QmdSearchResult {
@@ -1203,8 +1262,12 @@ export default function (pi: ExtensionAPI) {
 			if (reason) {
 				ensureDirs();
 				const result = await generateExitSummary(ctx);
-				if (result.hasMessages) {
-					const summary = result.summary ?? buildExitSummaryFallback(result.error);
+				// Only persist real summaries. The old fallback appended an
+				// all-"None." boilerplate block on every failed summarization
+				// (no API key, empty response, …), polluting the daily log —
+				// which is then re-injected into context every session start.
+				if (result.hasMessages && result.summary) {
+					const summary = result.summary;
 					const sid = shortSessionId(ctx.sessionManager.getSessionId());
 					const ts = nowTimestamp();
 					const entry = formatExitSummaryEntry(summary, reason, sid, ts);
@@ -1477,7 +1540,7 @@ export default function (pi: ExtensionAPI) {
 			const ts = nowTimestamp();
 
 			const existing = readFileSafe(SCRATCHPAD_FILE) ?? "";
-			let items = parseScratchpad(existing);
+			const items = parseScratchpad(existing);
 
 			if (action === "list") {
 				if (items.length === 0) {
@@ -1514,8 +1577,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				items.push({ done: false, text, meta: `<!-- ${ts} [${sid}] -->` });
-				const serialized = serializeScratchpad(items);
+				const serialized = scratchpadAdd(existing, text, `<!-- ${ts} [${sid}] -->`);
 				const preview = buildPreview(serialized, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
@@ -1553,17 +1615,9 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				const needle = text.toLowerCase();
 				const targetDone = action === "done";
-				let matched = false;
-				for (const item of items) {
-					if (item.done !== targetDone && item.text.toLowerCase().includes(needle)) {
-						item.done = targetDone;
-						matched = true;
-						break;
-					}
-				}
-				if (!matched) {
+				const toggled = scratchpadToggle(existing, text, targetDone);
+				if (!toggled.matched) {
 					return {
 						content: [
 							{
@@ -1574,7 +1628,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				const serialized = serializeScratchpad(items);
+				const serialized = toggled.content;
 				const preview = buildPreview(serialized, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
@@ -1601,10 +1655,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (action === "clear_done") {
-				const before = items.length;
-				items = items.filter((i) => !i.done);
-				const removed = before - items.length;
-				const serialized = serializeScratchpad(items);
+				const cleared = scratchpadClearDone(existing);
+				const removed = cleared.removed;
+				const serialized = cleared.content;
 				const preview = buildPreview(serialized, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
@@ -1810,7 +1863,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mode = params.mode ?? "keyword";
-			const limit = params.limit ?? 5;
+			const limit = clampSearchLimit(params.limit);
 
 			try {
 				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
