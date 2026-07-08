@@ -152,6 +152,7 @@ const CONTEXT_SEARCH_MAX_LINES = 80;
 const CONTEXT_MAX_CHARS = 16_000;
 
 const EXIT_SUMMARY_MAX_CHARS = 80_000;
+const EXIT_SUMMARY_MIN_MESSAGES = 4;
 const EXIT_SUMMARY_SYSTEM_PROMPT = [
 	"You are a session recap assistant.",
 	"Read the conversation and extract key decisions, lessons learned, notes, and follow-ups.",
@@ -388,7 +389,11 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		.filter((entry): entry is SessionEntry & { type: "message" } => entry.type === "message")
 		.map((entry) => entry.message);
 
-	if (messages.length === 0) {
+	// Curated-write gate: auto-summarizing trivial sessions (a lone `ls`, a
+	// one-liner Q&A) appends noise the daily-log injection and search then
+	// faithfully resurface forever. Only sessions with enough exchange to
+	// plausibly contain decisions/lessons earn an automatic summary.
+	if (messages.length < EXIT_SUMMARY_MIN_MESSAGES) {
 		return { summary: null, hasMessages: false };
 	}
 

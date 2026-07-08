@@ -1267,6 +1267,30 @@ describe("lifecycle hooks", () => {
 						timestamp: Date.now(),
 					},
 				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Also migrate the config to match." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+						timestamp: Date.now(),
+					},
+				},
 			],
 			model: { provider: "openai", id: "gpt-4o-mini" },
 			modelRegistry: {},
@@ -1300,6 +1324,39 @@ describe("lifecycle hooks", () => {
 		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 	});
 
+	test("session_shutdown skips trivial sessions without attempting a summary", async () => {
+		// Curated-write gate: a 2-message session (one-liner Q&A) has nothing
+		// worth summarizing — no LLM call, no daily-log write.
+		const getApiKey = mock(async () => "key");
+		const ctx = createShutdownCtx({
+			branch: [
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "ls" }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "file.txt" }],
+						timestamp: Date.now(),
+					},
+				},
+			],
+			model: { provider: "openai", id: "gpt-4o-mini" },
+			modelRegistry: { getApiKey },
+		});
+
+		await hooks.session_shutdown({}, ctx);
+
+		expect(getApiKey).not.toHaveBeenCalled();
+		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+	});
+
 	test("session_shutdown with reason=quit still attempts the exit summary", async () => {
 		// Ensure the reload-skip guard does not suppress real quit summaries.
 		// Summarization cannot succeed here (no API key), so the attempt is
@@ -1311,7 +1368,7 @@ describe("lifecycle hooks", () => {
 					type: "message",
 					message: {
 						role: "user",
-						content: [{ type: "text", text: "Remember: dark mode preferred" }],
+						content: [{ type: "text", text: "Please remember we chose dark mode." }],
 						timestamp: Date.now(),
 					},
 				},
@@ -1319,7 +1376,23 @@ describe("lifecycle hooks", () => {
 					type: "message",
 					message: {
 						role: "assistant",
-						content: [{ type: "text", text: "Noted." }],
+						content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Also migrate the config to match." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Done — config migrated and tests pass." }],
 						timestamp: Date.now(),
 					},
 				},
