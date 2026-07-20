@@ -37,8 +37,9 @@ pi install npm:pi-memory
 pi install ./pi-memory
 ```
 
-That's it — the four core tools (`memory_write`, `memory_read`, `scratchpad`,
-`memory_status`) work immediately with no other setup. Search is opt-in below.
+That's it — the six core tools (`memory_write`, `memory_forget`, `memory_restore`,
+`memory_read`, `scratchpad`, `memory_status`) work immediately with no other setup.
+Search is opt-in below.
 
 ### Optional: enable search with qmd
 
@@ -73,6 +74,8 @@ Without qmd, the core tools still work fully — only `memory_search` and select
 | Tool | Description |
 |------|-------------|
 | `memory_write` | Write to MEMORY.md (long-term) or daily log |
+| `memory_forget` | Delete matching entries and create a durable recovery record |
+| `memory_restore` | Restore a deletion using the recovery ID returned by `memory_forget` |
 | `memory_read` | Read any memory file or list daily logs |
 | `scratchpad` | Add/done/undo/clear/list checklist items |
 | `memory_search` | Search across all memory files (requires qmd) |
@@ -98,6 +101,8 @@ If the first search doesn't find what you need, try rephrasing or switching mode
     2026-02-15.md         # Daily append-only log
     2026-02-14.md
     ...
+  recovery/
+    <recovery-id>.json    # Complete payload and restore state for a memory_forget deletion
 ```
 
 ## How it works
@@ -165,6 +170,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 ### Other behavior
 
 - **Persistence**: Memory files are plain markdown on disk — readable, editable, and git-friendly.
+- **Recoverable deletion**: `memory_forget` stores complete deleted entries under `recovery/` before changing memory and returns a recovery ID that `memory_restore` can use. Recovery JSON is outside qmd's `**/*.md` index.
 - **Tool response previews**: Write/scratchpad tools return size-capped previews instead of full file contents.
 - **qmd auto-setup**: On first session start with qmd available, the extension creates the collection and path contexts automatically.
 - **qmd re-indexing**: After every write, a debounced `qmd update` runs in the background (fire-and-forget, non-blocking) unless disabled via `PI_MEMORY_QMD_UPDATE`.
