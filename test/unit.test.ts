@@ -1623,12 +1623,13 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 6 tools", () => {
+	test("registers all 7 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(6);
+		expect(Object.keys(mockPi.tools)).toHaveLength(7);
 		expect(mockPi.tools.memory_write).toBeDefined();
 		expect(mockPi.tools.memory_forget).toBeDefined();
+		expect(mockPi.tools.memory_restore).toBeDefined();
 		expect(mockPi.tools.memory_read).toBeDefined();
 		expect(mockPi.tools.scratchpad).toBeDefined();
 		expect(mockPi.tools.memory_search).toBeDefined();
@@ -1647,7 +1648,15 @@ describe("extension registration", () => {
 	test("tools have labels and descriptions", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		for (const name of ["memory_write", "memory_read", "scratchpad", "memory_search", "memory_status"]) {
+		for (const name of [
+			"memory_write",
+			"memory_forget",
+			"memory_restore",
+			"memory_read",
+			"scratchpad",
+			"memory_search",
+			"memory_status",
+		]) {
 			expect(mockPi.tools[name].label).toBeTruthy();
 			expect(mockPi.tools[name].description).toBeTruthy();
 		}
@@ -1745,6 +1754,15 @@ describe("line-preserving scratchpad mutations", () => {
 		expect(content).toContain("Hand-written note that must survive.");
 		expect(content).toContain("## Ideas");
 	});
+
+	test("scratchpadClearDone preserves hand-written HTML comments", () => {
+		const content = ["# Scratchpad", "", "<!-- Keep this deployment note. -->", "- [x] ship the release", ""].join(
+			"\n",
+		);
+		const result = scratchpadClearDone(content);
+		expect(result.removed).toBe(1);
+		expect(result.content).toContain("<!-- Keep this deployment note. -->");
+	});
 });
 
 // ==========================================================================
@@ -1771,13 +1789,13 @@ describe("clampSearchLimit", () => {
 
 describe("forgetBlocks", () => {
 	const file = [
+		"Hand-written note about deployment.",
+		"",
 		"<!-- 2026-07-01 10:00:00 [abc] -->",
 		"Balance is $12.69 #finance",
 		"",
 		"<!-- 2026-07-03 09:00:00 [def] -->",
 		"Prefers dark mode #preference",
-		"",
-		"Hand-written note about deployment.",
 	].join("\n");
 
 	test("removes the matching entry with its timestamp stamp", () => {
@@ -1799,6 +1817,60 @@ describe("forgetBlocks", () => {
 		const { content, removed } = forgetBlocks(file, "20");
 		expect(removed).toHaveLength(2); // both stamped entries contain 2026 dates
 		expect(content).toContain("Hand-written note");
+	});
+
+	test("removes an entire stamped entry when a later paragraph matches", () => {
+		const content = [
+			"<!-- 2026-07-01 10:00:00 [abc] -->",
+			"Balance is $12.69 #finance",
+			"",
+			"Supporting detail says this value is stale.",
+			"",
+			"<!-- 2026-07-03 09:00:00 [def] -->",
+			"Prefers dark mode #preference",
+		].join("\n");
+		const { content: remaining, removed } = forgetBlocks(content, "stale");
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain("Balance is $12.69");
+		expect(removed[0]).toContain("Supporting detail");
+		expect(remaining).not.toContain("Balance is $12.69");
+		expect(remaining).not.toContain("Supporting detail");
+		expect(remaining).toContain("Prefers dark mode");
+	});
+
+	test("preserves CRLF entry boundaries when removing a multi-paragraph entry", () => {
+		const content = [
+			"<!-- 2026-07-01 10:00:00 [abc] -->",
+			"Balance is $12.69 #finance",
+			"",
+			"Supporting detail says this value is stale.",
+			"",
+			"<!-- 2026-07-03 09:00:00 [def] -->",
+			"Prefers dark mode #preference",
+		].join("\r\n");
+		const { content: remaining, removed } = forgetBlocks(content, "stale");
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain("Balance is $12.69");
+		expect(removed[0]).toContain("Supporting detail");
+		expect(remaining).not.toContain("Balance is $12.69");
+		expect(remaining).toContain("Prefers dark mode");
+	});
+
+	test("recognizes the first generated entry when the file starts with a UTF-8 BOM", () => {
+		const content = `\uFEFF${[
+			"<!-- 2026-07-01 10:00:00 [abc] -->",
+			"Balance is $12.69 #finance",
+			"",
+			"Supporting detail says this value is stale.",
+			"",
+			"<!-- 2026-07-03 09:00:00 [def] -->",
+			"Prefers dark mode #preference",
+		].join("\n")}`;
+		const { content: remaining, removed } = forgetBlocks(content, "stale");
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain("Balance is $12.69");
+		expect(remaining).not.toContain("Balance is $12.69");
+		expect(remaining).toContain("Prefers dark mode");
 	});
 
 	test("no match leaves content untouched", () => {
@@ -1869,6 +1941,18 @@ describe("memory_forget tool", () => {
 		const remaining = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
 		expect(remaining).toContain("keep me");
 		expect(remaining).not.toContain("wrong fact");
+
+		const restoreResult = await tools.memory_restore.execute(
+			"c2",
+			{ recoveryId: result.details.recoveryId },
+			null,
+			null,
+			{},
+		);
+		expect(restoreResult.content[0].text).toContain("Restored 1 entry");
+		const restored = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
+		expect(restored).toContain("wrong fact");
+		expect(restored).toContain("keep me");
 	});
 
 	test("rejects empty match and bad dates", async () => {
@@ -1887,5 +1971,48 @@ describe("memory_forget tool", () => {
 	test("handles empty memory gracefully", async () => {
 		const result = await tools.memory_forget.execute("c1", { match: "x" }, null, null, {});
 		expect(result.content[0].text).toContain("nothing to forget");
+	});
+
+	test("rejects invalid recovery IDs without reading outside the recovery directory", async () => {
+		const result = await tools.memory_restore.execute("c1", { recoveryId: "../../MEMORY.md" }, null, null, {});
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("No valid recovery record");
+	});
+
+	test("persists complete removed content and restores it by visible recovery ID", async () => {
+		const longEntry = `<!-- 2026-07-01 10:00:00 [abc] -->\nwrong fact ${"x".repeat(4500)} recovery-tail`;
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), longEntry, "utf-8");
+		const forgetResult = await tools.memory_forget.execute("c1", { match: "wrong fact" }, null, null, {});
+		expect(forgetResult.content[0].text).not.toContain("recovery-tail");
+		expect(forgetResult.content[0].text).toContain("memory_restore");
+		expect(forgetResult.content[0].text).toContain(forgetResult.details.recoveryId);
+
+		const recoveryPath = path.join(tmpDir, "recovery", `${forgetResult.details.recoveryId}.json`);
+		const recovery = JSON.parse(fs.readFileSync(recoveryPath, "utf-8"));
+		expect(recovery.removedContent).toEqual([longEntry]);
+		expect(forgetResult.details.removedContent).toBeUndefined();
+
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "A later fact that must survive.\n", "utf-8");
+
+		const restoreResult = await tools.memory_restore.execute(
+			"c2",
+			{ recoveryId: forgetResult.details.recoveryId },
+			null,
+			null,
+			{},
+		);
+		expect(restoreResult.content[0].text).toContain("Restored 1 entry");
+		const restoredMemory = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
+		expect(restoredMemory).toContain("recovery-tail");
+		expect(restoredMemory).toContain("A later fact that must survive.");
+
+		const secondRestore = await tools.memory_restore.execute(
+			"c3",
+			{ recoveryId: forgetResult.details.recoveryId },
+			null,
+			null,
+			{},
+		);
+		expect(secondRestore.content[0].text).toContain("already restored");
 	});
 });

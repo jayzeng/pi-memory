@@ -9,9 +9,12 @@
  *   MEMORY.md              — curated long-term memory (decisions, preferences, durable facts)
  *   SCRATCHPAD.md           — checklist of things to keep in mind / fix later
  *   daily/YYYY-MM-DD.md    — daily append-only log (today + yesterday loaded at session start)
+ *   recovery/*.json        — durable records for restoring memory_forget deletions
  *
  * Tools:
  *   memory_write   — write to MEMORY.md or daily log
+ *   memory_forget  — delete matching memory entries and create a recovery record
+ *   memory_restore — restore entries from a memory_forget recovery record
  *   memory_read    — read any memory file or list daily logs
  *   scratchpad     — add/check/uncheck/clear items on the scratchpad checklist
  *   memory_search  — search across all memory files via qmd (keyword, semantic, or deep)
@@ -21,6 +24,7 @@
  */
 
 import { type ExecFileOptions, execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { complete, type Message, StringEnum } from "@mariozechner/pi-ai";
@@ -57,6 +61,7 @@ let MEMORY_DIR = resolveMemoryDir();
 let MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 let SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
 let DAILY_DIR = path.join(MEMORY_DIR, "daily");
+let RECOVERY_DIR = path.join(MEMORY_DIR, "recovery");
 
 /** Override base directory (for testing). */
 export function _setBaseDir(baseDir: string) {
@@ -64,6 +69,7 @@ export function _setBaseDir(baseDir: string) {
 	MEMORY_FILE = path.join(baseDir, "MEMORY.md");
 	SCRATCHPAD_FILE = path.join(baseDir, "SCRATCHPAD.md");
 	DAILY_DIR = path.join(baseDir, "daily");
+	RECOVERY_DIR = path.join(baseDir, "recovery");
 }
 
 /** Reset to default paths (for testing). */
@@ -78,6 +84,7 @@ export function _resetBaseDir() {
 export function ensureDirs() {
 	fs.mkdirSync(MEMORY_DIR, { recursive: true });
 	fs.mkdirSync(DAILY_DIR, { recursive: true });
+	fs.mkdirSync(RECOVERY_DIR, { recursive: true });
 }
 
 // Daily logs are keyed by the user's LOCAL calendar day. toISOString() is UTC,
@@ -523,7 +530,22 @@ export function serializeScratchpad(items: ScratchpadItem[]): string {
 // These operate on the raw lines so unknown content survives.
 
 const SCRATCHPAD_ITEM_REGEX = /^- \[([ xX])\] (.+)$/;
-const META_COMMENT_REGEX = /^<!--.*-->$/;
+const SCRATCHPAD_META_COMMENT_REGEX = /^<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[[^\]\r\n]+\] -->$/;
+const MEMORY_ENTRY_META_COMMENT_REGEX =
+	/^<!-- (?:(?:last updated: )?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|HANDOFF \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[[^\]\r\n]+\] -->$/;
+const RECOVERY_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type MemoryTarget = "long_term" | "daily";
+
+interface RecoveryRecord {
+	version: 1;
+	id: string;
+	createdAt: string;
+	target: MemoryTarget;
+	date?: string;
+	removedContent: string[];
+	restoredAt?: string;
+}
 
 export function scratchpadAdd(content: string, text: string, meta: string): string {
 	if (!content.trim()) {
@@ -560,7 +582,7 @@ export function scratchpadClearDone(content: string): { content: string; removed
 		if (m && m[1].toLowerCase() === "x") {
 			removed++;
 			// Drop the item's timestamp comment directly above it, if any.
-			if (out.length > 0 && META_COMMENT_REGEX.test(out[out.length - 1])) {
+			if (out.length > 0 && SCRATCHPAD_META_COMMENT_REGEX.test(out[out.length - 1])) {
 				out.pop();
 			}
 			continue;
@@ -575,31 +597,111 @@ export function scratchpadClearDone(content: string): { content: string; removed
 // ---------------------------------------------------------------------------
 
 /**
- * Remove every paragraph (blank-line-separated block) containing `match`
- * (case-insensitive) from `content`. Entry timestamp comments live inside the
- * same paragraph as their entry, so removing the paragraph removes the stamp.
- * Returns the surviving content and the removed blocks so callers can echo
- * them back — a wrong deletion stays recoverable from the conversation.
+ * Remove every generated entry containing `match` (case-insensitive) from
+ * `content`. Generated entries start at a pi-memory timestamp comment and end
+ * at the next one, so multi-paragraph writes are removed as a unit. Content
+ * before the first generated entry falls back to blank-line paragraph blocks.
+ * Returns the surviving content and complete removed entries.
  */
 export function forgetBlocks(content: string, match: string): { content: string; removed: string[] } {
 	const needle = match.trim().toLowerCase();
 	if (!needle) return { content, removed: [] };
-	const paragraphs = content.split(/\n{2,}/);
+	const newline = content.includes("\r\n") ? "\r\n" : "\n";
+	const normalizedContent = content.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
+
+	const blocks: string[] = [];
+	let currentLines: string[] = [];
+	let currentIsStamped = false;
+	const flushCurrent = () => {
+		const current = currentLines.join("\n").trim();
+		if (!current) return;
+		if (currentIsStamped) {
+			blocks.push(current);
+		} else {
+			blocks.push(
+				...current
+					.split(/\n{2,}/)
+					.map((block) => block.trim())
+					.filter(Boolean),
+			);
+		}
+	};
+
+	for (const line of normalizedContent.split("\n")) {
+		if (MEMORY_ENTRY_META_COMMENT_REGEX.test(line)) {
+			flushCurrent();
+			currentLines = [line];
+			currentIsStamped = true;
+		} else {
+			currentLines.push(line);
+		}
+	}
+	flushCurrent();
+
 	const kept: string[] = [];
 	const removed: string[] = [];
-	for (const p of paragraphs) {
-		if (p.trim() && p.toLowerCase().includes(needle)) {
-			removed.push(p.trim());
+	for (const block of blocks) {
+		if (block.toLowerCase().includes(needle)) {
+			removed.push(block);
 		} else {
-			kept.push(p);
+			kept.push(block);
 		}
 	}
 	if (removed.length === 0) return { content, removed };
-	const joined = kept
-		.join("\n\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-	return { content: joined ? `${joined}\n` : "", removed };
+	const joined = kept.join("\n\n").trim();
+	return {
+		content: joined ? `${joined}\n`.replace(/\n/g, newline) : "",
+		removed: removed.map((block) => block.replace(/\n/g, newline)),
+	};
+}
+
+function recoveryPath(recoveryId: string): string | null {
+	if (!RECOVERY_ID_REGEX.test(recoveryId)) return null;
+	return path.join(RECOVERY_DIR, `${recoveryId}.json`);
+}
+
+function isRecoveryRecord(value: unknown): value is RecoveryRecord {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Partial<RecoveryRecord>;
+	return (
+		record.version === 1 &&
+		typeof record.id === "string" &&
+		RECOVERY_ID_REGEX.test(record.id) &&
+		(record.target === "long_term" || record.target === "daily") &&
+		(record.target !== "daily" || (typeof record.date === "string" && isValidDailyDate(record.date))) &&
+		Array.isArray(record.removedContent) &&
+		record.removedContent.length > 0 &&
+		record.removedContent.every((entry) => typeof entry === "string")
+	);
+}
+
+function writeRecoveryRecord(target: MemoryTarget, date: string | undefined, removedContent: string[]): RecoveryRecord {
+	const record: RecoveryRecord = {
+		version: 1,
+		id: randomUUID(),
+		createdAt: new Date().toISOString(),
+		target,
+		...(date ? { date } : {}),
+		removedContent,
+	};
+	const filePath = recoveryPath(record.id);
+	if (!filePath) throw new Error("Failed to create a valid recovery ID.");
+	fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf-8", flag: "wx" });
+	return record;
+}
+
+function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; filePath: string } | null {
+	const filePath = recoveryPath(recoveryId);
+	if (!filePath) return null;
+	const content = readFileSafe(filePath);
+	if (!content) return null;
+	try {
+		const record: unknown = JSON.parse(content);
+		if (!isRecoveryRecord(record) || record.id !== recoveryId) return null;
+		return { record, filePath };
+	} catch {
+		return null;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1845,8 +1947,8 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delete outdated or incorrect facts from memory. Removes every entry/paragraph",
 			"containing the match string (case-insensitive substring) from MEMORY.md, or from",
-			"a daily log when target='daily'. The removed content is returned in the result so",
-			"it can be re-added if the deletion was wrong.",
+			"a daily log when target='daily'. Every deletion creates a durable recovery record",
+			"whose visible recovery ID can be passed to memory_restore if the deletion was wrong.",
 			"Use this when the user corrects a stored fact or a memory is no longer true —",
 			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
 		].join("\n"),
@@ -1865,7 +1967,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			ensureDirs();
-			const target = params.target ?? "long_term";
+			const target: MemoryTarget = params.target ?? "long_term";
 			if (!params.match.trim()) {
 				return {
 					content: [{ type: "text", text: "Error: 'match' must not be empty." }],
@@ -1874,6 +1976,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			let filePath: string;
+			let recoveryDate: string | undefined;
 			if (target === "daily") {
 				const d = params.date ?? todayStr();
 				if (!isValidDailyDate(d)) {
@@ -1884,6 +1987,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				filePath = dailyPath(d);
+				recoveryDate = d;
 			} else {
 				filePath = MEMORY_FILE;
 			}
@@ -1904,6 +2008,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Persist the complete recovery payload before mutating the source file.
+			// If either write fails, we never report a successful unrecoverable deletion.
+			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
 			// Deleted facts must leave the injected snapshot too, whichever file
 			// they lived in — a forgotten-but-still-injected memory defeats the
@@ -1923,11 +2030,82 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text:
 							`Removed ${result.removed.length} entr${result.removed.length === 1 ? "y" : "ies"} from ${filePath}. ` +
-							"Removed content (re-add with memory_write if this was wrong):\n\n" +
+							`Recovery ID: ${recovery.id}. To undo this deletion, call memory_restore with that ID.\n\n` +
+							"Removed content preview:\n\n" +
 							removedPreview.preview,
 					},
 				],
-				details: { path: filePath, target, removed: result.removed.length, removedPreview },
+				details: {
+					path: filePath,
+					target,
+					removed: result.removed.length,
+					recoveryId: recovery.id,
+					recoveryPath: recoveryPath(recovery.id),
+					removedPreview,
+				},
+			};
+		},
+	});
+
+	// --- memory_restore tool ---
+	pi.registerTool({
+		name: "memory_restore",
+		label: "Memory Restore",
+		description: [
+			"Restore entries removed by memory_forget using the recovery ID returned by that tool.",
+			"Restoration is idempotent and appends only missing entries, so later memory writes survive.",
+		].join("\n"),
+		parameters: Type.Object({
+			recoveryId: Type.String({ description: "Recovery ID returned by memory_forget" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			ensureDirs();
+			const loaded = readRecoveryRecord(params.recoveryId);
+			if (!loaded) {
+				return {
+					content: [{ type: "text", text: `No valid recovery record found for ID ${params.recoveryId}.` }],
+					isError: true,
+					details: { recoveryId: params.recoveryId },
+				};
+			}
+
+			const { record, filePath: recordPath } = loaded;
+			if (record.restoredAt) {
+				return {
+					content: [{ type: "text", text: `Recovery ${record.id} was already restored at ${record.restoredAt}.` }],
+					details: { recoveryId: record.id, restoredAt: record.restoredAt },
+				};
+			}
+
+			const targetPath = record.target === "daily" ? dailyPath(record.date as string) : MEMORY_FILE;
+			const existing = readFileSafe(targetPath) ?? "";
+			const missingEntries = record.removedContent.filter((entry) => !existing.includes(entry));
+			if (missingEntries.length > 0) {
+				const separator = existing.trim() ? "\n\n" : "";
+				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
+				snapshotDirty = true;
+				await ensureQmdAvailableForUpdate();
+				scheduleQmdUpdate();
+			}
+
+			record.restoredAt = new Date().toISOString();
+			fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf-8");
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							missingEntries.length > 0
+								? `Restored ${missingEntries.length} entr${missingEntries.length === 1 ? "y" : "ies"} to ${targetPath}.`
+								: `Recovery ${record.id} was already present in ${targetPath}; marked as restored.`,
+					},
+				],
+				details: {
+					recoveryId: record.id,
+					target: record.target,
+					path: targetPath,
+					restored: missingEntries.length,
+				},
 			};
 		},
 	});
