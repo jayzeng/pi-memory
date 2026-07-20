@@ -8,6 +8,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `memory_forget` now recognizes generated entry boundaries in CRLF-formatted
+  memory files and files with a UTF-8 BOM instead of treating them as
+  unstructured deletion blocks.
 - **Peer dependency floors raised**: `@mariozechner/pi-ai` and
   `@mariozechner/pi-coding-agent` now require `>=0.52.0` (previously
   `>=0.0.1`). If you run an older pi, stay on 0.3.12. This makes the next
@@ -28,6 +31,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Recoverable deletion: `memory_forget` writes the complete removed entries to
+  `recovery/<id>.json` before changing memory and returns the ID visibly. The
+  new `memory_restore` tool restores that record without overwriting later
+  memory writes.
 - **Automatic embeddings — no more manual `qmd embed`.** An incremental
   `qmd embed` now runs in the background after each debounced `qmd update`, as
   a catch-up at session start, and when `memory_search`/`memory_status` detect

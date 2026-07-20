@@ -10,7 +10,7 @@
  *   - Optionally: `qmd` on PATH for search tests
  *
  * What it tests:
- *   1. Extension loads and registers 4 tools
+ *   1. Extension loads and registers 7 tools
  *   2. Memory write tool → files appear on disk
  *   3. Memory context injection → LLM can answer from injected memory
  *   4. Full round-trip: write in session 1, recall in session 2
@@ -287,7 +287,15 @@ function runQmdUpdate(): boolean {
 
 function testExtensionLoads() {
 	const tools = registeredToolNames();
-	const expected = ["memory_read", "memory_search", "memory_write", "scratchpad"];
+	const expected = [
+		"memory_forget",
+		"memory_read",
+		"memory_restore",
+		"memory_search",
+		"memory_status",
+		"memory_write",
+		"scratchpad",
+	];
 
 	assert(
 		tools.length === expected.length,
