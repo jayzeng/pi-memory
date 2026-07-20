@@ -25,9 +25,11 @@ import {
 	_setQmdAvailable,
 	buildMemoryContext,
 	buildQmdSpawn,
+	clampSearchLimit,
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
+	forgetBlocks,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -37,6 +39,9 @@ import {
 	resolveQmdJsPath,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
+	scratchpadAdd,
+	scratchpadClearDone,
+	scratchpadToggle,
 	serializeScratchpad,
 	shortSessionId,
 	todayStr,
@@ -1249,7 +1254,10 @@ describe("lifecycle hooks", () => {
 		await hooks.session_shutdown({}, {});
 	});
 
-	test("session_shutdown writes fallback summary when getApiKey is unavailable", async () => {
+	test("session_shutdown writes nothing when summary generation is unavailable", async () => {
+		// Previously a boilerplate "Auto-summary unavailable / None." block was
+		// appended on every failed summarization, polluting the daily log that
+		// gets re-injected into context each session start.
 		const ctx = createShutdownCtx({
 			branch: [
 				{
@@ -1264,7 +1272,23 @@ describe("lifecycle hooks", () => {
 					type: "message",
 					message: {
 						role: "assistant",
-						content: [{ type: "text", text: "Noted." }],
+						content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Also migrate the config to match." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Done — config migrated and tests pass." }],
 						timestamp: Date.now(),
 					},
 				},
@@ -1275,10 +1299,7 @@ describe("lifecycle hooks", () => {
 
 		await hooks.session_shutdown({}, ctx);
 
-		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
-		expect(content).toContain("## Session Summary (auto, exit: session-end)");
-		expect(content).toContain("Auto-summary unavailable");
-		expect(content).toContain("API key resolution unavailable");
+		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 	});
 
 	test("session_shutdown with reason=reload skips exit summary entirely", async () => {
@@ -1304,15 +1325,17 @@ describe("lifecycle hooks", () => {
 		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 	});
 
-	test("session_shutdown with reason=quit still writes exit summary", async () => {
-		// Ensure the reload-skip guard does not suppress real quit summaries.
+	test("session_shutdown skips trivial sessions without attempting a summary", async () => {
+		// Curated-write gate: a 2-message session (one-liner Q&A) has nothing
+		// worth summarizing — no LLM call, no daily-log write.
+		const getApiKey = mock(async () => "key");
 		const ctx = createShutdownCtx({
 			branch: [
 				{
 					type: "message",
 					message: {
 						role: "user",
-						content: [{ type: "text", text: "Remember: dark mode preferred" }],
+						content: [{ type: "text", text: "ls" }],
 						timestamp: Date.now(),
 					},
 				},
@@ -1320,20 +1343,69 @@ describe("lifecycle hooks", () => {
 					type: "message",
 					message: {
 						role: "assistant",
-						content: [{ type: "text", text: "Noted." }],
+						content: [{ type: "text", text: "file.txt" }],
 						timestamp: Date.now(),
 					},
 				},
 			],
 			model: { provider: "openai", id: "gpt-4o-mini" },
-			modelRegistry: {},
+			modelRegistry: { getApiKey },
+		});
+
+		await hooks.session_shutdown({}, ctx);
+
+		expect(getApiKey).not.toHaveBeenCalled();
+		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+	});
+
+	test("session_shutdown with reason=quit still attempts the exit summary", async () => {
+		// Ensure the reload-skip guard does not suppress real quit summaries.
+		// Summarization cannot succeed here (no API key), so the attempt is
+		// observed via the API-key lookup — and no boilerplate is written.
+		const getApiKey = mock(async () => undefined);
+		const ctx = createShutdownCtx({
+			branch: [
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Please remember we chose dark mode." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "Also migrate the config to match." }],
+						timestamp: Date.now(),
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+						timestamp: Date.now(),
+					},
+				},
+			],
+			model: { provider: "openai", id: "gpt-4o-mini" },
+			modelRegistry: { getApiKey },
 		});
 
 		await hooks.session_shutdown({ reason: "quit" }, ctx);
 
-		// Fallback summary (no real API key) should still be written.
-		const content = fs.readFileSync(dailyPath(todayStr()), "utf-8");
-		expect(content).toContain("## Session Summary");
+		expect(getApiKey).toHaveBeenCalled();
+		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 	});
 
 	// -- session_before_compact --
@@ -1551,11 +1623,12 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 5 tools", () => {
+	test("registers all 6 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(5);
+		expect(Object.keys(mockPi.tools)).toHaveLength(6);
 		expect(mockPi.tools.memory_write).toBeDefined();
+		expect(mockPi.tools.memory_forget).toBeDefined();
 		expect(mockPi.tools.memory_read).toBeDefined();
 		expect(mockPi.tools.scratchpad).toBeDefined();
 		expect(mockPi.tools.memory_search).toBeDefined();
@@ -1578,5 +1651,241 @@ describe("extension registration", () => {
 			expect(mockPi.tools[name].label).toBeTruthy();
 			expect(mockPi.tools[name].description).toBeTruthy();
 		}
+	});
+});
+
+// ==========================================================================
+// Local calendar dates (regression: daily logs were keyed to UTC)
+// ==========================================================================
+
+describe("local calendar dates", () => {
+	const pad = (n: number) => String(n).padStart(2, "0");
+
+	test("todayStr returns the LOCAL calendar date, not UTC", () => {
+		const now = new Date();
+		const local = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+		expect(todayStr()).toBe(local);
+	});
+
+	test("yesterdayStr returns the LOCAL calendar date minus one day", () => {
+		const d = new Date();
+		d.setDate(d.getDate() - 1);
+		const local = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+		expect(yesterdayStr()).toBe(local);
+	});
+
+	test("nowTimestamp uses local date and local hour", () => {
+		const now = new Date();
+		const ts = nowTimestamp();
+		expect(ts.slice(0, 10)).toBe(todayStr());
+		// Tolerate the clock ticking across an hour boundary mid-test.
+		const hour = Number(ts.slice(11, 13));
+		expect([now.getHours(), new Date().getHours()]).toContain(hour);
+	});
+});
+
+// ==========================================================================
+// Line-preserving scratchpad mutations (regression: round-trip deleted
+// any non-checklist content from SCRATCHPAD.md)
+// ==========================================================================
+
+describe("line-preserving scratchpad mutations", () => {
+	const file = [
+		"# Scratchpad",
+		"",
+		"Hand-written note that must survive.",
+		"",
+		"## Ideas",
+		"<!-- 2026-07-08 10:00:00 [abc12345] -->",
+		"- [ ] fix the flaky test",
+		"  extra detail under the item",
+		"<!-- 2026-07-08 10:05:00 [abc12345] -->",
+		"- [x] ship the release",
+		"",
+	].join("\n");
+
+	test("scratchpadAdd appends and preserves all existing content", () => {
+		const out = scratchpadAdd(file, "water the plants", "<!-- meta -->");
+		expect(out).toContain("Hand-written note that must survive.");
+		expect(out).toContain("## Ideas");
+		expect(out).toContain("  extra detail under the item");
+		expect(out.endsWith("<!-- meta -->\n- [ ] water the plants\n")).toBe(true);
+	});
+
+	test("scratchpadAdd creates the standard skeleton for empty content", () => {
+		const out = scratchpadAdd("", "first item", "<!-- meta -->");
+		expect(out.startsWith("# Scratchpad")).toBe(true);
+		expect(out).toContain("- [ ] first item");
+	});
+
+	test("scratchpadToggle flips only the matched item", () => {
+		const { content, matched } = scratchpadToggle(file, "flaky", true);
+		expect(matched).toBe(true);
+		expect(content).toContain("- [x] fix the flaky test");
+		expect(content).toContain("- [x] ship the release");
+		expect(content).toContain("Hand-written note that must survive.");
+	});
+
+	test("scratchpadToggle can uncheck a done item", () => {
+		const { content, matched } = scratchpadToggle(file, "ship", false);
+		expect(matched).toBe(true);
+		expect(content).toContain("- [ ] ship the release");
+	});
+
+	test("scratchpadToggle reports no match honestly", () => {
+		expect(scratchpadToggle(file, "nonexistent", true).matched).toBe(false);
+	});
+
+	test("scratchpadClearDone removes done items and their meta, keeps the rest", () => {
+		const { content, removed } = scratchpadClearDone(file);
+		expect(removed).toBe(1);
+		expect(content).not.toContain("ship the release");
+		expect(content).not.toContain("10:05:00");
+		expect(content).toContain("- [ ] fix the flaky test");
+		expect(content).toContain("Hand-written note that must survive.");
+		expect(content).toContain("## Ideas");
+	});
+});
+
+// ==========================================================================
+// clampSearchLimit (regression: NaN/0/negative/huge limits reached qmd -n)
+// ==========================================================================
+
+describe("clampSearchLimit", () => {
+	test("defaults when undefined or NaN", () => {
+		expect(clampSearchLimit(undefined)).toBe(5);
+		expect(clampSearchLimit(Number.NaN)).toBe(5);
+	});
+
+	test("clamps to the valid range and floors fractions", () => {
+		expect(clampSearchLimit(0)).toBe(1);
+		expect(clampSearchLimit(-3)).toBe(1);
+		expect(clampSearchLimit(3.7)).toBe(3);
+		expect(clampSearchLimit(9999)).toBe(25);
+	});
+});
+
+// ==========================================================================
+// forgetBlocks + memory_forget (deletion as a first-class operation)
+// ==========================================================================
+
+describe("forgetBlocks", () => {
+	const file = [
+		"<!-- 2026-07-01 10:00:00 [abc] -->",
+		"Balance is $12.69 #finance",
+		"",
+		"<!-- 2026-07-03 09:00:00 [def] -->",
+		"Prefers dark mode #preference",
+		"",
+		"Hand-written note about deployment.",
+	].join("\n");
+
+	test("removes the matching entry with its timestamp stamp", () => {
+		const { content, removed } = forgetBlocks(file, "$12.69");
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain("Balance is $12.69");
+		expect(removed[0]).toContain("2026-07-01");
+		expect(content).not.toContain("$12.69");
+		expect(content).toContain("Prefers dark mode");
+		expect(content).toContain("Hand-written note about deployment.");
+	});
+
+	test("match is case-insensitive", () => {
+		const { removed } = forgetBlocks(file, "DARK MODE");
+		expect(removed).toHaveLength(1);
+	});
+
+	test("removes multiple matching blocks", () => {
+		const { content, removed } = forgetBlocks(file, "20");
+		expect(removed).toHaveLength(2); // both stamped entries contain 2026 dates
+		expect(content).toContain("Hand-written note");
+	});
+
+	test("no match leaves content untouched", () => {
+		const { content, removed } = forgetBlocks(file, "nonexistent");
+		expect(removed).toHaveLength(0);
+		expect(content).toBe(file);
+	});
+
+	test("empty match removes nothing", () => {
+		expect(forgetBlocks(file, "  ").removed).toHaveLength(0);
+	});
+
+	test("removing the only entry empties the file", () => {
+		const { content, removed } = forgetBlocks("only fact here\n", "only fact");
+		expect(removed).toHaveLength(1);
+		expect(content).toBe("");
+	});
+});
+
+describe("memory_forget tool", () => {
+	let tools: Record<string, any>;
+
+	beforeEach(() => {
+		setupTmpDir();
+		const mockPi = createMockPi();
+		tools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	afterEach(cleanupTmpDir);
+
+	test("registers with correct name", () => {
+		expect(tools.memory_forget).toBeDefined();
+	});
+
+	test("removes matching entry from MEMORY.md and echoes it back", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "MEMORY.md"),
+			"<!-- ts [s] -->\nBalance is $12.69\n\nPrefers tabs over spaces\n",
+			"utf-8",
+		);
+		const result = await tools.memory_forget.execute("c1", { match: "$12.69" }, null, null, {});
+		expect(result.content[0].text).toContain("Removed 1 entry");
+		expect(result.content[0].text).toContain("$12.69"); // recoverable echo
+		const remaining = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
+		expect(remaining).not.toContain("$12.69");
+		expect(remaining).toContain("Prefers tabs");
+	});
+
+	test("reports no match without touching the file", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "a fact\n", "utf-8");
+		const result = await tools.memory_forget.execute("c1", { match: "zzz" }, null, null, {});
+		expect(result.content[0].text).toContain("No entries matching");
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toBe("a fact\n");
+	});
+
+	test("targets a specific daily log by date", async () => {
+		fs.mkdirSync(path.join(tmpDir, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "old wrong fact\n\nkeep me\n", "utf-8");
+		const result = await tools.memory_forget.execute(
+			"c1",
+			{ match: "wrong fact", target: "daily", date: "2026-07-01" },
+			null,
+			null,
+			{},
+		);
+		expect(result.content[0].text).toContain("Removed 1 entry");
+		const remaining = fs.readFileSync(path.join(tmpDir, "daily", "2026-07-01.md"), "utf-8");
+		expect(remaining).toContain("keep me");
+		expect(remaining).not.toContain("wrong fact");
+	});
+
+	test("rejects empty match and bad dates", async () => {
+		const r1 = await tools.memory_forget.execute("c1", { match: "  " }, null, null, {});
+		expect(r1.isError).toBe(true);
+		const r2 = await tools.memory_forget.execute(
+			"c1",
+			{ match: "x", target: "daily", date: "not-a-date" },
+			null,
+			null,
+			{},
+		);
+		expect(r2.isError).toBe(true);
+	});
+
+	test("handles empty memory gracefully", async () => {
+		const result = await tools.memory_forget.execute("c1", { match: "x" }, null, null, {});
+		expect(result.content[0].text).toContain("nothing to forget");
 	});
 });
