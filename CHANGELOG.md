@@ -6,15 +6,41 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-19
+
 ### Changed
 
+- Daily logs and timestamps now use the user's local calendar date instead of
+  UTC, preventing evening writes from landing in the following day's file.
+- Scratchpad mutations preserve hand-written notes, headings, comments, and
+  sub-bullets instead of rebuilding the file from checklist items alone.
+- Exit summaries are skipped for trivial sessions and are only written when a
+  real summary is generated, keeping boilerplate and low-value entries out of
+  the daily log.
+- `memory_search` clamps result limits to the supported range and reliably
+  clears its search timeout.
 - `memory_forget` now recognizes generated entry boundaries in CRLF-formatted
   memory files and files with a UTF-8 BOM instead of treating them as
   unstructured deletion blocks.
+
+### Added
+
+- Recoverable deletion: `memory_forget` writes the complete removed entries to
+  `recovery/<id>.json` before changing memory and returns the ID visibly. The
+  new `memory_restore` tool restores that record without overwriting later
+  memory writes.
+
+## [0.3.14] — 2026-06-10
+
+- Packaging-only version bump; no runtime changes from 0.3.13.
+
+## [0.3.13] — 2026-06-10
+
+### Changed
+
 - **Peer dependency floors raised**: `@mariozechner/pi-ai` and
   `@mariozechner/pi-coding-agent` now require `>=0.52.0` (previously
-  `>=0.0.1`). If you run an older pi, stay on 0.3.12. This makes the next
-  release a **minor** version bump.
+  `>=0.0.1`). If you run an older pi, stay on 0.3.12.
 - **`postinstall` no longer touches your git config.** It previously ran
   `git config core.hooksPath .githooks` unconditionally, which — when pi-memory
   was installed as a dependency — repointed the *consumer's* repo at a hooks
@@ -31,10 +57,6 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Recoverable deletion: `memory_forget` writes the complete removed entries to
-  `recovery/<id>.json` before changing memory and returns the ID visibly. The
-  new `memory_restore` tool restores that record without overwriting later
-  memory writes.
 - **Automatic embeddings — no more manual `qmd embed`.** An incremental
   `qmd embed` now runs in the background after each debounced `qmd update`, as
   a catch-up at session start, and when `memory_search`/`memory_status` detect
@@ -125,7 +147,10 @@ follows [Semantic Versioning](https://semver.org/).
 - qmd integration for keyword, semantic, and hybrid search.
 - Debounced background `qmd update` after writes.
 
-[Unreleased]: https://github.com/jayzeng/pi-memory/compare/v0.3.12...HEAD
+[Unreleased]: https://github.com/jayzeng/pi-memory/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jayzeng/pi-memory/compare/v0.3.14...v0.4.0
+[0.3.14]: https://github.com/jayzeng/pi-memory/compare/v0.3.13...v0.3.14
+[0.3.13]: https://github.com/jayzeng/pi-memory/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/jayzeng/pi-memory/compare/v0.3.10...v0.3.12
 [0.3.10]: https://github.com/jayzeng/pi-memory/compare/v0.3.8...v0.3.10
 [0.3.8]: https://github.com/jayzeng/pi-memory/compare/v0.3.6...v0.3.8
