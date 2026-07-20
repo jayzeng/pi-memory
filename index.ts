@@ -523,7 +523,9 @@ export function serializeScratchpad(items: ScratchpadItem[]): string {
 // These operate on the raw lines so unknown content survives.
 
 const SCRATCHPAD_ITEM_REGEX = /^- \[([ xX])\] (.+)$/;
-const META_COMMENT_REGEX = /^<!--.*-->$/;
+const SCRATCHPAD_META_COMMENT_REGEX = /^<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[[^\]\r\n]+\] -->$/;
+const MEMORY_ENTRY_META_COMMENT_REGEX =
+	/^<!-- (?:(?:last updated: )?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|HANDOFF \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[[^\]\r\n]+\] -->$/;
 
 export function scratchpadAdd(content: string, text: string, meta: string): string {
 	if (!content.trim()) {
@@ -560,7 +562,7 @@ export function scratchpadClearDone(content: string): { content: string; removed
 		if (m && m[1].toLowerCase() === "x") {
 			removed++;
 			// Drop the item's timestamp comment directly above it, if any.
-			if (out.length > 0 && META_COMMENT_REGEX.test(out[out.length - 1])) {
+			if (out.length > 0 && SCRATCHPAD_META_COMMENT_REGEX.test(out[out.length - 1])) {
 				out.pop();
 			}
 			continue;
@@ -575,30 +577,56 @@ export function scratchpadClearDone(content: string): { content: string; removed
 // ---------------------------------------------------------------------------
 
 /**
- * Remove every paragraph (blank-line-separated block) containing `match`
- * (case-insensitive) from `content`. Entry timestamp comments live inside the
- * same paragraph as their entry, so removing the paragraph removes the stamp.
- * Returns the surviving content and the removed blocks so callers can echo
- * them back — a wrong deletion stays recoverable from the conversation.
+ * Remove every generated entry containing `match` (case-insensitive) from
+ * `content`. Generated entries start at a pi-memory timestamp comment and end
+ * at the next one, so multi-paragraph writes are removed as a unit. Content
+ * before the first generated entry falls back to blank-line paragraph blocks.
+ * Returns the surviving content and complete removed entries.
  */
 export function forgetBlocks(content: string, match: string): { content: string; removed: string[] } {
 	const needle = match.trim().toLowerCase();
 	if (!needle) return { content, removed: [] };
-	const paragraphs = content.split(/\n{2,}/);
+
+	const blocks: string[] = [];
+	let currentLines: string[] = [];
+	let currentIsStamped = false;
+	const flushCurrent = () => {
+		const current = currentLines.join("\n").trim();
+		if (!current) return;
+		if (currentIsStamped) {
+			blocks.push(current);
+		} else {
+			blocks.push(
+				...current
+					.split(/\n{2,}/)
+					.map((block) => block.trim())
+					.filter(Boolean),
+			);
+		}
+	};
+
+	for (const line of content.split("\n")) {
+		if (MEMORY_ENTRY_META_COMMENT_REGEX.test(line)) {
+			flushCurrent();
+			currentLines = [line];
+			currentIsStamped = true;
+		} else {
+			currentLines.push(line);
+		}
+	}
+	flushCurrent();
+
 	const kept: string[] = [];
 	const removed: string[] = [];
-	for (const p of paragraphs) {
-		if (p.trim() && p.toLowerCase().includes(needle)) {
-			removed.push(p.trim());
+	for (const block of blocks) {
+		if (block.toLowerCase().includes(needle)) {
+			removed.push(block);
 		} else {
-			kept.push(p);
+			kept.push(block);
 		}
 	}
 	if (removed.length === 0) return { content, removed };
-	const joined = kept
-		.join("\n\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
+	const joined = kept.join("\n\n").trim();
 	return { content: joined ? `${joined}\n` : "", removed };
 }
 
@@ -1846,7 +1874,7 @@ export default function (pi: ExtensionAPI) {
 			"Delete outdated or incorrect facts from memory. Removes every entry/paragraph",
 			"containing the match string (case-insensitive substring) from MEMORY.md, or from",
 			"a daily log when target='daily'. The removed content is returned in the result so",
-			"it can be re-added if the deletion was wrong.",
+			"it can be re-added if the deletion was wrong; complete content is in result details.",
 			"Use this when the user corrects a stored fact or a memory is no longer true —",
 			"stale entries keep resurfacing in retrieval and cause confidently wrong answers.",
 		].join("\n"),
@@ -1923,11 +1951,17 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text:
 							`Removed ${result.removed.length} entr${result.removed.length === 1 ? "y" : "ies"} from ${filePath}. ` +
-							"Removed content (re-add with memory_write if this was wrong):\n\n" +
+							"Removed content preview (complete content is in result details; re-add with memory_write if this was wrong):\n\n" +
 							removedPreview.preview,
 					},
 				],
-				details: { path: filePath, target, removed: result.removed.length, removedPreview },
+				details: {
+					path: filePath,
+					target,
+					removed: result.removed.length,
+					removedContent: result.removed,
+					removedPreview,
+				},
 			};
 		},
 	});
