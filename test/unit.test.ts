@@ -117,6 +117,27 @@ function createShutdownCtx(options?: {
 	};
 }
 
+describe("runtime package scope", () => {
+	test("uses the official @earendil-works Pi packages", () => {
+		const source = fs.readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
+		const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
+
+		expect(source).toContain('from "@earendil-works/pi-ai"');
+		expect(source).toContain('from "@earendil-works/pi-coding-agent"');
+		expect(source).not.toContain("@mariozechner/pi-ai");
+		expect(source).not.toContain("@mariozechner/pi-coding-agent");
+
+		expect(packageJson.devDependencies["@earendil-works/pi-ai"]).toBe("0.81.1");
+		expect(packageJson.devDependencies["@earendil-works/pi-coding-agent"]).toBe("0.81.1");
+		expect(packageJson.peerDependencies["@earendil-works/pi-ai"]).toBe(">=0.81.1");
+		expect(packageJson.peerDependencies["@earendil-works/pi-coding-agent"]).toBe(">=0.81.1");
+		expect(packageJson.peerDependencies["@mariozechner/pi-ai"]).toBeUndefined();
+		expect(packageJson.peerDependencies["@mariozechner/pi-coding-agent"]).toBeUndefined();
+		expect(packageJson.peerDependencies["@sinclair/typebox"]).toBeUndefined();
+		expect(packageJson.engines.node).toBe(">=22.19.0");
+	});
+});
+
 // We need to import the default export to register tools
 import registerExtension from "../index.js";
 
