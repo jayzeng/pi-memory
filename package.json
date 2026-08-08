@@ -49,16 +49,17 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.0",
+		"@earendil-works/pi-ai": "0.81.1",
+		"@earendil-works/pi-coding-agent": "0.81.1",
 		"tsx": "^4.0.0",
 		"typescript": "^5.9.3"
 	},
 	"engines": {
-		"node": ">=20"
+		"node": ">=22.19.0"
 	},
 	"peerDependencies": {
-		"@mariozechner/pi-ai": ">=0.52.0",
-		"@mariozechner/pi-coding-agent": ">=0.52.0",
-		"@sinclair/typebox": ">=0.34.0"
+		"@earendil-works/pi-ai": ">=0.81.1",
+		"@earendil-works/pi-coding-agent": ">=0.81.1"
 	},
 	"overrides": {
 		"rimraf": "^6.1.3",
