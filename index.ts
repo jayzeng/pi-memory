@@ -858,6 +858,12 @@ export function buildQmdSpawn(
 	return { file: "node", args: [qmdJsPath, ...args] };
 }
 
+export function buildQmdEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const qmdEnv: NodeJS.ProcessEnv = { ...env, NO_COLOR: "1" };
+	delete qmdEnv.FORCE_COLOR;
+	return qmdEnv;
+}
+
 const execFileWithQmdOptions: ExecFileFn = ((
 	file: string,
 	args: readonly string[],
@@ -866,7 +872,8 @@ const execFileWithQmdOptions: ExecFileFn = ((
 ) => {
 	const qmdJs = process.platform === "win32" && isQmdCommand(file) ? resolveQmdJsPath() : null;
 	const spawn = buildQmdSpawn(file, args ?? [], process.platform, qmdJs);
-	return execFile(spawn.file, spawn.args, options, callback as any);
+	const execOptions = isQmdCommand(file) ? { ...options, env: buildQmdEnv(options.env ?? process.env) } : options;
+	return execFile(spawn.file, spawn.args, execOptions, callback as any);
 }) as ExecFileFn;
 
 let execFileFn: ExecFileFn = execFileWithQmdOptions;
@@ -1181,8 +1188,9 @@ function getQmdResultText(r: QmdSearchResult): string {
 function stripAnsi(text: string): string {
 	// qmd may emit spinners/progress bars even with --json, especially on first model download.
 	// Strip ANSI CSI/OSC sequences so we can reliably find and parse JSON payloads.
+	// CSI parameter bytes include private-mode sequences such as ESC[?25l / ESC[?25h.
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escape sequences
-	return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, "");
+	return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, "");
 }
 
 function parseQmdJson(stdout: string): unknown {
@@ -1216,7 +1224,13 @@ export function runQmdSearch(
 	return new Promise((resolve, reject) => {
 		execFileFn("qmd", args, { timeout: 60_000 }, (err, stdout, stderr) => {
 			if (err) {
-				reject(new Error(stderr?.trim() || err.message));
+				const cleaned = stripAnsi(stderr ?? "").trim();
+				const cleanedMessage = stripAnsi(err.message).trim();
+				const timedOut = (err as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
+				const hint = timedOut
+					? " (qmd timed out after 60s — first semantic/deep search may download or load models; retry shortly)"
+					: "";
+				reject(new Error(`${cleaned || cleanedMessage}${hint}`));
 				return;
 			}
 			try {

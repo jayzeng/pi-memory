@@ -24,6 +24,7 @@ import {
 	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
+	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
 	dailyPath,
@@ -37,6 +38,7 @@ import {
 	readFileSafe,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
 	scratchpadAdd,
@@ -1120,6 +1122,61 @@ describe("memory_read tool", () => {
 // ==========================================================================
 // 8. Tool: memory_search
 // ==========================================================================
+
+describe("runQmdSearch qmd diagnostics", () => {
+	afterEach(() => {
+		_resetExecFileForTest();
+	});
+
+	test("strips qmd spinner control sequences from stderr failures", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(
+				new Error("Command failed: qmd vsearch"),
+				"",
+				"\u001b[?25l\u001b[?25h\u001b[2K\u001b[1A\u001b[Greal diagnostic",
+			);
+		}) as any);
+
+		await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("real diagnostic");
+		await expect(runQmdSearch("semantic", "query", 5)).rejects.not.toThrow("[?25");
+	});
+
+	test("strips qmd spinner control sequences from the fallback error message", async () => {
+		const spinner = "\u001b[?25l\u001b[?25h";
+		const commandError = new Error(`Command failed: qmd vsearch\n${spinner}`);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(commandError, "", spinner);
+		}) as any);
+
+		let failure: unknown;
+		try {
+			await runQmdSearch("semantic", "query", 5);
+		} catch (err) {
+			failure = err;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("Command failed: qmd vsearch");
+		expect((failure as Error).message).not.toContain("\u001b");
+	});
+
+	test("annotates qmd timeouts with a retryable cold-start hint", async () => {
+		const timeoutErr = Object.assign(new Error("Command failed: qmd vsearch"), { killed: true });
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(timeoutErr, "", "\u001b[?25l\u001b[?25h");
+		}) as any);
+
+		await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("qmd timed out after 60s");
+	});
+
+	test("removes FORCE_COLOR and sets NO_COLOR for qmd child processes", () => {
+		const env = buildQmdEnv({ FORCE_COLOR: "3", NO_COLOR: undefined, PATH: "bin" });
+
+		expect(env.FORCE_COLOR).toBeUndefined();
+		expect(env.NO_COLOR).toBe("1");
+		expect(env.PATH).toBe("bin");
+	});
+});
 
 describe("memory_search tool", () => {
 	let tools: Record<string, any>;
