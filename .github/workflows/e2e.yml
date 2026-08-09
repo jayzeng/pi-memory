@@ -1,0 +1,31 @@
+name: E2E
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PI_E2E_PROVIDER: openai
+      PI_E2E_MODEL: gpt-4o-mini
+    steps:
+      - name: Require API key
+        shell: bash
+        run: test -n "$OPENAI_API_KEY"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run e2e tests
+        run: npm run test:e2e

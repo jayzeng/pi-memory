@@ -2,53 +2,43 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  lint:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  verify-ubuntu:
+    name: verify (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
       - run: npm ci
       - run: npm run lint
-
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
       - run: npm run build
+      - name: Run unit tests
+        run: npm test
 
-  unit:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  unit-windows:
+    name: unit (windows-latest)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - uses: oven-sh/setup-bun@v2
         with:
@@ -56,114 +46,3 @@ jobs:
       - run: npm ci
       - name: Run unit tests
         run: npm test
-
-  windows-qmd-smoke:
-    name: windows-qmd-smoke (PR #11 verification)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-
-      - name: Install qmd via npm
-        shell: pwsh
-        run: npm install -g @tobilu/qmd
-
-      - name: Ensure qmd prerequisites are on PATH
-        shell: pwsh
-        run: |
-          $npmPrefix = npm prefix -g
-          Write-Host "Adding to PATH: $npmPrefix"
-          Add-Content -Path $env:GITHUB_PATH -Value $npmPrefix
-          $gitUsrBin = Join-Path $env:ProgramFiles "Git\usr\bin"
-          if (Test-Path $gitUsrBin) {
-            Write-Host "Adding to PATH: $gitUsrBin"
-            Add-Content -Path $env:GITHUB_PATH -Value $gitUsrBin
-          }
-
-      - name: Confirm qmd is callable (via the same direct-node path the wrapper uses)
-        shell: pwsh
-        run: |
-          $prefix = (npm prefix -g).Trim()
-          Write-Host "--- npm prefix shims ($prefix) ---"
-          Get-ChildItem -Path $prefix -Filter "qmd*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Name, Length
-          Write-Host "--- Get-Command qmd -All ---"
-          Get-Command qmd -All | Format-Table -AutoSize
-          # cmd-shim writes literal `/bin/sh` into both qmd.cmd and qmd.ps1 on
-          # Windows, so neither shim is callable directly. The extension bypasses
-          # this by invoking qmd's JS entry with node. Verify that path exists
-          # and works.
-          $qmdJs = Join-Path $prefix "node_modules\@tobilu\qmd\dist\cli\qmd.js"
-          Write-Host "--- expected qmd.js: $qmdJs ---"
-          if (-not (Test-Path $qmdJs)) {
-            Write-Error "qmd.js not found at $qmdJs"
-            exit 1
-          }
-          node $qmdJs --version
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "node $qmdJs --version failed (exit $LASTEXITCODE)"
-            exit 1
-          }
-
-      # Captures stock Node execFile behavior for the runner's qmd shim. This
-      # is informational because shim behavior varies by package manager.
-      - name: Smoke (informational) — stock Node execFile -> qmd
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          node -e "const { execFile } = require('node:child_process'); execFile('qmd', ['--version'], (err, stdout, stderr) => { if (err) { console.error('STOCK execFile FAILED (expected on Windows):', err.code, err.message); process.exit(1); } console.log('STOCK execFile OK:', stdout.trim()); });"
-
-      # Exercises the extension's qmd execFile wrapper under Node. The
-      # setupQmdCollection() calls qmd via the wrapped execFile, so a
-      # successful run here verifies Windows shell invocation.
-      - name: Smoke — extension wrapper -> qmd (must succeed)
-        shell: pwsh
-        run: |
-          node --import tsx -e "import('./index.ts').then(async (m) => { m.ensureDirs(); const ok = await m.setupQmdCollection(); if (!ok) { console.error('setupQmdCollection returned false — wrapper did not fix qmd invocation'); process.exit(1); } console.log('OK: extension wrapper successfully invoked qmd through the Windows shell'); }).catch((e) => { console.error('FAILED:', e); process.exit(1); });"
-
-      # Verifies resolveMemoryDir() falls back to USERPROFILE when HOME
-      # is unset (the second bug PR #11 fixes). We import the module in a
-      # subprocess with HOME deliberately removed, then have it create the
-      # default memory directory and print its location.
-      - name: Smoke — resolveMemoryDir USERPROFILE fallback
-        shell: pwsh
-        run: |
-          Remove-Item Env:HOME -ErrorAction SilentlyContinue
-          Remove-Item Env:PI_MEMORY_DIR -ErrorAction SilentlyContinue
-          if (-not $env:USERPROFILE) { Write-Error "USERPROFILE is not set on this runner"; exit 1 }
-          $expectedPrefix = Join-Path $env:USERPROFILE ".pi\agent\memory"
-          Write-Host "Expected prefix: $expectedPrefix"
-          $actual = node --import tsx -e "import('./index.ts').then(m => { console.log(m.dailyPath('2026-01-01')); });"
-          Write-Host "ensureDirs/dailyPath returned: $actual"
-          if ($actual -notlike "$expectedPrefix*") {
-            Write-Error "FAILED: resolveMemoryDir did not honor USERPROFILE fallback. Got: $actual"
-            exit 1
-          }
-          if ($actual -like "*~\.pi*") {
-            Write-Error "FAILED: literal '~' subdirectory still present in resolved path"
-            exit 1
-          }
-          Write-Host "OK: memory directory resolved under USERPROFILE"
-
-  test:
-    runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      PI_E2E_PROVIDER: openai
-      PI_E2E_MODEL: gpt-4o-mini
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - name: Run e2e tests
-        if: ${{ env.OPENAI_API_KEY != '' }}
-        run: npm test
-      - name: Skip e2e tests (missing OPENAI_API_KEY)
-        if: ${{ env.OPENAI_API_KEY == '' }}
-        run: echo "Skipping e2e tests. Add an OPENAI_API_KEY repository secret to enable."

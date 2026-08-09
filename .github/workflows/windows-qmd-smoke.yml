@@ -1,0 +1,123 @@
+name: Windows qmd smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - index.ts
+      - package.json
+      - package-lock.json
+      - test/qmd-cache.ts
+      - .github/workflows/windows-qmd-smoke.yml
+  pull_request:
+    paths:
+      - index.ts
+      - package.json
+      - package-lock.json
+      - test/qmd-cache.ts
+      - .github/workflows/windows-qmd-smoke.yml
+  workflow_dispatch:
+
+concurrency:
+  group: qmd-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-qmd-smoke:
+    name: windows-qmd-smoke
+    runs-on: windows-latest
+    env:
+      QMD_VERSION: "2.5.3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Set isolated qmd prefix
+        id: qmd-prefix
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "qmd"
+          "path=$prefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "QMD_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache qmd installation
+        id: qmd-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.qmd-prefix.outputs.path }}
+          key: qmd-${{ runner.os }}-node-22-${{ env.QMD_VERSION }}
+
+      - name: Install qmd via npm
+        if: steps.qmd-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: npm install --global --prefix "$env:QMD_PREFIX" "@tobilu/qmd@$env:QMD_VERSION"
+
+      - name: Add qmd and Git prerequisites to PATH
+        shell: pwsh
+        run: |
+          Write-Host "Adding to PATH: $env:QMD_PREFIX"
+          Add-Content -Path $env:GITHUB_PATH -Value $env:QMD_PREFIX
+          $gitUsrBin = Join-Path $env:ProgramFiles "Git\usr\bin"
+          if (Test-Path $gitUsrBin) {
+            Write-Host "Adding to PATH: $gitUsrBin"
+            Add-Content -Path $env:GITHUB_PATH -Value $gitUsrBin
+          }
+
+      - name: Confirm qmd is callable through its direct-node path
+        shell: pwsh
+        run: |
+          Write-Host "--- npm prefix shims ($env:QMD_PREFIX) ---"
+          Get-ChildItem -Path $env:QMD_PREFIX -Filter "qmd*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Name, Length
+          Write-Host "--- Get-Command qmd -All ---"
+          Get-Command qmd -All | Format-Table -AutoSize
+          $qmdJs = Join-Path $env:QMD_PREFIX "node_modules\@tobilu\qmd\dist\cli\qmd.js"
+          Write-Host "--- expected qmd.js: $qmdJs ---"
+          if (-not (Test-Path $qmdJs)) {
+            Write-Error "qmd.js not found at $qmdJs"
+            exit 1
+          }
+          node $qmdJs --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "node $qmdJs --version failed (exit $LASTEXITCODE)"
+            exit 1
+          }
+
+      # Captures stock Node execFile behavior for the runner's qmd shim. This
+      # is informational because shim behavior varies by package manager.
+      - name: Smoke (informational) — stock Node execFile -> qmd
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          node -e "const { execFile } = require('node:child_process'); execFile('qmd', ['--version'], (err, stdout, stderr) => { if (err) { console.error('STOCK execFile FAILED (expected on Windows):', err.code, err.message); process.exit(1); } console.log('STOCK execFile OK:', stdout.trim()); });"
+
+      - name: Smoke — extension wrapper -> qmd (must succeed)
+        shell: pwsh
+        run: |
+          node --import tsx -e "import('./index.ts').then(async (m) => { m.ensureDirs(); const ok = await m.setupQmdCollection(); if (!ok) { console.error('setupQmdCollection returned false — wrapper did not fix qmd invocation'); process.exit(1); } console.log('OK: extension wrapper successfully invoked qmd through the Windows shell'); }).catch((e) => { console.error('FAILED:', e); process.exit(1); });"
+
+      - name: Smoke — resolveMemoryDir USERPROFILE fallback
+        shell: pwsh
+        run: |
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:PI_MEMORY_DIR -ErrorAction SilentlyContinue
+          if (-not $env:USERPROFILE) { Write-Error "USERPROFILE is not set on this runner"; exit 1 }
+          $expectedPrefix = Join-Path $env:USERPROFILE ".pi\agent\memory"
+          Write-Host "Expected prefix: $expectedPrefix"
+          $actual = node --import tsx -e "import('./index.ts').then(m => { console.log(m.dailyPath('2026-01-01')); });"
+          Write-Host "ensureDirs/dailyPath returned: $actual"
+          if ($actual -notlike "$expectedPrefix*") {
+            Write-Error "FAILED: resolveMemoryDir did not honor USERPROFILE fallback. Got: $actual"
+            exit 1
+          }
+          if ($actual -like "*~\.pi*") {
+            Write-Error "FAILED: literal '~' subdirectory still present in resolved path"
+            exit 1
+          }
+          Write-Host "OK: memory directory resolved under USERPROFILE"

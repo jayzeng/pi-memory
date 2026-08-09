@@ -150,6 +150,43 @@ describe("runtime package scope", () => {
 	});
 });
 
+describe("GitHub Actions workflows", () => {
+	const ciWorkflow = fs.readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf-8");
+	const e2eWorkflow = fs.readFileSync(new URL("../.github/workflows/e2e.yml", import.meta.url), "utf-8");
+	const qmdWorkflow = fs.readFileSync(new URL("../.github/workflows/windows-qmd-smoke.yml", import.meta.url), "utf-8");
+
+	test("runs feature-branch CI once and cancels superseded runs", () => {
+		expect(ciWorkflow).toContain("push:\n    branches: [main]\n  pull_request:");
+		expect(ciWorkflow).toContain(
+			`group: ci-\${{ github.workflow }}-\${{ github.event.pull_request.number || github.ref }}`,
+		);
+		expect(ciWorkflow).toContain("cancel-in-progress: true");
+	});
+
+	test("installs once per OS for the fast verification path", () => {
+		expect(ciWorkflow.match(/- run: npm ci/g)).toHaveLength(2);
+		expect(ciWorkflow).toContain("name: verify (ubuntu-latest)");
+		expect(ciWorkflow).toContain("name: unit (windows-latest)");
+		expect(ciWorkflow).not.toContain("matrix:");
+		expect(ciWorkflow).not.toContain("windows-qmd-smoke");
+		expect(ciWorkflow).not.toContain("OPENAI_API_KEY");
+	});
+
+	test("pins and caches the path-filtered Windows qmd smoke", () => {
+		expect(qmdWorkflow).toContain("name: Windows qmd smoke");
+		expect(qmdWorkflow).toContain("paths:");
+		expect(qmdWorkflow).toContain('QMD_VERSION: "2.5.3"');
+		expect(qmdWorkflow).toContain("uses: actions/cache@v4");
+		expect(qmdWorkflow).toContain('"@tobilu/qmd@$env:QMD_VERSION"');
+	});
+
+	test("keeps API-backed e2e explicit and uses the e2e command", () => {
+		expect(e2eWorkflow).toContain("workflow_dispatch:");
+		expect(e2eWorkflow).not.toContain("pull_request:");
+		expect(e2eWorkflow).toContain("run: npm run test:e2e");
+	});
+});
+
 // We need to import the default export to register tools
 import registerExtension from "../index.js";
 

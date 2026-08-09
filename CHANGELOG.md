@@ -8,6 +8,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Reduced pull-request CI duplication and setup overhead by consolidating the
+  fast verification jobs, canceling superseded runs, moving API-backed e2e to
+  an explicit workflow, and caching the path-filtered Windows qmd smoke test.
 - Migrated Pi runtime imports and peer dependencies from the retired
   `@mariozechner` scope to `@earendil-works` 0.81.1+, including its unified
   TypeBox exports and compatibility API. The minimum Node.js version is now
