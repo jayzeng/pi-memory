@@ -885,10 +885,16 @@ let qmdAvailabilityCheckedAt = 0;
 // don't have to wait through a long TTL before retries succeed.
 const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
+const DEFAULT_QMD_SEARCH_TIMEOUT_MS = 60_000;
 const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
 
 function qmdStatusTtl(positive: boolean): number {
 	return positive ? QMD_STATUS_CACHE_TTL_MS : QMD_STATUS_NEGATIVE_CACHE_TTL_MS;
+}
+
+export function getQmdSearchTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const configured = Number(env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS);
+	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_QMD_SEARCH_TIMEOUT_MS;
 }
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
@@ -1220,15 +1226,16 @@ export function runQmdSearch(
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
 	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
+	const timeoutMs = getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
-		execFileFn("qmd", args, { timeout: 60_000 }, (err, stdout, stderr) => {
+		execFileFn("qmd", args, { timeout: timeoutMs }, (err, stdout, stderr) => {
 			if (err) {
 				const cleaned = stripAnsi(stderr ?? "").trim();
 				const cleanedMessage = stripAnsi(err.message).trim();
 				const timedOut = (err as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
 				const hint = timedOut
-					? " (qmd timed out after 60s — first semantic/deep search may download or load models; retry shortly)"
+					? ` (qmd timed out after ${timeoutMs / 1000}s — first semantic/deep search may download or load models; retry shortly)`
 					: "";
 				reject(new Error(`${cleaned || cleanedMessage}${hint}`));
 				return;
@@ -2320,6 +2327,7 @@ export default function (pi: ExtensionAPI) {
 				"## Configuration",
 				`- PI_MEMORY_SNAPSHOT: ${getSnapshotMode()}`,
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
+				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 			);
 

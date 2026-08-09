@@ -31,6 +31,7 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getQmdSearchTimeoutMs,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -1160,13 +1161,23 @@ describe("runQmdSearch qmd diagnostics", () => {
 		expect((failure as Error).message).not.toContain("\u001b");
 	});
 
-	test("annotates qmd timeouts with a retryable cold-start hint", async () => {
-		const timeoutErr = Object.assign(new Error("Command failed: qmd vsearch"), { killed: true });
-		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
-			cb(timeoutErr, "", "\u001b[?25l\u001b[?25h");
-		}) as any);
+	test("uses the configured qmd search timeout in execution and diagnostics", async () => {
+		const previousTimeout = process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+		process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = "90000";
+		let observedTimeout: number | undefined;
+		try {
+			const timeoutErr = Object.assign(new Error("Command failed: qmd vsearch"), { killed: true });
+			_setExecFileForTest(((_file: string, _args: string[], opts: any, cb: any) => {
+				observedTimeout = opts.timeout;
+				cb(timeoutErr, "", "\u001b[?25l\u001b[?25h");
+			}) as any);
 
-		await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("qmd timed out after 60s");
+			await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("qmd timed out after 90s");
+			expect(observedTimeout).toBe(90_000);
+		} finally {
+			if (previousTimeout === undefined) delete process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+			else process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = previousTimeout;
+		}
 	});
 
 	test("removes FORCE_COLOR and sets NO_COLOR for qmd child processes", () => {
@@ -1175,6 +1186,15 @@ describe("runQmdSearch qmd diagnostics", () => {
 		expect(env.FORCE_COLOR).toBeUndefined();
 		expect(env.NO_COLOR).toBe("1");
 		expect(env.PATH).toBe("bin");
+	});
+});
+
+describe("getQmdSearchTimeoutMs", () => {
+	test("accepts positive integer milliseconds and defaults invalid values", () => {
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "90000" })).toBe(90_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "0.5" })).toBe(60_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "0" })).toBe(60_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "invalid" })).toBe(60_000);
 	});
 });
 
