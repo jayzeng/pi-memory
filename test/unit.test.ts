@@ -24,12 +24,14 @@ import {
 	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
+	buildQmdEnv,
 	buildQmdSpawn,
 	clampSearchLimit,
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getQmdSearchTimeoutMs,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -37,6 +39,7 @@ import {
 	readFileSafe,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
 	scratchpadAdd,
@@ -120,6 +123,8 @@ function createShutdownCtx(options?: {
 describe("runtime package scope", () => {
 	test("uses the official @earendil-works Pi packages", () => {
 		const source = fs.readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
+		const claudeGuide = fs.readFileSync(new URL("../CLAUDE.md", import.meta.url), "utf-8");
+		const bunLock = fs.readFileSync(new URL("../bun.lock", import.meta.url), "utf-8");
 		const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
 
 		expect(source).toContain('from "@earendil-works/pi-ai"');
@@ -127,14 +132,21 @@ describe("runtime package scope", () => {
 		expect(source).not.toContain("@mariozechner/pi-ai");
 		expect(source).not.toContain("@mariozechner/pi-coding-agent");
 
-		expect(packageJson.devDependencies["@earendil-works/pi-ai"]).toBe("0.81.1");
-		expect(packageJson.devDependencies["@earendil-works/pi-coding-agent"]).toBe("0.81.1");
+		expect(packageJson.devDependencies["@earendil-works/pi-ai"]).toBe("0.84.1");
+		expect(packageJson.devDependencies["@earendil-works/pi-coding-agent"]).toBe("0.84.1");
 		expect(packageJson.peerDependencies["@earendil-works/pi-ai"]).toBe(">=0.81.1");
 		expect(packageJson.peerDependencies["@earendil-works/pi-coding-agent"]).toBe(">=0.81.1");
 		expect(packageJson.peerDependencies["@mariozechner/pi-ai"]).toBeUndefined();
 		expect(packageJson.peerDependencies["@mariozechner/pi-coding-agent"]).toBeUndefined();
 		expect(packageJson.peerDependencies["@sinclair/typebox"]).toBeUndefined();
 		expect(packageJson.engines.node).toBe(">=22.19.0");
+
+		expect(claudeGuide).toContain("https://github.com/earendil-works/pi");
+		expect(claudeGuide).not.toContain("https://github.com/mariozechner/pi-mono");
+		expect(claudeGuide).not.toContain("@mariozechner/pi-ai");
+		expect(claudeGuide).not.toContain("@mariozechner/pi-coding-agent");
+		expect(bunLock).not.toContain('"@mariozechner/pi-ai"');
+		expect(bunLock).not.toContain('"@mariozechner/pi-coding-agent"');
 	});
 });
 
@@ -1120,6 +1132,80 @@ describe("memory_read tool", () => {
 // ==========================================================================
 // 8. Tool: memory_search
 // ==========================================================================
+
+describe("runQmdSearch qmd diagnostics", () => {
+	afterEach(() => {
+		_resetExecFileForTest();
+	});
+
+	test("strips qmd spinner control sequences from stderr failures", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(
+				new Error("Command failed: qmd vsearch"),
+				"",
+				"\u001b[?25l\u001b[?25h\u001b[2K\u001b[1A\u001b[Greal diagnostic",
+			);
+		}) as any);
+
+		await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("real diagnostic");
+		await expect(runQmdSearch("semantic", "query", 5)).rejects.not.toThrow("[?25");
+	});
+
+	test("strips qmd spinner control sequences from the fallback error message", async () => {
+		const spinner = "\u001b[?25l\u001b[?25h";
+		const commandError = new Error(`Command failed: qmd vsearch\n${spinner}`);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(commandError, "", spinner);
+		}) as any);
+
+		let failure: unknown;
+		try {
+			await runQmdSearch("semantic", "query", 5);
+		} catch (err) {
+			failure = err;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain("Command failed: qmd vsearch");
+		expect((failure as Error).message).not.toContain("\u001b");
+	});
+
+	test("uses the configured qmd search timeout in execution and diagnostics", async () => {
+		const previousTimeout = process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+		process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = "90000";
+		let observedTimeout: number | undefined;
+		try {
+			const timeoutErr = Object.assign(new Error("Command failed: qmd vsearch"), { killed: true });
+			_setExecFileForTest(((_file: string, _args: string[], opts: any, cb: any) => {
+				observedTimeout = opts.timeout;
+				cb(timeoutErr, "", "\u001b[?25l\u001b[?25h");
+			}) as any);
+
+			await expect(runQmdSearch("semantic", "query", 5)).rejects.toThrow("qmd timed out after 90s");
+			expect(observedTimeout).toBe(90_000);
+		} finally {
+			if (previousTimeout === undefined) delete process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+			else process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = previousTimeout;
+		}
+	});
+
+	test("removes FORCE_COLOR and sets NO_COLOR for qmd child processes", () => {
+		const env = buildQmdEnv({ FORCE_COLOR: "3", NO_COLOR: undefined, PATH: "bin" });
+
+		expect(env.FORCE_COLOR).toBeUndefined();
+		expect(env.NO_COLOR).toBe("1");
+		expect(env.PATH).toBe("bin");
+	});
+});
+
+describe("getQmdSearchTimeoutMs", () => {
+	test("accepts positive integer milliseconds and defaults invalid values", () => {
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "90000" })).toBe(90_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "0.5" })).toBe(60_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "0" })).toBe(60_000);
+		expect(getQmdSearchTimeoutMs({ PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: "invalid" })).toBe(60_000);
+	});
+});
 
 describe("memory_search tool", () => {
 	let tools: Record<string, any>;

@@ -858,6 +858,12 @@ export function buildQmdSpawn(
 	return { file: "node", args: [qmdJsPath, ...args] };
 }
 
+export function buildQmdEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const qmdEnv: NodeJS.ProcessEnv = { ...env, NO_COLOR: "1" };
+	delete qmdEnv.FORCE_COLOR;
+	return qmdEnv;
+}
+
 const execFileWithQmdOptions: ExecFileFn = ((
 	file: string,
 	args: readonly string[],
@@ -866,7 +872,8 @@ const execFileWithQmdOptions: ExecFileFn = ((
 ) => {
 	const qmdJs = process.platform === "win32" && isQmdCommand(file) ? resolveQmdJsPath() : null;
 	const spawn = buildQmdSpawn(file, args ?? [], process.platform, qmdJs);
-	return execFile(spawn.file, spawn.args, options, callback as any);
+	const execOptions = isQmdCommand(file) ? { ...options, env: buildQmdEnv(options.env ?? process.env) } : options;
+	return execFile(spawn.file, spawn.args, execOptions, callback as any);
 }) as ExecFileFn;
 
 let execFileFn: ExecFileFn = execFileWithQmdOptions;
@@ -878,10 +885,16 @@ let qmdAvailabilityCheckedAt = 0;
 // don't have to wait through a long TTL before retries succeed.
 const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
+const DEFAULT_QMD_SEARCH_TIMEOUT_MS = 60_000;
 const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
 
 function qmdStatusTtl(positive: boolean): number {
 	return positive ? QMD_STATUS_CACHE_TTL_MS : QMD_STATUS_NEGATIVE_CACHE_TTL_MS;
+}
+
+export function getQmdSearchTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const configured = Number(env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS);
+	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_QMD_SEARCH_TIMEOUT_MS;
 }
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
@@ -1181,8 +1194,9 @@ function getQmdResultText(r: QmdSearchResult): string {
 function stripAnsi(text: string): string {
 	// qmd may emit spinners/progress bars even with --json, especially on first model download.
 	// Strip ANSI CSI/OSC sequences so we can reliably find and parse JSON payloads.
+	// CSI parameter bytes include private-mode sequences such as ESC[?25l / ESC[?25h.
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escape sequences
-	return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, "");
+	return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\u001b\][^\u0007]*(\u0007|\u001b\\)/g, "");
 }
 
 function parseQmdJson(stdout: string): unknown {
@@ -1212,11 +1226,18 @@ export function runQmdSearch(
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
 	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
+	const timeoutMs = getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
-		execFileFn("qmd", args, { timeout: 60_000 }, (err, stdout, stderr) => {
+		execFileFn("qmd", args, { timeout: timeoutMs }, (err, stdout, stderr) => {
 			if (err) {
-				reject(new Error(stderr?.trim() || err.message));
+				const cleaned = stripAnsi(stderr ?? "").trim();
+				const cleanedMessage = stripAnsi(err.message).trim();
+				const timedOut = (err as NodeJS.ErrnoException & { killed?: boolean }).killed === true;
+				const hint = timedOut
+					? ` (qmd timed out after ${timeoutMs / 1000}s — first semantic/deep search may download or load models; retry shortly)`
+					: "";
+				reject(new Error(`${cleaned || cleanedMessage}${hint}`));
 				return;
 			}
 			try {
@@ -2306,6 +2327,7 @@ export default function (pi: ExtensionAPI) {
 				"## Configuration",
 				`- PI_MEMORY_SNAPSHOT: ${getSnapshotMode()}`,
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
+				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 			);
 

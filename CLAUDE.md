@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A memory extension for the [pi coding agent](https://github.com/mariozechner/pi-mono). It provides persistent memory across coding sessions via plain markdown files, with optional semantic search powered by [qmd](https://github.com/tobi/qmd). Single-file extension (`index.ts`) — no build step, pi loads TypeScript directly.
+A memory extension for the [pi coding agent](https://github.com/earendil-works/pi). It provides persistent memory across coding sessions via plain markdown files, with optional semantic search powered by [qmd](https://github.com/tobi/qmd). Single-file extension (`index.ts`) — no build step, pi loads TypeScript directly.
 
 ## Commands
 
@@ -35,7 +35,7 @@ Key design patterns:
 
 ## Peer Dependencies
 
-Uses `@mariozechner/pi-coding-agent` (ExtensionAPI types), `@mariozechner/pi-ai` (StringEnum), and `@sinclair/typebox` (schema definitions). These are peer deps — provided by the pi runtime.
+Uses `@earendil-works/pi-coding-agent` for extension APIs and `@earendil-works/pi-ai` for model, schema, and compatibility APIs. These are peer deps — provided by the pi runtime.
 
 ## Testing
 
