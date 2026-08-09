@@ -123,6 +123,8 @@ function createShutdownCtx(options?: {
 describe("runtime package scope", () => {
 	test("uses the official @earendil-works Pi packages", () => {
 		const source = fs.readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
+		const claudeGuide = fs.readFileSync(new URL("../CLAUDE.md", import.meta.url), "utf-8");
+		const bunLock = fs.readFileSync(new URL("../bun.lock", import.meta.url), "utf-8");
 		const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
 
 		expect(source).toContain('from "@earendil-works/pi-ai"');
@@ -130,14 +132,21 @@ describe("runtime package scope", () => {
 		expect(source).not.toContain("@mariozechner/pi-ai");
 		expect(source).not.toContain("@mariozechner/pi-coding-agent");
 
-		expect(packageJson.devDependencies["@earendil-works/pi-ai"]).toBe("0.81.1");
-		expect(packageJson.devDependencies["@earendil-works/pi-coding-agent"]).toBe("0.81.1");
+		expect(packageJson.devDependencies["@earendil-works/pi-ai"]).toBe("0.84.1");
+		expect(packageJson.devDependencies["@earendil-works/pi-coding-agent"]).toBe("0.84.1");
 		expect(packageJson.peerDependencies["@earendil-works/pi-ai"]).toBe(">=0.81.1");
 		expect(packageJson.peerDependencies["@earendil-works/pi-coding-agent"]).toBe(">=0.81.1");
 		expect(packageJson.peerDependencies["@mariozechner/pi-ai"]).toBeUndefined();
 		expect(packageJson.peerDependencies["@mariozechner/pi-coding-agent"]).toBeUndefined();
 		expect(packageJson.peerDependencies["@sinclair/typebox"]).toBeUndefined();
 		expect(packageJson.engines.node).toBe(">=22.19.0");
+
+		expect(claudeGuide).toContain("https://github.com/earendil-works/pi");
+		expect(claudeGuide).not.toContain("https://github.com/mariozechner/pi-mono");
+		expect(claudeGuide).not.toContain("@mariozechner/pi-ai");
+		expect(claudeGuide).not.toContain("@mariozechner/pi-coding-agent");
+		expect(bunLock).not.toContain('"@mariozechner/pi-ai"');
+		expect(bunLock).not.toContain('"@mariozechner/pi-coding-agent"');
 	});
 });
 

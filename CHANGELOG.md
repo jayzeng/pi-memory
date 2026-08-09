@@ -11,7 +11,8 @@ follows [Semantic Versioning](https://semver.org/).
 - Migrated Pi runtime imports and peer dependencies from the retired
   `@mariozechner` scope to `@earendil-works` 0.81.1+, including its unified
   TypeBox exports and compatibility API. The minimum Node.js version is now
-  22.19.0 to match the current Pi runtime.
+  22.19.0 to match the current Pi runtime. Refreshed the development pins and
+  npm/Bun dependency locks against the current 0.84.1 release.
 
 ## [0.4.0] — 2026-07-19
 
