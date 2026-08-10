@@ -17,6 +17,18 @@ follows [Semantic Versioning](https://semver.org/).
   summaries to a cheaper/faster model. Unresolvable specs fall back to the
   session model with a warning. (#26)
 
+### Fixed
+
+- Exit summaries whose every section is "None." (trivial sessions with nothing
+  worth recording) are no longer persisted to the daily log, completing the
+  curated-write gate — previously such boilerplate entries were appended,
+  re-injected at every session start, and indexed by qmd. (#26)
+- Exit-summary generation on `session_shutdown` is now bounded by a
+  self-imposed timeout (`PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS`, default 10s).
+  Pi core awaits shutdown handlers with no timeout, so a hanging provider
+  previously blocked quitting indefinitely. On expiry nothing is persisted.
+  (#26)
+
 ### Changed
 
 - Reduced pull-request CI duplication and setup overhead by consolidating the
