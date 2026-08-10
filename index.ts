@@ -367,23 +367,53 @@ function getSessionBranch(ctx: ExtensionContext): SessionEntry[] | null {
 	return sessionManager.getBranch();
 }
 
-async function resolveExitSummaryApiKey(ctx: ExtensionContext): Promise<string | undefined> {
-	if (!ctx.model) return undefined;
-
+async function resolveExitSummaryApiKey(
+	ctx: ExtensionContext,
+	model: NonNullable<ExtensionContext["model"]>,
+): Promise<string | undefined> {
 	const modelRegistry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
 		getApiKey?: (model: NonNullable<ExtensionContext["model"]>) => Promise<string | undefined>;
 		getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
 	};
 
 	if (typeof modelRegistry?.getApiKey === "function") {
-		return modelRegistry.getApiKey(ctx.model);
+		return modelRegistry.getApiKey(model);
 	}
 
 	if (typeof modelRegistry?.getApiKeyForProvider === "function") {
-		return modelRegistry.getApiKeyForProvider(ctx.model.provider);
+		return modelRegistry.getApiKeyForProvider(model.provider);
 	}
 
 	return undefined;
+}
+
+/**
+ * Model used for exit summaries. Defaults to the session's active model;
+ * PI_MEMORY_EXIT_SUMMARY_MODEL="provider/model-id" overrides it (e.g. to a
+ * cheaper/faster model). Unresolvable specs fall back to the session model.
+ */
+function resolveExitSummaryModel(ctx: ExtensionContext): ExtensionContext["model"] {
+	const spec = (process.env.PI_MEMORY_EXIT_SUMMARY_MODEL ?? "").trim();
+	if (!spec) return ctx.model;
+
+	const slash = spec.indexOf("/");
+	const modelRegistry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+		find?: (provider: string, modelId: string) => ExtensionContext["model"];
+	};
+	const found = slash > 0 ? modelRegistry?.find?.(spec.slice(0, slash), spec.slice(slash + 1)) : undefined;
+	if (found) return found;
+
+	if (ctx.hasUI) {
+		try {
+			ctx.ui.notify(
+				`pi-memory: PI_MEMORY_EXIT_SUMMARY_MODEL "${spec}" not resolved; using session model`,
+				"warning",
+			);
+		} catch {
+			/* UI may already be tearing down during shutdown */
+		}
+	}
+	return ctx.model;
 }
 
 async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
@@ -404,15 +434,16 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		return { summary: null, hasMessages: false };
 	}
 
-	if (!ctx.model) {
+	const model = resolveExitSummaryModel(ctx);
+	if (!model) {
 		return { summary: null, error: "No active model", hasMessages: true };
 	}
 
-	const apiKey = await resolveExitSummaryApiKey(ctx);
+	const apiKey = await resolveExitSummaryApiKey(ctx, model);
 	if (!apiKey) {
 		return {
 			summary: null,
-			error: `API key resolution unavailable for ${ctx.model.provider}/${ctx.model.id}`,
+			error: `API key resolution unavailable for ${model.provider}/${model.id}`,
 			hasMessages: true,
 		};
 	}
@@ -434,7 +465,7 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 
 	try {
 		const response = await complete(
-			ctx.model,
+			model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
 			{ apiKey, reasoningEffort: "low" },
 		);
@@ -466,6 +497,15 @@ function getQmdUpdateMode(): "background" | "manual" | "off" {
 export function shouldSummarizeLifecycleTransitions(): boolean {
 	const value = (process.env.PI_MEMORY_SUMMARIZE_TRANSITIONS ?? "").toLowerCase();
 	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+/**
+ * Exit summaries on real quit (Ctrl+D, /quit, session end) can be disabled
+ * with PI_MEMORY_EXIT_SUMMARY=0 (aliases: off/false/no). Default: enabled.
+ */
+export function isExitSummaryEnabled(): boolean {
+	const value = (process.env.PI_MEMORY_EXIT_SUMMARY ?? "").trim().toLowerCase();
+	return !(value === "0" || value === "off" || value === "false" || value === "no");
 }
 
 export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
@@ -1406,7 +1446,7 @@ export default function (pi: ExtensionAPI) {
 		// /new, /resume, and /fork because that makes those transitions slow.
 		// Users who prefer the old behavior can opt in with
 		// PI_MEMORY_SUMMARIZE_TRANSITIONS=1.
-		if (shouldSkipExitSummaryForReason(shutdownReason)) {
+		if (shouldSkipExitSummaryForReason(shutdownReason) || !isExitSummaryEnabled()) {
 			exitSummaryReason = null;
 			if (updateTimer) {
 				clearTimeout(updateTimer);
@@ -2329,6 +2369,8 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
+				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
+				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
 			);
 
 			return {

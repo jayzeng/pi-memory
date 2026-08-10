@@ -32,6 +32,7 @@ import {
 	ensureQmdEmbed,
 	forgetBlocks,
 	getQmdSearchTimeoutMs,
+	isExitSummaryEnabled,
 	nowTimestamp,
 	parseScratchpad,
 	qmdCollectionInstructions,
@@ -1550,6 +1551,115 @@ describe("lifecycle hooks", () => {
 
 		expect(getApiKey).toHaveBeenCalled();
 		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+	});
+
+	// -- exit summary configurability (PI_MEMORY_EXIT_SUMMARY / PI_MEMORY_EXIT_SUMMARY_MODEL) --
+
+	describe("exit summary configurability", () => {
+		const fourMessageBranch = () => [
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Please remember we chose dark mode." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Also migrate the config to match." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+					timestamp: Date.now(),
+				},
+			},
+		];
+
+		let savedEnabled: string | undefined;
+		let savedModel: string | undefined;
+		beforeEach(() => {
+			savedEnabled = process.env.PI_MEMORY_EXIT_SUMMARY;
+			savedModel = process.env.PI_MEMORY_EXIT_SUMMARY_MODEL;
+		});
+		afterEach(() => {
+			if (savedEnabled === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY;
+			else process.env.PI_MEMORY_EXIT_SUMMARY = savedEnabled;
+			if (savedModel === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY_MODEL;
+			else process.env.PI_MEMORY_EXIT_SUMMARY_MODEL = savedModel;
+		});
+
+		test("PI_MEMORY_EXIT_SUMMARY=0 skips the exit summary on real quit", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY = "0";
+			const getApiKey = mock(async () => "key");
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(getApiKey).not.toHaveBeenCalled();
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		});
+
+		test("PI_MEMORY_EXIT_SUMMARY=off (and other aliases) also disable", async () => {
+			for (const value of ["off", "false", "no"]) {
+				process.env.PI_MEMORY_EXIT_SUMMARY = value;
+				expect(isExitSummaryEnabled()).toBe(false);
+			}
+			delete process.env.PI_MEMORY_EXIT_SUMMARY;
+			expect(isExitSummaryEnabled()).toBe(true);
+		});
+
+		test("PI_MEMORY_EXIT_SUMMARY_MODEL routes the summary to the configured model", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_MODEL = "anthropic/claude-haiku-4";
+			const overrideModel = { provider: "anthropic", id: "claude-haiku-4" };
+			const find = mock((_provider: string, _id: string) => overrideModel);
+			const getApiKey = mock(async (_model: unknown) => undefined);
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { find, getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(find).toHaveBeenCalledWith("anthropic", "claude-haiku-4");
+			expect(getApiKey).toHaveBeenCalledWith(overrideModel);
+		});
+
+		test("unresolvable PI_MEMORY_EXIT_SUMMARY_MODEL falls back to the session model", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_MODEL = "nonexistent/no-such-model";
+			const sessionModel = { provider: "openai", id: "gpt-4o-mini" };
+			const find = mock((_provider: string, _id: string) => undefined);
+			const getApiKey = mock(async (_model: unknown) => undefined);
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: sessionModel,
+				modelRegistry: { find, getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(getApiKey).toHaveBeenCalledWith(sessionModel);
+		});
 	});
 
 	// -- session_before_compact --
