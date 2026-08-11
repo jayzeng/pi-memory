@@ -508,6 +508,35 @@ export function isExitSummaryEnabled(): boolean {
 	return !(value === "0" || value === "off" || value === "false" || value === "no");
 }
 
+/**
+ * True when a generated exit summary carries no actual content — every section
+ * is empty or "None.". The summary prompt instructs the model to write "None."
+ * under each heading when nothing is worth recording; persisting those blocks
+ * would pollute the daily log (re-injected every session start) and the qmd
+ * index with boilerplate.
+ */
+export function isExitSummaryEmpty(summary: string): boolean {
+	const contentLines = summary
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("#"));
+	if (contentLines.length === 0) return true;
+	return contentLines.every((line) => /^none\.?$/i.test(line.replace(/^[-*+]\s*/, "")));
+}
+
+const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 10_000;
+
+/**
+ * Self-imposed timeout for the exit-summary work on session_shutdown. Pi core
+ * awaits shutdown handlers with no timeout, and generateExitSummary() is only
+ * bounded by the provider's own timeout — a hanging provider would otherwise
+ * block quitting indefinitely. Override with PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS.
+ */
+export function getExitSummaryTimeoutMs(): number {
+	const configured = Number(process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS);
+	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_EXIT_SUMMARY_TIMEOUT_MS;
+}
+
 export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
 	if (!reason) return false;
 	if (shouldSummarizeLifecycleTransitions()) return false;
@@ -1458,15 +1487,26 @@ export default function (pi: ExtensionAPI) {
 		const reason = exitSummaryReason ?? "session-end";
 		exitSummaryReason = null;
 
+		let summaryTimer: ReturnType<typeof setTimeout> | undefined;
 		try {
 			if (reason) {
 				ensureDirs();
-				const result = await generateExitSummary(ctx);
+				// Race the summary against a self-imposed timeout: pi core awaits
+				// shutdown handlers with no timeout, so a hanging provider would
+				// otherwise block quitting indefinitely. On expiry nothing is
+				// persisted (the late result, if any, is simply dropped).
+				const summaryWork = generateExitSummary(ctx);
+				const expired = new Promise<null>((resolve) => {
+					summaryTimer = setTimeout(() => resolve(null), getExitSummaryTimeoutMs());
+				});
+				const result = await Promise.race([summaryWork, expired]);
 				// Only persist real summaries. The old fallback appended an
 				// all-"None." boilerplate block on every failed summarization
 				// (no API key, empty response, …), polluting the daily log —
 				// which is then re-injected into context every session start.
-				if (result.hasMessages && result.summary) {
+				// Successful-but-empty summaries (every section "None.") are
+				// filtered out for the same reason.
+				if (result?.hasMessages && result.summary && !isExitSummaryEmpty(result.summary)) {
 					const summary = result.summary;
 					const sid = shortSessionId(ctx.sessionManager.getSessionId());
 					const ts = nowTimestamp();
@@ -1480,6 +1520,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		} finally {
+			if (summaryTimer) clearTimeout(summaryTimer);
 			if (updateTimer) {
 				clearTimeout(updateTimer);
 				updateTimer = null;
@@ -2371,6 +2412,7 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
+				`- PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS: ${getExitSummaryTimeoutMs()}`,
 			);
 
 			return {

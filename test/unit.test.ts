@@ -31,7 +31,9 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
+	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
 	parseScratchpad,
@@ -1659,6 +1661,119 @@ describe("lifecycle hooks", () => {
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
 
 			expect(getApiKey).toHaveBeenCalledWith(sessionModel);
+		});
+	});
+
+	describe("isExitSummaryEmpty", () => {
+		test("treats all-None summaries as empty", () => {
+			const summary = [
+				"### Decisions",
+				"- None.",
+				"### Lessons Learned",
+				"- None.",
+				"### Notes",
+				"- None.",
+				"### Follow-ups",
+				"- None.",
+			].join("\n");
+			expect(isExitSummaryEmpty(summary)).toBe(true);
+		});
+
+		test("tolerates formatting variations (bullets, case, missing period)", () => {
+			expect(isExitSummaryEmpty("### Decisions\nNone\n### Notes\n* none.")).toBe(true);
+			expect(isExitSummaryEmpty("None.")).toBe(true);
+			expect(isExitSummaryEmpty("### Decisions\n### Notes")).toBe(true);
+		});
+
+		test("keeps summaries with any real content", () => {
+			const summary = [
+				"### Decisions",
+				"- None.",
+				"### Lessons Learned",
+				"- None.",
+				"### Notes",
+				"- User prefers dark mode.",
+				"### Follow-ups",
+				"- None.",
+			].join("\n");
+			expect(isExitSummaryEmpty(summary)).toBe(false);
+			expect(isExitSummaryEmpty("### Notes\n- Discussed None. vs null semantics")).toBe(false);
+		});
+	});
+
+	describe("exit summary shutdown timeout", () => {
+		const fourMessageBranch = () => [
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Please remember we chose dark mode." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Also migrate the config to match." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+					timestamp: Date.now(),
+				},
+			},
+		];
+
+		let savedTimeout: string | undefined;
+		beforeEach(() => {
+			savedTimeout = process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
+		});
+		afterEach(() => {
+			if (savedTimeout === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
+			else process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = savedTimeout;
+		});
+
+		test("getExitSummaryTimeoutMs parses env with fallback to default", () => {
+			delete process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
+			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "250";
+			expect(getExitSummaryTimeoutMs()).toBe(250);
+			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "not-a-number";
+			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "-5";
+			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+		});
+
+		test("session_shutdown stays responsive when summary generation hangs", async () => {
+			// Pi core awaits session_shutdown handlers with no timeout; a hanging
+			// provider must not block quitting forever. The API-key lookup never
+			// resolves here, so without a self-imposed timeout this test only fails
+			// via bun's per-test timeout.
+			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "50";
+			const getApiKey = mock(() => new Promise<string | undefined>(() => {}));
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(getApiKey).toHaveBeenCalled();
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 		});
 	});
 
