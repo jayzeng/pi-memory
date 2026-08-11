@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-08-10
+
 ### Added
 
 - `PI_MEMORY_EXIT_SUMMARY=0` (aliases: `off`/`false`/`no`) disables the exit
@@ -28,6 +30,13 @@ follows [Semantic Versioning](https://semver.org/).
   Pi core awaits shutdown handlers with no timeout, so a hanging provider
   previously blocked quitting indefinitely. On expiry nothing is persisted.
   (#26)
+
+### Changed
+
+- npm releases now run on the package's supported Node.js 22.19 runtime and
+  publish provenance attestations after lint, build, and unit-test gates pass.
+
+## [0.4.1] — 2026-08-08
 
 ### Changed
 

@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -18,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "22.19.0"
           cache: npm
           registry-url: "https://registry.npmjs.org"
       - uses: oven-sh/setup-bun@v2
@@ -45,4 +46,4 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm test
-      - run: npm publish
+      - run: npm publish --provenance
