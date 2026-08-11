@@ -156,6 +156,7 @@ describe("runtime package scope", () => {
 describe("GitHub Actions workflows", () => {
 	const ciWorkflow = fs.readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf-8");
 	const e2eWorkflow = fs.readFileSync(new URL("../.github/workflows/e2e.yml", import.meta.url), "utf-8");
+	const publishWorkflow = fs.readFileSync(new URL("../.github/workflows/publish-npm.yml", import.meta.url), "utf-8");
 	const qmdWorkflow = fs.readFileSync(new URL("../.github/workflows/windows-qmd-smoke.yml", import.meta.url), "utf-8");
 
 	test("runs feature-branch CI once and cancels superseded runs", () => {
@@ -187,6 +188,18 @@ describe("GitHub Actions workflows", () => {
 		expect(e2eWorkflow).toContain("workflow_dispatch:");
 		expect(e2eWorkflow).not.toContain("pull_request:");
 		expect(e2eWorkflow).toContain("run: npm run test:e2e");
+	});
+
+	test("publishes matching release tags on the supported Node runtime with provenance", () => {
+		expect(publishWorkflow).toContain('tags:\n      - "v*"');
+		expect(publishWorkflow).toContain(`NODE_AUTH_TOKEN: \${{ secrets.NPM_TOKEN }}`);
+		expect(publishWorkflow).toContain('node-version: "22.19.0"');
+		expect(publishWorkflow).toContain("id-token: write");
+		expect(publishWorkflow).toContain(`tag="\${GITHUB_REF_NAME#v}"`);
+		expect(publishWorkflow).toContain("npm run lint");
+		expect(publishWorkflow).toContain("npm run build");
+		expect(publishWorkflow).toContain("npm test");
+		expect(publishWorkflow).toContain("npm publish --provenance");
 	});
 });
 
