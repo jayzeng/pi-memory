@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `PI_MEMORY_EXIT_SUMMARY=0` (aliases: `off`/`false`/`no`) disables the exit
+  summary on real quit (Ctrl+D, `/quit`, session end). With summaries disabled,
+  quitting performs no LLM call and no `qmd update`, so it is instant.
+  Lifecycle-transition skips are unchanged. (#26)
+- `PI_MEMORY_EXIT_SUMMARY_MODEL=provider/model-id` overrides the model used to
+  write exit summaries (default: the session's active model), e.g. to route
+  summaries to a cheaper/faster model. Unresolvable specs fall back to the
+  session model with a warning. (#26)
+
 ### Changed
 
 - Reduced pull-request CI duplication and setup overhead by consolidating the
