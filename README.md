@@ -130,8 +130,9 @@ To keep the prefix byte-stable, the extension snapshots the memory context at de
 
 - **`session_start`** — fresh snapshot per session
 - **`session_before_compact`** — handoff is written then snapshot refreshes (one intentional cache boundary at compaction)
-- **`memory_write` with `target: long_term`** — marks the snapshot dirty so the next turn refreshes (long-term writes are rare, intentional, and the user expects them to stick as ambient context)
-- **Day rollover** — snapshot's captured date no longer matches today
+- **`session_start`** is the only checkpoint in `stable` mode. Long-term writes and day rollovers do **not** re-render the block: a refresh rewrites the tail of the system prompt and voids the prefix cache for the whole conversation, which is the cost the snapshot exists to avoid, paid on the most common in-session event. The written fact is already in tool-call history, and `memory_read` / `memory_search` reach the files directly.
+- **Deletions and restores** are delivered as an injected session message, not by re-rendering the block and not by appending to the system prompt. A forgotten memory must stop being authoritative, but the system prompt is a cache prefix: appending one line to it reprocesses the whole conversation on a recurrent/hybrid model (measured 15.5k tokens / 17.8 s). A message lands at the tail of the history, which is free, and pi persists it for later turns.
+- Set `PI_MEMORY_SNAPSHOT=refresh` for the old behaviour (refresh on long-term write and day rollover, with a `Snapshot <reason> at <hh:mm:ss>` caveat line).
 
 `memory_write` with `target: daily` and `scratchpad` writes do **not** mark dirty — they're high-frequency and the write content is already echoed via tool-call args. The model can always call `memory_read` / `memory_search` for the authoritative latest state.
 
@@ -186,7 +187,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `PI_MEMORY_DIR` | path | `~/.pi/agent/memory` | Override the memory storage directory |
-| `PI_MEMORY_SNAPSHOT` | `stable`, `per-turn` | `stable` | `stable` snapshots memory at checkpoints for KV cache stability; `per-turn` rebuilds every turn (legacy behavior) |
+| `PI_MEMORY_SNAPSHOT` | `stable`, `refresh`, `per-turn` | `stable` | `stable` snapshots once at session start and never re-renders it (deletions append a correction); `refresh` also re-renders on long-term writes and day rollover; `per-turn` rebuilds every turn (legacy behavior) |
 | `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` + `qmd embed` after writes |
 | `PI_MEMORY_QMD_SEARCH_TIMEOUT_MS` | positive integer (milliseconds) | `60000` | Sets the timeout for explicit `memory_search` qmd queries |
 | `PI_MEMORY_NO_SEARCH` | `1` | unset | Disable selective injection in `per-turn` mode (no effect in `stable` mode) |
@@ -206,7 +207,7 @@ Run the `memory_status` tool first — it reports most of these at a glance.
 | “need embeddings” on semantic/deep search | Vectors not built yet | Embedding starts automatically in the background — retry shortly. If `PI_MEMORY_QMD_UPDATE` is `manual`/`off`, run `qmd embed` yourself |
 | Collection `pi-memory` missing | Auto-setup didn't run (qmd installed mid-session) | Run any `memory_search` (auto-creates it) or `qmd collection add ~/.pi/agent/memory --name pi-memory` |
 | qmd works in the shell but not from pi on Windows | Broken `.cmd`/`.ps1` shims | The extension bypasses them by invoking qmd's JS entry with `node`; make sure the npm global `node_modules` dir is on `PATH` |
-| Memory isn't being injected after a write | Cache-stable snapshot only refreshes at checkpoints | Long-term writes refresh next turn; for daily/scratchpad use `memory_read`, or set `PI_MEMORY_SNAPSHOT=per-turn` |
+| Memory isn't being injected after a write | The snapshot is taken once per session and deliberately not re-rendered | The write is visible in tool-call history; use `memory_read` / `memory_search` for the current state, or set `PI_MEMORY_SNAPSHOT=refresh` (costs a full prompt reprocess per write) |
 
 ## Running tests
 
