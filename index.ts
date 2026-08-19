@@ -1396,6 +1396,35 @@ let snapshotTakenAt: string | null = null;
 let snapshotTakenOnDate: string | null = null;
 let snapshotReason: string | null = null;
 let snapshotDirty = false;
+// Append-only list of things that stopped being true AFTER the snapshot was
+// taken (deletions, restores). Re-rendering the whole block to reflect them
+// would move every byte of it and cost a full prompt reprocess, so these are
+// drained into an injected message instead (see before_agent_start) and still
+// stop the model from acting on a memory that was explicitly forgotten. Writes
+// are NOT listed here: the written fact is already in the tool-call history.
+let snapshotCorrections: string[] = [];
+
+const SNAPSHOT_CORRECTIONS_MAX = 20;
+
+function noteSnapshotCorrection(line: string) {
+	if (snapshotCorrections.length >= SNAPSHOT_CORRECTIONS_MAX) return;
+	if (!snapshotCorrections.includes(line)) snapshotCorrections.push(line);
+}
+
+// One short, stable line per changed entry: strip the HTML id/timestamp
+// comments, take the first line, cap the length.
+function correctionPreview(entries: string[]): string[] {
+	return entries
+		.map((e) =>
+			e
+				.replace(/<!--[\s\S]*?-->/g, "")
+				.trim()
+				.split("\n")[0]
+				.trim()
+				.slice(0, 160),
+		)
+		.filter(Boolean);
+}
 
 function refreshMemorySnapshot(reason: string) {
 	memorySnapshot = buildMemoryContext("");
@@ -1405,9 +1434,11 @@ function refreshMemorySnapshot(reason: string) {
 	snapshotDirty = false;
 }
 
-function getSnapshotMode(): "stable" | "per-turn" {
+function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
 	const mode = (process.env.PI_MEMORY_SNAPSHOT ?? "stable").toLowerCase();
-	return mode === "per-turn" ? "per-turn" : "stable";
+	if (mode === "per-turn") return "per-turn";
+	if (mode === "refresh") return "refresh";
+	return "stable";
 }
 
 /** Reset snapshot state (for testing). */
@@ -1417,6 +1448,7 @@ export function _resetMemorySnapshot() {
 	snapshotTakenOnDate = null;
 	snapshotReason = null;
 	snapshotDirty = false;
+	snapshotCorrections = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,18 +1580,33 @@ export default function (pi: ExtensionAPI) {
 			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
 			memoryContext = buildMemoryContext(searchResults);
 		} else {
+			// "stable" means stable: once taken, the block is emitted byte-for-byte
+			// for the rest of the session. Refreshing on a long-term write or a
+			// midnight rollover rewrites the tail of the system prompt and voids the
+			// whole conversation's prefix cache — the exact cost the snapshot exists
+			// to avoid, paid on the single most common in-session event. The fresh
+			// state is not lost: the write is in tool-call history a few messages
+			// back, deletions are sent as a correction message below, and
+			// memory_read / memory_search reach the files directly. "refresh" restores the old
+			// checkpoint behaviour.
 			const today = todayStr();
-			const needsRefresh = memorySnapshot === null || snapshotDirty || snapshotTakenOnDate !== today;
-			if (needsRefresh) {
+			const stale = mode === "refresh" && (snapshotDirty || snapshotTakenOnDate !== today);
+			if (memorySnapshot === null || stale) {
 				const reason =
 					memorySnapshot === null ? "before_agent_start" : snapshotDirty ? "long_term_write" : "day_rollover";
 				refreshMemorySnapshot(reason);
 			}
 			memoryContext = memorySnapshot ?? "";
+			// Deliberately carries no timestamp and no reason word: both change
+			// between turns without the memory itself changing, which is enough on
+			// its own to invalidate the cache this branch is trying to preserve.
 			snapshotCaveat =
-				`Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
-				"Use memory_read / memory_search for the authoritative latest state; " +
-				"recent writes may also be visible in tool-call history.";
+				mode === "refresh"
+					? `Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
+						"Use memory_read / memory_search for the authoritative latest state; " +
+						"recent writes may also be visible in tool-call history."
+					: "Loaded once at session start and not re-read since. Use memory_read / memory_search " +
+						"for the authoritative latest state; anything written this session is in tool-call history.";
 		}
 
 		if (!memoryContext) return;
@@ -1578,8 +1625,31 @@ export default function (pi: ExtensionAPI) {
 			memoryContext,
 		);
 
+		// Corrections are delivered as an injected message, NOT appended to the
+		// system prompt. Appending would still move the prefix boundary, and a
+		// recurrent/hybrid model (GatedDeltaNet, Mamba) cannot rewind its state to
+		// a partial match — it reuses zero tokens and reprocesses the entire
+		// conversation, measured at 15.5k tokens / 17.8 s for one appended line.
+		// A message lands at the tail of the history, which costs nothing, and pi
+		// persists it in the session so it stays visible on later turns; that is
+		// also why the queue is drained after emitting rather than re-sent.
+		let correctionMessage: { customType: string; content: string; display: boolean } | undefined;
+		if (mode !== "refresh" && snapshotCorrections.length > 0) {
+			correctionMessage = {
+				customType: "pi-memory-correction",
+				content: [
+					"Memory corrections - these override the ## Memory block in the system prompt,",
+					"which was loaded at session start and is not re-read:",
+					...snapshotCorrections,
+				].join("\n"),
+				display: true,
+			};
+			snapshotCorrections = [];
+		}
+
 		return {
 			systemPrompt: event.systemPrompt + headerLines.join("\n"),
+			...(correctionMessage ? { message: correctionMessage } : {}),
 		};
 	});
 
@@ -2116,8 +2186,12 @@ export default function (pi: ExtensionAPI) {
 			fs.writeFileSync(filePath, result.content, "utf-8");
 			// Deleted facts must leave the injected snapshot too, whichever file
 			// they lived in — a forgotten-but-still-injected memory defeats the
-			// point of forgetting.
+			// point of forgetting. In stable mode that is done by appending a
+			// correction rather than re-rendering the block.
 			snapshotDirty = true;
+			for (const line of correctionPreview(result.removed)) {
+				noteSnapshotCorrection(`- FORGOTTEN, no longer true: ${line}${target === "daily" ? " (daily log)" : ""}`);
+			}
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
@@ -2186,6 +2260,9 @@ export default function (pi: ExtensionAPI) {
 				const separator = existing.trim() ? "\n\n" : "";
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
 				snapshotDirty = true;
+				for (const line of correctionPreview(missingEntries)) {
+					noteSnapshotCorrection(`- RESTORED, true again: ${line}`);
+				}
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 			}

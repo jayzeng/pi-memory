@@ -1912,7 +1912,29 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
 	});
 
-	test("memory_write target=long_term marks snapshot dirty so next turn refreshes", async () => {
+	test("memory_write target=long_term does NOT refresh the snapshot (cache stays warm)", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("OLD_FACT");
+
+		await tools.memory_write.execute(
+			"tc1",
+			{ target: "long_term", content: "NEW_FACT_ABOUT_X", mode: "append" },
+			null,
+			null,
+			createMockCtx(),
+		);
+
+		// The write is already in tool-call history; re-rendering the block would
+		// rewrite the prompt tail and void the whole conversation's prefix cache.
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("NEW_FACT_ABOUT_X");
+	});
+
+	test("PI_MEMORY_SNAPSHOT=refresh restores checkpoint refresh on long_term writes", async () => {
+		process.env.PI_MEMORY_SNAPSHOT = "refresh";
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
@@ -1928,8 +1950,30 @@ describe("KV cache stability: memory snapshot", () => {
 
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result2.systemPrompt).toContain("NEW_FACT_ABOUT_X");
-		// Snapshot did refresh, so previous bytes are no longer identical.
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+	});
+
+	test("memory_forget sends a correction message and leaves the systemPrompt untouched", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "WRONG_FACT_ABOUT_Z\n\nkeep me\n", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("WRONG_FACT_ABOUT_Z");
+		expect(result1.message).toBeUndefined();
+
+		await tools.memory_forget.execute("tc1", { match: "WRONG_FACT_ABOUT_Z" }, null, null, {});
+
+		// A forgotten memory must stop being authoritative — but via a message at
+		// the tail of the history, not by moving the cached prompt prefix.
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toBe(result1.systemPrompt);
+		expect(result2.message).toBeDefined();
+		expect(result2.message.customType).toBe("pi-memory-correction");
+		expect(result2.message.content).toContain("WRONG_FACT_ABOUT_Z");
+
+		// pi persists the injected message, so it is sent once and then drained.
+		const result3 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result3.systemPrompt).toBe(result1.systemPrompt);
+		expect(result3.message).toBeUndefined();
 	});
 
 	test("memory_write target=daily does NOT mark snapshot dirty (cache stays warm)", async () => {
@@ -1992,11 +2036,15 @@ describe("KV cache stability: memory snapshot", () => {
 		}
 	});
 
-	test("snapshot caveat is included in stable mode header", async () => {
+	test("stable mode header carries a caveat with no volatile timestamp", async () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "anything", "utf-8");
 		const result = await hooks.before_agent_start({ systemPrompt: "base" }, {});
-		// Reader-facing hint that ambient context may lag behind disk.
-		expect(result.systemPrompt.toLowerCase()).toContain("snapshot");
+		// Reader-facing hint that ambient context may lag behind disk...
+		expect(result.systemPrompt).toContain("not re-read since");
+		expect(result.systemPrompt).toContain("memory_search");
+		// ...but no clock and no reason word: either would change the bytes
+		// between turns without the memory itself changing.
+		expect(result.systemPrompt).not.toMatch(/\d{2}:\d{2}:\d{2}/);
 	});
 });
 
