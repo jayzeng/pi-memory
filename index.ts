@@ -2448,21 +2448,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /pi-dream command: quick health check without touching files ---
+	// --- /pi-dream command: drives the agent to run the memory_dream tool ---
 	pi.registerCommand("pi-dream", {
-		description: "Check MEMORY.md for duplicates/superseded entries (read-only report)",
-		handler: async (_args, ctx) => {
+		description: "Memory consolidation: /pi-dream [report|apply] (default: report)",
+		handler: async (args, ctx) => {
+			const mode = (args ?? "").trim().toLowerCase();
 			const existing = readFileSafe(MEMORY_FILE);
 			if (!existing?.trim()) {
 				ctx.ui.notify("pi-dream: memory is empty — nothing to consolidate.", "info");
 				return;
 			}
-			const analysis = dreamAnalyze(existing);
-			const removable = dreamDropIndices(analysis).length;
-			ctx.ui.notify(
-				`pi-dream: ${analysis.blocks.length} entries, ${analysis.duplicateGroups.length} duplicate group(s), ` +
-					`${analysis.superseded.length} superseded → ${removable} removable. Ask the agent to run memory_dream (mode='apply') to consolidate.`,
-				removable > 0 ? "warning" : "info",
+			if (mode !== "" && mode !== "report" && mode !== "apply") {
+				ctx.ui.notify("pi-dream: unknown argument. Usage: /pi-dream [report|apply]", "warning");
+				return;
+			}
+			const effective = mode === "" ? "report" : mode;
+			pi.sendUserMessage(
+				effective === "apply"
+					? "Run the memory_dream tool with mode='apply' to consolidate MEMORY.md. Show me what was removed and the recovery ID."
+					: "Run the memory_dream tool in report mode and show me the full findings for MEMORY.md — duplicate groups and superseded entries with previews. Do not modify anything.",
 			);
 		},
 	});
