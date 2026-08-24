@@ -467,7 +467,7 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		const response = await complete(
 			model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: "low" },
+			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
 		);
 
 		const summaryText = response.content
@@ -535,6 +535,25 @@ const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 10_000;
 export function getExitSummaryTimeoutMs(): number {
 	const configured = Number(process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS);
 	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_EXIT_SUMMARY_TIMEOUT_MS;
+}
+
+const DEFAULT_EXIT_SUMMARY_REASONING_EFFORT = "low";
+
+/**
+ * Reasoning effort passed to the exit-summary LLM call. Defaults to "low".
+ *
+ * Some providers reject certain efforts — e.g. Baseten's GLM-5.2 only accepts
+ * "high"/"max"/"none" and returns HTTP 400 for "low", silently breaking exit
+ * summaries (the error is caught, summary is null, nothing is persisted).
+ * Override with PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT to a value the
+ * configured PI_MEMORY_EXIT_SUMMARY_MODEL accepts. Set to "off" to omit the
+ * parameter entirely and let the provider apply its own default.
+ */
+export function getExitSummaryReasoningEffort(): string | undefined {
+	const value = (process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT ?? "").trim().toLowerCase();
+	if (value === "off") return undefined;
+	if (value === "") return DEFAULT_EXIT_SUMMARY_REASONING_EFFORT;
+	return value;
 }
 
 export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
@@ -2412,6 +2431,7 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
+				`- PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT: ${getExitSummaryReasoningEffort() ?? "off"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS: ${getExitSummaryTimeoutMs()}`,
 			);
 
