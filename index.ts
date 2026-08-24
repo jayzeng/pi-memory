@@ -724,6 +724,187 @@ export function forgetBlocks(content: string, match: string): { content: string;
 	};
 }
 
+// ---------------------------------------------------------------------------
+// pi-dream: memory consolidation analysis
+// ---------------------------------------------------------------------------
+
+export interface DreamBlock {
+	/** Timestamp meta comment line ("" for unstamped paragraph blocks). */
+	meta: string;
+	body: string;
+	timestamp: Date | null;
+}
+
+export interface DreamAnalysisOptions {
+	/** Jaccard similarity at/below which two entries are considered duplicates. Default 0.75. */
+	duplicateSimilarity?: number;
+	/** Jaccard similarity at which an older entry counts as superseded by a newer one. Default 0.6. */
+	supersedeSimilarity?: number;
+	/** Minimum age gap in days between a superseded entry and its newer replacement. Default 7. */
+	supersedeMinAgeDays?: number;
+}
+
+export interface DreamAnalysis {
+	blocks: DreamBlock[];
+	/** Groups of block indices (length > 1) whose text is near-identical. */
+	duplicateGroups: number[][];
+	/** Pairs where the older entry is considered superseded by the newer one. */
+	superseded: Array<{ olderIndex: number; newerIndex: number }>;
+}
+
+const DREAM_TIMESTAMP_REGEX =
+	/^<!-- (?:(?:last updated: )?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})|HANDOFF (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})) /;
+
+/** Parse MEMORY.md content into stamped/unstamped blocks (same unit as forgetBlocks removes). */
+export function parseMemoryBlocks(content: string): DreamBlock[] {
+	const normalized = content.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
+	const rawBlocks: string[] = [];
+	let currentLines: string[] = [];
+	let currentIsStamped = false;
+	const flushCurrent = () => {
+		const current = currentLines.join("\n").trim();
+		if (!current) return;
+		if (currentIsStamped) {
+			rawBlocks.push(current);
+		} else {
+			rawBlocks.push(
+				...current
+					.split(/\n{2,}/)
+					.map((block) => block.trim())
+					.filter(Boolean),
+			);
+		}
+	};
+	for (const line of normalized.split("\n")) {
+		if (MEMORY_ENTRY_META_COMMENT_REGEX.test(line)) {
+			flushCurrent();
+			currentLines = [line];
+			currentIsStamped = true;
+		} else {
+			currentLines.push(line);
+		}
+	}
+	flushCurrent();
+
+	return rawBlocks.map((raw) => {
+		const lines = raw.split("\n");
+		const first = lines[0] ?? "";
+		if (MEMORY_ENTRY_META_COMMENT_REGEX.test(first)) {
+			const match = DREAM_TIMESTAMP_REGEX.exec(first);
+			const ts = match ? (match[1] ?? match[2]) : undefined;
+			return {
+				meta: first,
+				body: lines.slice(1).join("\n").trim() || raw,
+				timestamp: ts ? new Date(ts.replace(" ", "T")) : null,
+			};
+		}
+		return { meta: "", body: raw, timestamp: null };
+	});
+}
+
+function dreamTokenSet(text: string): Set<string> {
+	const tokens = text
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter((word) => word.length >= 3);
+	return new Set(tokens);
+}
+
+/** Jaccard similarity over lowercase word tokens (words < 3 chars ignored). */
+export function dreamSimilarity(a: string, b: string): number {
+	const setA = dreamTokenSet(a);
+	const setB = dreamTokenSet(b);
+	if (setA.size === 0 && setB.size === 0) return 1;
+	let intersection = 0;
+	for (const token of setA) {
+		if (setB.has(token)) intersection++;
+	}
+	const union = setA.size + setB.size - intersection;
+	return union === 0 ? 0 : intersection / union;
+}
+
+function dreamDaysBetween(a: Date, b: Date): number {
+	return Math.abs(a.getTime() - b.getTime()) / 86_400_000;
+}
+
+/** Analyze MEMORY.md content for duplicate groups and superseded older entries. */
+export function dreamAnalyze(content: string, opts: DreamAnalysisOptions = {}): DreamAnalysis {
+	const duplicateThreshold = opts.duplicateSimilarity ?? 0.75;
+	const supersedeThreshold = opts.supersedeSimilarity ?? 0.6;
+	const supersedeMinAgeDays = opts.supersedeMinAgeDays ?? 7;
+	const blocks = parseMemoryBlocks(content);
+	const n = blocks.length;
+
+	// Union-find over near-identical pairs.
+	const parent = Array.from({ length: n }, (_, i) => i);
+	const find = (i: number): number => {
+		if (parent[i] !== i) parent[i] = find(parent[i]);
+		return parent[i];
+	};
+	const unionPair = (i: number, j: number) => {
+		parent[find(i)] = find(j);
+	};
+	const superseded: Array<{ olderIndex: number; newerIndex: number }> = [];
+	for (let i = 0; i < n; i++) {
+		for (let j = i + 1; j < n; j++) {
+			const sim = dreamSimilarity(blocks[i].body, blocks[j].body);
+			if (sim >= duplicateThreshold) {
+				unionPair(i, j);
+				continue;
+			}
+			const ti = blocks[i].timestamp;
+			const tj = blocks[j].timestamp;
+			if (sim >= supersedeThreshold && ti && tj) {
+				if (dreamDaysBetween(ti, tj) >= supersedeMinAgeDays) {
+					const olderIsFirst = ti <= tj;
+					superseded.push(olderIsFirst ? { olderIndex: i, newerIndex: j } : { olderIndex: j, newerIndex: i });
+				}
+			}
+		}
+	}
+
+	const groupMap = new Map<number, number[]>();
+	for (let i = 0; i < n; i++) {
+		const root = find(i);
+		const group = groupMap.get(root);
+		if (group) group.push(i);
+		else groupMap.set(root, [i]);
+	}
+	const duplicateGroups = [...groupMap.values()].filter((group) => group.length > 1);
+	return { blocks, duplicateGroups, superseded };
+}
+
+/** Compute which block indices pi-dream would remove: older members of duplicate groups plus superseded entries. */
+export function dreamDropIndices(analysis: DreamAnalysis): number[] {
+	const drops = new Set<number>();
+	for (const group of analysis.duplicateGroups) {
+		// Keep the newest member (largest index = latest position); drop earlier copies.
+		const sorted = [...group].sort((a, b) => a - b);
+		for (const index of sorted.slice(0, -1)) drops.add(index);
+	}
+	for (const pair of analysis.superseded) drops.add(pair.olderIndex);
+	return [...drops].sort((a, b) => a - b);
+}
+
+/** Apply consolidation to content: returns surviving content plus complete removed blocks. */
+export function dreamApply(
+	content: string,
+	opts: DreamAnalysisOptions = {},
+): { keptContent: string; removed: string[] } {
+	const newline = content.includes("\r\n") ? "\r\n" : "\n";
+	const analysis = dreamAnalyze(content, opts);
+	const drops = dreamDropIndices(analysis);
+	if (drops.length === 0) return { keptContent: content, removed: [] };
+	const removed: string[] = [];
+	const kept: string[] = [];
+	analysis.blocks.forEach((block, index) => {
+		const raw = block.meta ? `${block.meta}\n${block.body}` : block.body;
+		if (drops.includes(index)) removed.push(raw.replace(/\n/g, newline));
+		else kept.push(raw.replace(/\n/g, newline));
+	});
+	return { keptContent: kept.length ? `${kept.join("\n\n")}\n` : "", removed };
+}
+
 function recoveryPath(recoveryId: string): string | null {
 	if (!RECOVERY_ID_REGEX.test(recoveryId)) return null;
 	return path.join(RECOVERY_DIR, `${recoveryId}.json`);
@@ -2146,6 +2327,143 @@ export default function (pi: ExtensionAPI) {
 					removedPreview,
 				},
 			};
+		},
+	});
+
+	// --- memory_dream (pi-dream) tool ---
+	pi.registerTool({
+		name: "memory_dream",
+		label: "Memory Dream",
+		description: [
+			"Consolidate long-term memory (MEMORY.md): detect near-duplicate entries and older entries",
+			"superseded by newer ones about the same topic. mode='report' (default) analyzes only and",
+			"returns findings; mode='apply' removes redundant older entries via the standard recovery-record",
+			"pipeline (undo with memory_restore). Run this when MEMORY.md has grown bloated or contradictory",
+			"after many sessions.",
+		].join("\n"),
+		parameters: Type.Object({
+			mode: Type.Optional(
+				StringEnum(["report", "apply"] as const, {
+					description: "'report' (default) analyzes without changing files; 'apply' removes redundant entries",
+				}),
+			),
+			duplicateSimilarity: Type.Optional(
+				Type.Number({ description: "Jaccard threshold for duplicates (0-1, default 0.75)" }),
+			),
+			supersedeSimilarity: Type.Optional(
+				Type.Number({ description: "Jaccard threshold for superseded entries (0-1, default 0.6)" }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			ensureDirs();
+			const existing = readFileSafe(MEMORY_FILE);
+			if (!existing?.trim()) {
+				return {
+					content: [{ type: "text", text: `Nothing stored in ${MEMORY_FILE} — nothing to dream about.` }],
+					details: { path: MEMORY_FILE, removed: 0 },
+				};
+			}
+			const opts: DreamAnalysisOptions = {};
+			if (params.duplicateSimilarity !== undefined) opts.duplicateSimilarity = params.duplicateSimilarity;
+			if (params.supersedeSimilarity !== undefined) opts.supersedeSimilarity = params.supersedeSimilarity;
+
+			const analysis = dreamAnalyze(existing, opts);
+			const dropCount = dreamDropIndices(analysis).length;
+			if (dropCount === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `pi-dream: no duplicates or superseded entries found in ${MEMORY_FILE} (${analysis.blocks.length} entries analyzed). Memory looks healthy.`,
+						},
+					],
+					details: { path: MEMORY_FILE, analyzed: analysis.blocks.length, removed: 0 },
+				};
+			}
+
+			const previewBlock = (index: number): string => {
+				const block = analysis.blocks[index];
+				const raw = block.meta ? `${block.meta}\n${block.body}` : block.body;
+				const preview = buildPreview(raw, { maxLines: 4, maxChars: 300, mode: "start" });
+				return preview.preview;
+			};
+			const findings: string[] = [];
+			for (const group of analysis.duplicateGroups) {
+				findings.push(`Duplicate group (keeping newest #${Math.max(...group)}):`);
+				for (const index of group) findings.push(`  [#${index}] ${previewBlock(index)}`);
+			}
+			for (const pair of analysis.superseded) {
+				findings.push(`Superseded: [#${pair.olderIndex}] replaced by newer [#${pair.newerIndex}]:`);
+				findings.push(`  [#${pair.olderIndex}] ${previewBlock(pair.olderIndex)}`);
+			}
+			const findingsText = findings.join("\n");
+
+			if ((params.mode ?? "report") === "report") {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`pi-dream report for ${MEMORY_FILE}: ${dropCount} of ${analysis.blocks.length} entries are removable ` +
+								`(${analysis.duplicateGroups.length} duplicate group(s), ${analysis.superseded.length} superseded).\n\n` +
+								`${findingsText}\n\n` +
+								`Review the findings, then re-run with mode='apply' to remove them (recovery record included).`,
+						},
+					],
+					details: {
+						path: MEMORY_FILE,
+						analyzed: analysis.blocks.length,
+						removable: dropCount,
+						duplicateGroups: analysis.duplicateGroups.length,
+						superseded: analysis.superseded.length,
+					},
+				};
+			}
+
+			const applied = dreamApply(existing, opts);
+			const recovery = writeRecoveryRecord("long_term", undefined, applied.removed);
+			fs.writeFileSync(MEMORY_FILE, applied.keptContent, "utf-8");
+			snapshotDirty = true;
+			await ensureQmdAvailableForUpdate();
+			scheduleQmdUpdate();
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`pi-dream: consolidated ${MEMORY_FILE}. Removed ${applied.removed.length} redundant entr${applied.removed.length === 1 ? "y" : "ies"} ` +
+							`(was ${analysis.blocks.length}, now ${analysis.blocks.length - applied.removed.length}). ` +
+							`Recovery ID: ${recovery.id}. To undo this consolidation, call memory_restore with that ID.\n\n` +
+							`Removed:\n${findingsText}`,
+					},
+				],
+				details: {
+					path: MEMORY_FILE,
+					analyzed: analysis.blocks.length,
+					removed: applied.removed.length,
+					recoveryId: recovery.id,
+					recoveryPath: recoveryPath(recovery.id),
+				},
+			};
+		},
+	});
+
+	// --- /pi-dream command: quick health check without touching files ---
+	pi.registerCommand("pi-dream", {
+		description: "Check MEMORY.md for duplicates/superseded entries (read-only report)",
+		handler: async (_args, ctx) => {
+			const existing = readFileSafe(MEMORY_FILE);
+			if (!existing?.trim()) {
+				ctx.ui.notify("pi-dream: memory is empty — nothing to consolidate.", "info");
+				return;
+			}
+			const analysis = dreamAnalyze(existing);
+			const removable = dreamDropIndices(analysis).length;
+			ctx.ui.notify(
+				`pi-dream: ${analysis.blocks.length} entries, ${analysis.duplicateGroups.length} duplicate group(s), ` +
+					`${analysis.superseded.length} superseded → ${removable} removable. Ask the agent to run memory_dream (mode='apply') to consolidate.`,
+				removable > 0 ? "warning" : "info",
+			);
 		},
 	});
 
