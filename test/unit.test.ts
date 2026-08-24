@@ -28,6 +28,10 @@ import {
 	buildQmdSpawn,
 	clampSearchLimit,
 	dailyPath,
+	dreamAnalyze,
+	dreamApply,
+	dreamDropIndices,
+	dreamSimilarity,
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
@@ -36,6 +40,7 @@ import {
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
+	parseMemoryBlocks,
 	parseScratchpad,
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
@@ -84,6 +89,7 @@ function createMockPi() {
 		on(event: string, handler: (...args: unknown[]) => unknown) {
 			hooks[event] = handler;
 		},
+		registerCommand(_name: string, _def: unknown) {},
 	};
 
 	return { pi, tools, hooks };
@@ -2005,10 +2011,10 @@ describe("KV cache stability: memory snapshot", () => {
 // ==========================================================================
 
 describe("extension registration", () => {
-	test("registers all 7 tools", () => {
+	test("registers all 8 tools", () => {
 		const mockPi = createMockPi();
 		registerExtension(mockPi.pi as any);
-		expect(Object.keys(mockPi.tools)).toHaveLength(7);
+		expect(Object.keys(mockPi.tools)).toHaveLength(8);
 		expect(mockPi.tools.memory_write).toBeDefined();
 		expect(mockPi.tools.memory_forget).toBeDefined();
 		expect(mockPi.tools.memory_restore).toBeDefined();
@@ -2396,5 +2402,144 @@ describe("memory_forget tool", () => {
 			{},
 		);
 		expect(secondRestore.content[0].text).toContain("already restored");
+	});
+});
+
+describe("pi-dream consolidation", () => {
+	const stamp = (iso: string, session = "test-session") => `<!-- ${iso} [${session}] -->`;
+
+	test("parseMemoryBlocks splits stamped entries and unstamped paragraphs", () => {
+		const content = [
+			"# Heading",
+			"",
+			stamp("2026-01-01 10:00:00"),
+			"first entry body",
+			"",
+			stamp("2026-02-01 10:00:00"),
+			"second entry body line one",
+			"second entry body line two",
+			"",
+			"unstamped paragraph one",
+			"",
+			"unstamped paragraph two",
+		].join("\n");
+		const blocks = parseMemoryBlocks(content);
+		expect(blocks.length).toBe(3); // "# Heading" + 2 stamped entries (trailing unstamped lines belong to last entry)
+		expect(blocks[1].meta).toContain("2026-01-01");
+		expect(blocks[2].body).toContain("second entry body line two");
+		expect(blocks[blocks.length - 1].body).toContain("unstamped paragraph two");
+	});
+
+	test("dreamSimilarity is high for near-duplicates and low for unrelated text", () => {
+		const a = "User prefers bun test over vitest for the memory package";
+		const b = "user prefers bun test over vitest for the memory package!";
+		const c = "Deploy pipeline runs on Fridays via GitHub Actions";
+		expect(dreamSimilarity(a, b)).toBeGreaterThan(0.9);
+		expect(dreamSimilarity(a, c)).toBeLessThan(0.2);
+	});
+
+	test("dreamAnalyze groups near-identical entries as duplicates", () => {
+		const body = "API key rotation happens monthly using rotate-keys script";
+		const content = [
+			stamp("2026-01-01 10:00:00"),
+			body,
+			"",
+			stamp("2026-03-01 10:00:00"),
+			`${body} (unchanged)`,
+		].join("\n");
+		const analysis = dreamAnalyze(content);
+		expect(analysis.duplicateGroups.length).toBe(1);
+		expect(dreamDropIndices(analysis)).toEqual([0]); // older copy dropped
+	});
+
+	test("dreamAnalyze flags older entries superseded by newer ones", () => {
+		const content = [
+			stamp("2026-01-01 10:00:00"),
+			"deployment target is staging.example.com with manual approval step before release",
+			"",
+			stamp("2026-06-01 10:00:00"),
+			"deployment target is staging.example.com with automated approval gate before release",
+		].join("\n");
+		const analysis = dreamAnalyze(content);
+		expect(analysis.duplicateGroups.length).toBe(0);
+		expect(analysis.superseded).toEqual([{ olderIndex: 0, newerIndex: 1 }]);
+	});
+
+	test("supersede detection requires minimum age gap", () => {
+		const content = [
+			stamp("2026-06-01 10:00:00"),
+			"database host is db-primary.internal port 5432 with connection pool of twenty",
+			"",
+			stamp("2026-06-03 10:00:00"),
+			"database host is db-replica.internal port 5432 with connection pool of twenty",
+		].join("\n");
+		const analysis = dreamAnalyze(content, { supersedeSimilarity: 0.5 });
+		// Only 2 days apart — below default min age gap; also below duplicate threshold.
+		expect(analysis.superseded.length).toBe(0);
+	});
+
+	test("dreamApply removes older copies, keeps newest, returns full removed blocks", () => {
+		const body = "release checklist lives in docs/release.md and is updated quarterly";
+		const content = [stamp("2026-01-01 10:00:00"), body, "", stamp("2026-05-01 10:00:00"), body].join("\n");
+		const result = dreamApply(content);
+		expect(result.removed.length).toBe(1);
+		expect(result.removed[0]).toContain("2026-01-01");
+		expect(result.keptContent).toContain("2026-05-01");
+		expect(result.keptContent).not.toContain("2026-01-01");
+	});
+
+	let dreamTools: Record<string, any>;
+
+	beforeEach(() => {
+		setupTmpDir();
+		const mockPi = createMockPi();
+		dreamTools = mockPi.tools;
+		registerExtension(mockPi.pi as any);
+	});
+
+	test("memory_dream registers with correct name", () => {
+		expect(dreamTools.memory_dream).toBeDefined();
+	});
+
+	test("memory_dream report mode leaves file untouched", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "MEMORY.md"),
+			`${stamp("2026-01-01 10:00:00")}\ndup body shared words here\n\n${stamp("2026-02-01 10:00:00")}\ndup body shared words here\n`,
+			"utf-8",
+		);
+		const result = await dreamTools.memory_dream.execute("c1", { mode: "report" }, null, null, {});
+		expect(result.content[0].text).toContain("pi-dream report");
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toContain("dup body shared words"); // unchanged
+	});
+
+	test("memory_dream apply mode removes duplicates with recovery id", async () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "MEMORY.md"),
+			`${stamp("2026-01-01 10:00:00")}\ndup body shared words here\n\n${stamp("2026-02-01 10:00:00")}\ndup body shared words here\n`,
+			"utf-8",
+		);
+		const result = await dreamTools.memory_dream.execute("c1", { mode: "apply" }, null, null, {});
+		expect(result.content[0].text).toContain("Removed 1 redundant entry");
+		expect(result.details.recoveryId).toBeDefined();
+		const remaining = fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8");
+		expect(remaining).toContain("2026-02-01");
+		expect(remaining).not.toContain("2026-01-01");
+
+		// Recovery record must restore the removed entry.
+		const restored = await dreamTools.memory_restore.execute(
+			"c2",
+			{ recoveryId: result.details.recoveryId },
+			null,
+			null,
+			{},
+		);
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toContain("2026-01-01");
+		void restored;
+	});
+
+	test("memory_dream reports healthy memory when nothing removable", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "one unique fact about bun test runner config\n", "utf-8");
+		const result = await dreamTools.memory_dream.execute("c1", {}, null, null, {});
+		expect(result.content[0].text).toContain("Memory looks healthy");
 	});
 });
