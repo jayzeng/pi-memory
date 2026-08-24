@@ -2450,7 +2450,8 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /pi-dream command: drives the agent to run the memory_dream tool ---
 	pi.registerCommand("pi-dream", {
-		description: "Memory consolidation: /pi-dream [report|apply] (default: report)",
+		description:
+			"Memory consolidation: /pi-dream [auto|report|apply] (default auto: applies pure duplicates, asks about superseded)",
 		handler: async (args, ctx) => {
 			const mode = (args ?? "").trim().toLowerCase();
 			const existing = readFileSafe(MEMORY_FILE);
@@ -2458,15 +2459,17 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("pi-dream: memory is empty — nothing to consolidate.", "info");
 				return;
 			}
-			if (mode !== "" && mode !== "report" && mode !== "apply") {
+			if (mode !== "" && mode !== "report" && mode !== "apply" && mode !== "auto") {
 				ctx.ui.notify("pi-dream: unknown argument. Usage: /pi-dream [report|apply]", "warning");
 				return;
 			}
-			const effective = mode === "" ? "report" : mode;
+			const effective = mode === "" ? "auto" : mode;
 			pi.sendUserMessage(
 				effective === "apply"
 					? "Run the memory_dream tool with mode='apply' to consolidate MEMORY.md. Show me what was removed and the recovery ID."
-					: "Run the memory_dream tool in report mode and show me the full findings for MEMORY.md — duplicate groups and superseded entries with previews. Do not modify anything.",
+					: effective === "auto"
+						? "Run the memory_dream tool in report mode on MEMORY.md. If ALL removable entries are near-duplicates of kept newer versions (zero unique content would be lost), immediately re-run with mode='apply' and show me what was removed plus the recovery ID. If any finding involves superseded entries where older content differs meaningfully from its newer replacement, do NOT apply — present those findings and ask me first."
+						: "Run the memory_dream tool in report mode and show me the full findings for MEMORY.md — duplicate groups and superseded entries with previews. Do not modify anything.",
 			);
 		},
 	});
