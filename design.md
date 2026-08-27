@@ -48,9 +48,10 @@ Three principles guided the design:
 
 **1. Files are the index.**
 No separate metadata store, no extraction pipeline, no sync to keep in
-agreement. Memory lives in `~/.pi/agent/memory/` as markdown files. qmd
-(a full-text + vector search tool) indexes them directly. `git diff` shows
-what changed. `cat` shows what's stored.
+agreement. User-wide memory lives in `~/.pi/agent/memory/`; repository memory
+lives in `.pi/agent/memory/` at the repository root. qmd (a full-text + vector
+search tool) indexes both scopes directly. `git diff` shows repository-memory
+changes. `cat` shows what's stored in either scope.
 
 **2. Injection should be selective, not exhaustive.**
 The previous design injected ALL of MEMORY.md every turn, truncating from
@@ -79,11 +80,10 @@ falls back to the previous behavior. No feature is critical-path.
                           |     - format top 3 results
                           |                          |
                           |  2. buildMemoryContext(searchResults)
-                          |     - read scratchpad    |
-                          |     - read today's daily |
+                          |     - read repo + user scratchpads
+                          |     - read repo + user daily logs
                           |     - include search results
-                          |     - read MEMORY.md     |
-                          |     - read yesterday's daily
+                          |     - read repo + user MEMORY.md
                           |     - truncate to 16K    |
                           |                          |
                           |  3. Append to system prompt
@@ -109,24 +109,21 @@ falls back to the previous behavior. No feature is critical-path.
 
 ### Injection Priority
 
-Context budget is 16K chars. Sections are built in priority order; when the total
-exceeds the budget, content is trimmed from the end (yesterday goes first):
+Context budget is 16K chars. Each file type keeps its existing per-section cap,
+but repository sections precede user-wide sections:
 
-```
-  Priority    Section                      Budget    Truncation
-  --------    -------                      ------    ----------
-  1 (high)    Open scratchpad items        2.0K      from start
-  2           Today's daily log            3.0K      from end (tail)
-  3           qmd search results           2.5K      from start
-  4           MEMORY.md (long-term)        4.0K      from middle
-  5 (low)     Yesterday's daily log        3.0K      from end (tail)
-                                          ------
-                                          14.5K (individual caps)
-                                          16.0K (total cap)
+```text
+  Priority    Section                              Budget    Truncation
+  --------    -------                              ------    ----------
+  1 (high)    Repository, then user scratchpad     2.0K each from start
+  2           Repository, then user today's log    3.0K each from end (tail)
+  3           qmd search results                   2.5K      from start
+  4           Repository, then user MEMORY.md      4.0K each from middle
+  5 (low)     Repository, then user yesterday      3.0K each from end (tail)
 ```
 
-The gap between individual caps (14.5K) and total cap (16K) provides headroom
-for section headers and separator lines.
+The 16K total cap remains authoritative when the per-section caps add up to more
+than the available context.
 
 ### Why This Order
 
@@ -147,7 +144,8 @@ the oldest context and most likely to be stale.
          |
          +-- sanitize: strip control chars, limit to 200 chars
          +-- check: qmd available? collection exists?
-         +-- qmd search "what database should we use?" -n 3 -c pi-memory
+         +-- qmd search "what database should we use?" -n 3
+         |     -c pi-memory -c pi-memory-repo-<hash>
          +-- timeout: 3 seconds (Promise.race)
          +-- format: markdown snippets with file paths
          |
@@ -220,21 +218,21 @@ commands. Now:
        |     no  --> show install instructions, stop
        |     yes --> continue
        |
-       +-- checkCollection("pi-memory") — does collection exist?
-       |     yes --> done
-       |     no  --> setupQmdCollection()
-       |               |
-       |               +-- qmd collection add ~/.pi/agent/memory --name pi-memory
-       |               +-- qmd context add /daily "Daily work logs" -c pi-memory
-       |               +-- qmd context add / "Long-term memory" -c pi-memory
-       |               |
-       |               +-- any step fails? log and continue (not critical)
+       +-- ensure user collection `pi-memory`
+       |     +-- qmd collection add ~/.pi/agent/memory --name pi-memory
+       |
+       +-- repository memory exists?
+       |     no  --> skip repository setup
+       |     yes --> ensure `pi-memory-repo-<path-hash>` for .pi/agent/memory
+       |
+       +-- add /daily and / path contexts to each collection (best effort)
        |
        done
 ```
 
-The same auto-setup runs inside the `memory_search` tool if the collection is
-missing at search time, covering the case where qmd was installed mid-session.
+The same auto-setup runs inside `memory_search`. Searches use repeated `-c`
+arguments to search user and repository collections together, while explicit
+scope arguments can restrict the search.
 
 ## What We Chose Not to Build
 
@@ -249,9 +247,10 @@ relationship modeling, and query translation — all failure-prone. Wiki-links l
 `[[database-choice]]` achieve cross-referencing through content, searchable
 without any graph infrastructure.
 
-**No multiple collections.** One qmd collection with path contexts (`/daily` vs
-`/`) is sufficient. Splitting into per-topic collections would require routing
-logic to decide which collection to search.
+**No per-topic collections.** qmd uses one user-wide collection and one
+collection for each repository that has memory. This split enforces storage
+scope without adding topic-routing logic; `/daily` and `/` path contexts still
+distinguish daily logs from long-term memory within each collection.
 
 **No semantic search for injection.** Keyword search (BM25) runs in ~30ms.
 Semantic search (vector) takes ~2s. For injection that runs every turn, latency
@@ -419,5 +418,5 @@ complex architectures — at least for retrieval tasks. Our testing verifies the
 mechanics work. The open question is whether selective injection meaningfully
 improves recall in practice, and the eval infrastructure exists to answer it.
 
-Total implementation: ~1,100 lines of TypeScript in a single file. Zero
-dependencies beyond the pi runtime and optional qmd.
+The implementation remains a single TypeScript file with no runtime dependencies
+beyond pi and optional qmd.

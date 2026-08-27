@@ -5,7 +5,7 @@
  * Core memory tools (write/read/scratchpad) work without qmd installed.
  * The memory_search tool requires qmd for keyword, semantic, and hybrid search.
  *
- * Layout (under ~/.pi/agent/memory/):
+ * Layout (under user-wide ~/.pi/agent/memory/ and repository .pi/agent/memory/):
  *   MEMORY.md              — curated long-term memory (decisions, preferences, durable facts)
  *   SCRATCHPAD.md           — checklist of things to keep in mind / fix later
  *   daily/YYYY-MM-DD.md    — daily append-only log (today + yesterday loaded at session start)
@@ -24,12 +24,13 @@
  */
 
 import { type ExecFileOptions, execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import {
+	CONFIG_DIR_NAME,
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -54,7 +55,76 @@ export function resolveMemoryDir(env: MemoryEnv = process.env): string {
 		env.USERPROFILE ??
 		(env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : undefined) ??
 		"~";
-	return path.join(home, ".pi", "agent", "memory");
+	return path.join(home, CONFIG_DIR_NAME, "agent", "memory");
+}
+
+export type MemoryScope = "user" | "repo";
+type MemorySearchScope = MemoryScope | "all";
+
+interface MemoryPaths {
+	scope: MemoryScope;
+	dir: string;
+	memoryFile: string;
+	scratchpadFile: string;
+	dailyDir: string;
+	recoveryDir: string;
+	collectionName: string;
+}
+
+function memoryPaths(scope: MemoryScope, dir: string, collectionName: string): MemoryPaths {
+	return {
+		scope,
+		dir,
+		memoryFile: path.join(dir, "MEMORY.md"),
+		scratchpadFile: path.join(dir, "SCRATCHPAD.md"),
+		dailyDir: path.join(dir, "daily"),
+		recoveryDir: path.join(dir, "recovery"),
+		collectionName,
+	};
+}
+
+/** Resolve the nearest git repository root, or use cwd for non-git projects. */
+export function resolveRepositoryRoot(cwd: string): string {
+	const start = path.resolve(cwd);
+	let current = start;
+	while (true) {
+		if (fs.existsSync(path.join(current, ".git"))) return current;
+		const parent = path.dirname(current);
+		if (parent === current) return start;
+		current = parent;
+	}
+}
+
+/** Stable qmd collection name for one repository. */
+export function repoCollectionName(repoRoot: string): string {
+	const digest = createHash("sha256").update(path.resolve(repoRoot)).digest("hex").slice(0, 12);
+	return `pi-memory-repo-${digest}`;
+}
+
+/** Resolve .pi/agent/memory under the nearest repository root. */
+export function resolveRepoMemoryDir(cwd: string): string {
+	return path.join(resolveRepositoryRoot(cwd), CONFIG_DIR_NAME, "agent", "memory");
+}
+
+const USER_SCOPE_PATTERNS = [
+	/\bglobally\b/i,
+	/\buser[- ](?:wide|level)\b/i,
+	/\buser memory\b/i,
+	/\bacross\s+(?:all\s+)?(?:repos?|repositories|projects?|codebases)\b/i,
+	/\b(?:all|every)\s+(?:repos?|repositories|projects?|codebases)\b/i,
+];
+const REPO_SCOPE_PATTERNS = [
+	/\b(?:this|current|the current)\s+(?:repos?|repository|projects?|codebase)\b/i,
+	/\b(?:repos?|repository|project|codebase)[ -]specific\b/i,
+	/\b(?:repo|repository|project) memory\b/i,
+	/\b(?:only|locally)\s+(?:in|for|to)\s+(?:this|the current)\s+(?:repo|repository|project|codebase)\b/i,
+];
+
+/** Infer an explicitly requested memory scope from natural-language clues. */
+export function inferMemoryScope(prompt: string): MemoryScope | null {
+	if (USER_SCOPE_PATTERNS.some((pattern) => pattern.test(prompt))) return "user";
+	if (REPO_SCOPE_PATTERNS.some((pattern) => pattern.test(prompt))) return "repo";
+	return null;
 }
 
 let MEMORY_DIR = resolveMemoryDir();
@@ -77,14 +147,35 @@ export function _resetBaseDir() {
 	_setBaseDir(resolveMemoryDir());
 }
 
+function getUserMemoryPaths(): MemoryPaths {
+	return {
+		scope: "user",
+		dir: MEMORY_DIR,
+		memoryFile: MEMORY_FILE,
+		scratchpadFile: SCRATCHPAD_FILE,
+		dailyDir: DAILY_DIR,
+		recoveryDir: RECOVERY_DIR,
+		collectionName: "pi-memory",
+	};
+}
+
+function getRepoMemoryPaths(cwd: string): MemoryPaths {
+	const repoRoot = resolveRepositoryRoot(cwd);
+	return memoryPaths("repo", path.join(repoRoot, CONFIG_DIR_NAME, "agent", "memory"), repoCollectionName(repoRoot));
+}
+
+function ensureMemoryDirs(paths: MemoryPaths) {
+	fs.mkdirSync(paths.dir, { recursive: true });
+	fs.mkdirSync(paths.dailyDir, { recursive: true });
+	fs.mkdirSync(paths.recoveryDir, { recursive: true });
+}
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
 export function ensureDirs() {
-	fs.mkdirSync(MEMORY_DIR, { recursive: true });
-	fs.mkdirSync(DAILY_DIR, { recursive: true });
-	fs.mkdirSync(RECOVERY_DIR, { recursive: true });
+	ensureMemoryDirs(getUserMemoryPaths());
 }
 
 // Daily logs are keyed by the user's LOCAL calendar day. toISOString() is UTC,
@@ -134,11 +225,15 @@ export function isValidDailyDate(date: string): boolean {
 	return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
 }
 
-export function dailyPath(date: string): string {
+function dailyPathFor(paths: MemoryPaths, date: string): string {
 	if (!isValidDailyDate(date)) {
 		throw new Error(`Invalid daily date: ${date}. Expected YYYY-MM-DD.`);
 	}
-	return path.join(DAILY_DIR, `${date}.md`);
+	return path.join(paths.dailyDir, `${date}.md`);
+}
+
+export function dailyPath(date: string): string {
+	return dailyPathFor(getUserMemoryPaths(), date);
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +705,7 @@ interface RecoveryRecord {
 	version: 1;
 	id: string;
 	createdAt: string;
+	scope?: MemoryScope;
 	target: MemoryTarget;
 	date?: string;
 	removedContent: string[];
@@ -724,9 +820,9 @@ export function forgetBlocks(content: string, match: string): { content: string;
 	};
 }
 
-function recoveryPath(recoveryId: string): string | null {
+function recoveryPathFor(paths: MemoryPaths, recoveryId: string): string | null {
 	if (!RECOVERY_ID_REGEX.test(recoveryId)) return null;
-	return path.join(RECOVERY_DIR, `${recoveryId}.json`);
+	return path.join(paths.recoveryDir, `${recoveryId}.json`);
 }
 
 function isRecoveryRecord(value: unknown): value is RecoveryRecord {
@@ -736,6 +832,7 @@ function isRecoveryRecord(value: unknown): value is RecoveryRecord {
 		record.version === 1 &&
 		typeof record.id === "string" &&
 		RECOVERY_ID_REGEX.test(record.id) &&
+		(record.scope === undefined || record.scope === "user" || record.scope === "repo") &&
 		(record.target === "long_term" || record.target === "daily") &&
 		(record.target !== "daily" || (typeof record.date === "string" && isValidDailyDate(record.date))) &&
 		Array.isArray(record.removedContent) &&
@@ -744,67 +841,86 @@ function isRecoveryRecord(value: unknown): value is RecoveryRecord {
 	);
 }
 
-function writeRecoveryRecord(target: MemoryTarget, date: string | undefined, removedContent: string[]): RecoveryRecord {
+function writeRecoveryRecord(
+	paths: MemoryPaths,
+	target: MemoryTarget,
+	date: string | undefined,
+	removedContent: string[],
+): RecoveryRecord {
 	const record: RecoveryRecord = {
 		version: 1,
 		id: randomUUID(),
 		createdAt: new Date().toISOString(),
+		scope: paths.scope,
 		target,
 		...(date ? { date } : {}),
 		removedContent,
 	};
-	const filePath = recoveryPath(record.id);
+	const filePath = recoveryPathFor(paths, record.id);
 	if (!filePath) throw new Error("Failed to create a valid recovery ID.");
 	fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf-8", flag: "wx" });
 	return record;
 }
 
-function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; filePath: string } | null {
-	const filePath = recoveryPath(recoveryId);
-	if (!filePath) return null;
-	const content = readFileSafe(filePath);
-	if (!content) return null;
-	try {
-		const record: unknown = JSON.parse(content);
-		if (!isRecoveryRecord(record) || record.id !== recoveryId) return null;
-		return { record, filePath };
-	} catch {
-		return null;
+function readRecoveryRecord(
+	recoveryId: string,
+	candidatePaths: readonly MemoryPaths[],
+): { record: RecoveryRecord; filePath: string; paths: MemoryPaths } | null {
+	for (const paths of candidatePaths) {
+		const filePath = recoveryPathFor(paths, recoveryId);
+		if (!filePath) return null;
+		const content = readFileSafe(filePath);
+		if (!content) continue;
+		try {
+			const record: unknown = JSON.parse(content);
+			if (!isRecoveryRecord(record) || record.id !== recoveryId) continue;
+			return { record, filePath, paths };
+		} catch {}
 	}
+	return null;
 }
 
 // ---------------------------------------------------------------------------
 // Context builder
 // ---------------------------------------------------------------------------
 
-export function buildMemoryContext(searchResults?: string): string {
+export function buildMemoryContext(searchResults?: string, repoMemoryDir?: string): string {
 	ensureDirs();
-	// Priority order: scratchpad > today's daily > search results > MEMORY.md > yesterday's daily
+	const userPaths = getUserMemoryPaths();
+	const repoPaths = repoMemoryDir ? memoryPaths("repo", repoMemoryDir, "") : null;
+	const scoped = repoPaths !== null;
+	// Priority order favors repository-specific context over user-wide context.
 	const sections: string[] = [];
+	const pathsInPriorityOrder = repoPaths ? [repoPaths, userPaths] : [userPaths];
+	const scopeLabel = (paths: MemoryPaths) => (paths.scope === "repo" ? "Repository" : "User");
 
-	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
-	if (scratchpad?.trim()) {
+	for (const paths of pathsInPriorityOrder) {
+		const scratchpad = readFileSafe(paths.scratchpadFile);
+		if (!scratchpad?.trim()) continue;
 		const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
-		if (openItems.length > 0) {
-			const serialized = serializeScratchpad(openItems);
-			const section = formatContextSection(
-				"## SCRATCHPAD.md (working context)",
-				serialized,
-				"start",
-				CONTEXT_SCRATCHPAD_MAX_LINES,
-				CONTEXT_SCRATCHPAD_MAX_CHARS,
-			);
-			if (section) sections.push(section);
-		}
+		if (openItems.length === 0) continue;
+		const serialized = serializeScratchpad(openItems);
+		const label = scoped
+			? `## ${scopeLabel(paths)} SCRATCHPAD.md (working context)`
+			: "## SCRATCHPAD.md (working context)";
+		const section = formatContextSection(
+			label,
+			serialized,
+			"start",
+			CONTEXT_SCRATCHPAD_MAX_LINES,
+			CONTEXT_SCRATCHPAD_MAX_CHARS,
+		);
+		if (section) sections.push(section);
 	}
 
 	const today = todayStr();
 	const yesterday = yesterdayStr();
-
-	const todayContent = readFileSafe(dailyPath(today));
-	if (todayContent?.trim()) {
+	for (const paths of pathsInPriorityOrder) {
+		const todayContent = readFileSafe(dailyPathFor(paths, today));
+		if (!todayContent?.trim()) continue;
+		const label = scoped ? `## ${scopeLabel(paths)} daily log: ${today} (today)` : `## Daily log: ${today} (today)`;
 		const section = formatContextSection(
-			`## Daily log: ${today} (today)`,
+			label,
 			todayContent,
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
@@ -824,10 +940,12 @@ export function buildMemoryContext(searchResults?: string): string {
 		if (section) sections.push(section);
 	}
 
-	const longTerm = readFileSafe(MEMORY_FILE);
-	if (longTerm?.trim()) {
+	for (const paths of pathsInPriorityOrder) {
+		const longTerm = readFileSafe(paths.memoryFile);
+		if (!longTerm?.trim()) continue;
+		const label = scoped ? `## ${scopeLabel(paths)} MEMORY.md (long-term)` : "## MEMORY.md (long-term)";
 		const section = formatContextSection(
-			"## MEMORY.md (long-term)",
+			label,
 			longTerm,
 			"middle",
 			CONTEXT_LONG_TERM_MAX_LINES,
@@ -836,10 +954,14 @@ export function buildMemoryContext(searchResults?: string): string {
 		if (section) sections.push(section);
 	}
 
-	const yesterdayContent = readFileSafe(dailyPath(yesterday));
-	if (yesterdayContent?.trim()) {
+	for (const paths of pathsInPriorityOrder) {
+		const yesterdayContent = readFileSafe(dailyPathFor(paths, yesterday));
+		if (!yesterdayContent?.trim()) continue;
+		const label = scoped
+			? `## ${scopeLabel(paths)} daily log: ${yesterday} (yesterday)`
+			: `## Daily log: ${yesterday} (yesterday)`;
 		const section = formatContextSection(
-			`## Daily log: ${yesterday} (yesterday)`,
+			label,
 			yesterdayContent,
 			"end",
 			CONTEXT_DAILY_MAX_LINES,
@@ -1019,8 +1141,8 @@ export function qmdInstallInstructions(): string {
 		"  npm install -g @tobilu/qmd        # no Bun needed",
 		`  bun install -g ${QMD_REPO_URL}   # ensure ~/.bun/bin is on PATH`,
 		"",
-		"The extension auto-creates the collection on next session start.",
-		"To set it up manually instead:",
+		"The extension auto-creates the required user and repository collections on the next session start.",
+		"To set up the user-wide collection manually instead:",
 		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
 		"  qmd embed",
 	].join("\n");
@@ -1028,7 +1150,7 @@ export function qmdInstallInstructions(): string {
 
 export function qmdCollectionInstructions(): string {
 	return [
-		"qmd collection pi-memory is not configured.",
+		"The user-wide qmd collection pi-memory is not configured.",
 		"",
 		"Set up the collection (one-time):",
 		`  qmd collection add ${MEMORY_DIR} --name pi-memory`,
@@ -1036,12 +1158,15 @@ export function qmdCollectionInstructions(): string {
 	].join("\n");
 }
 
-/** Auto-create the pi-memory collection and path contexts in qmd. */
-export async function setupQmdCollection(): Promise<boolean> {
+/** Auto-create a memory collection and path contexts in qmd. */
+export async function setupQmdCollection(paths: MemoryPaths = getUserMemoryPaths()): Promise<boolean> {
 	try {
 		await new Promise<void>((resolve, reject) => {
-			execFileFn("qmd", ["collection", "add", MEMORY_DIR, "--name", "pi-memory"], { timeout: 10_000 }, (err) =>
-				err ? reject(err) : resolve(),
+			execFileFn(
+				"qmd",
+				["collection", "add", paths.dir, "--name", paths.collectionName],
+				{ timeout: 10_000 },
+				(err) => (err ? reject(err) : resolve()),
 			);
 		});
 	} catch {
@@ -1050,24 +1175,26 @@ export async function setupQmdCollection(): Promise<boolean> {
 	}
 
 	// Add path contexts (best-effort, ignore errors)
+	const scopeDescription = paths.scope === "repo" ? "Repository-scoped" : "User-wide";
 	const contexts: [string, string][] = [
-		["/daily", "Daily append-only work logs organized by date"],
-		["/", "Curated long-term memory: decisions, preferences, facts, lessons"],
+		["/daily", `${scopeDescription} daily append-only work logs organized by date`],
+		["/", `${scopeDescription} curated long-term memory: decisions, preferences, facts, lessons`],
 	];
 	for (const [ctxPath, desc] of contexts) {
 		try {
 			await new Promise<void>((resolve, reject) => {
-				execFileFn("qmd", ["context", "add", ctxPath, desc, "-c", "pi-memory"], { timeout: 10_000 }, (err) =>
-					err ? reject(err) : resolve(),
+				execFileFn(
+					"qmd",
+					["context", "add", ctxPath, desc, "-c", paths.collectionName],
+					{ timeout: 10_000 },
+					(err) => (err ? reject(err) : resolve()),
 				);
 			});
 		} catch {
 			// Ignore — context may already exist
 		}
 	}
-	// Seed the cache so checkCollection("pi-memory") doesn't redundantly re-run
-	// setupQmdCollection during the short negative-cache window.
-	qmdCollectionStatusCache.set("pi-memory", { checkedAt: Date.now(), exists: true });
+	qmdCollectionStatusCache.set(paths.collectionName, { checkedAt: Date.now(), exists: true });
 	return true;
 }
 
@@ -1123,6 +1250,16 @@ export function checkCollection(name: string): Promise<boolean> {
 			resolve(exists);
 		});
 	});
+}
+
+async function ensureQmdCollection(paths: MemoryPaths): Promise<boolean> {
+	if (await checkCollection(paths.collectionName)) return true;
+	return setupQmdCollection(paths);
+}
+
+async function ensureMemoryCollectionForUpdate(paths: MemoryPaths): Promise<boolean> {
+	if (!(await ensureQmdAvailableForUpdate())) return false;
+	return ensureQmdCollection(paths);
 }
 
 // `qmd embed` is incremental: it only embeds new/changed chunks and no-ops in
@@ -1190,7 +1327,7 @@ async function runQmdUpdateNow() {
 }
 
 /** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
-export async function searchRelevantMemories(prompt: string): Promise<string> {
+export async function searchRelevantMemories(prompt: string, cwd?: string): Promise<string> {
 	if (!qmdAvailable || !prompt.trim()) return "";
 
 	// Sanitize: strip control chars, limit to 200 chars for the search query
@@ -1203,11 +1340,16 @@ export async function searchRelevantMemories(prompt: string): Promise<string> {
 
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection) return "";
+		const repoPaths = cwd ? getRepoMemoryPaths(cwd) : activeRepoPaths;
+		const candidatePaths = [getUserMemoryPaths(), ...(repoPaths && fs.existsSync(repoPaths.dir) ? [repoPaths] : [])];
+		const collectionNames: string[] = [];
+		for (const paths of candidatePaths) {
+			if (await checkCollection(paths.collectionName)) collectionNames.push(paths.collectionName);
+		}
+		if (collectionNames.length === 0) return "";
 
 		const results = await Promise.race([
-			runQmdSearch("keyword", sanitized, 3),
+			runQmdSearch("keyword", sanitized, 3, collectionNames),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("timeout")), 3_000);
 			}),
@@ -1292,9 +1434,11 @@ export function runQmdSearch(
 	mode: "keyword" | "semantic" | "deep",
 	query: string,
 	limit: number,
+	collectionNames: readonly string[] = ["pi-memory"],
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
-	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
+	const collectionArgs = collectionNames.flatMap((name) => ["-c", name]);
+	const args = [subcommand, "--json", ...collectionArgs, "-n", String(limit), query];
 	const timeoutMs = getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
@@ -1331,11 +1475,13 @@ export function runQmdSearch(
  * "ready" means a probe query ran without qmd's "need embeddings" warning —
  * it does not prove the index has content.
  */
-export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"> {
+export async function probeEmbeddings(
+	collectionNames: readonly string[] = ["pi-memory"],
+): Promise<"ready" | "missing" | "unknown"> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const { stderr } = await Promise.race([
-			runQmdSearch("semantic", "memory", 1),
+			runQmdSearch("semantic", "memory", 1, collectionNames),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => reject(new Error("timeout")), 4_000);
 			}),
@@ -1350,35 +1496,41 @@ export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"
 	}
 }
 
-/** Collect a fast on-disk inventory of the memory files (no qmd needed). */
-export function getMemoryInventory(): {
+interface MemoryInventory {
 	dir: string;
 	longTermChars: number;
 	scratchpadOpen: number;
 	scratchpadTotal: number;
 	dailyCount: number;
 	latestDaily: string | null;
-} {
-	const longTerm = readFileSafe(MEMORY_FILE) ?? "";
-	const scratchpad = readFileSafe(SCRATCHPAD_FILE) ?? "";
+}
+
+function getMemoryInventoryFor(paths: MemoryPaths): MemoryInventory {
+	const longTerm = readFileSafe(paths.memoryFile) ?? "";
+	const scratchpad = readFileSafe(paths.scratchpadFile) ?? "";
 	const items = parseScratchpad(scratchpad);
 	let dailyFiles: string[] = [];
 	try {
 		dailyFiles = fs
-			.readdirSync(DAILY_DIR)
+			.readdirSync(paths.dailyDir)
 			.filter((f) => f.endsWith(".md"))
 			.sort();
 	} catch {
 		dailyFiles = [];
 	}
 	return {
-		dir: MEMORY_DIR,
+		dir: paths.dir,
 		longTermChars: longTerm.trim().length,
 		scratchpadOpen: items.filter((i) => !i.done).length,
 		scratchpadTotal: items.length,
 		dailyCount: dailyFiles.length,
 		latestDaily: dailyFiles.length ? dailyFiles[dailyFiles.length - 1].replace(/\.md$/, "") : null,
 	};
+}
+
+/** Collect a fast on-disk inventory of user-wide memory files (no qmd needed). */
+export function getMemoryInventory(): MemoryInventory {
+	return getMemoryInventoryFor(getUserMemoryPaths());
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,9 +1548,29 @@ let snapshotTakenAt: string | null = null;
 let snapshotTakenOnDate: string | null = null;
 let snapshotReason: string | null = null;
 let snapshotDirty = false;
+let activePromptMemoryScope: MemoryScope | null = null;
+let activeRepoPaths: MemoryPaths | null = null;
 
-function refreshMemorySnapshot(reason: string) {
-	memorySnapshot = buildMemoryContext("");
+function repoPathsFromContext(ctx: Partial<ExtensionContext>): MemoryPaths | null {
+	return typeof ctx.cwd === "string" && ctx.cwd.trim() ? getRepoMemoryPaths(ctx.cwd) : activeRepoPaths;
+}
+
+function selectedMemoryScope(explicitScope: MemoryScope | undefined): MemoryScope {
+	return explicitScope ?? activePromptMemoryScope ?? "user";
+}
+
+function selectedMemoryPaths(explicitScope: MemoryScope | undefined, ctx: Partial<ExtensionContext>): MemoryPaths {
+	const scope = selectedMemoryScope(explicitScope);
+	if (scope === "user") return getUserMemoryPaths();
+	const repoPaths = repoPathsFromContext(ctx);
+	if (!repoPaths) {
+		throw new Error("Repository-scoped memory requires a session working directory.");
+	}
+	return repoPaths;
+}
+
+function refreshMemorySnapshot(reason: string, repoPaths: MemoryPaths | null = activeRepoPaths) {
+	memorySnapshot = buildMemoryContext("", repoPaths?.dir);
 	snapshotTakenAt = nowTimestamp();
 	snapshotTakenOnDate = todayStr();
 	snapshotReason = reason;
@@ -1417,6 +1589,8 @@ export function _resetMemorySnapshot() {
 	snapshotTakenOnDate = null;
 	snapshotReason = null;
 	snapshotDirty = false;
+	activePromptMemoryScope = null;
+	activeRepoPaths = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,9 +1598,14 @@ export function _resetMemorySnapshot() {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	activePromptMemoryScope = null;
+	activeRepoPaths = null;
+
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
+		activePromptMemoryScope = null;
+		activeRepoPaths = typeof ctx.cwd === "string" && ctx.cwd.trim() ? getRepoMemoryPaths(ctx.cwd) : null;
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -1450,9 +1629,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const hasCollection = await checkCollection("pi-memory");
-		if (!hasCollection) {
-			await setupQmdCollection();
+		await ensureQmdCollection(getUserMemoryPaths());
+		if (activeRepoPaths && fs.existsSync(activeRepoPaths.dir)) {
+			await ensureQmdCollection(activeRepoPaths);
 		}
 		// Catch-up embed: covers writes from previous sessions (shutdown skips
 		// embedding) and fresh installs where the collection exists but was
@@ -1537,7 +1716,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Inject memory context before every agent turn ---
-	pi.on("before_agent_start", async (event, _ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
+		activePromptMemoryScope = inferMemoryScope(event.prompt ?? "");
+		if (typeof ctx.cwd === "string" && ctx.cwd.trim()) {
+			activeRepoPaths = getRepoMemoryPaths(ctx.cwd);
+		}
 		const mode = getSnapshotMode();
 
 		let memoryContext: string;
@@ -1545,8 +1728,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (mode === "per-turn") {
 			const skipSearch = process.env.PI_MEMORY_NO_SEARCH === "1";
-			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
-			memoryContext = buildMemoryContext(searchResults);
+			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "", ctx.cwd);
+			memoryContext = buildMemoryContext(searchResults, activeRepoPaths?.dir);
 		} else {
 			const today = todayStr();
 			const needsRefresh = memorySnapshot === null || snapshotDirty || snapshotTakenOnDate !== today;
@@ -1567,10 +1750,12 @@ export default function (pi: ExtensionAPI) {
 		const headerLines = ["\n\n## Memory"];
 		if (snapshotCaveat) headerLines.push(`(${snapshotCaveat})`);
 		headerLines.push(
-			"The following memory files have been loaded. Use the memory_write tool to persist important information.",
+			"The following user-wide and repository memory files have been loaded. Use memory_write to persist important information.",
 			"- Decisions, preferences, and durable facts \u2192 MEMORY.md",
 			"- Day-to-day notes and running context \u2192 daily/<YYYY-MM-DD>.md",
 			"- Things to fix later or keep in mind \u2192 scratchpad tool",
+			"- Requests such as 'remember this for this repo/project/codebase' \u2192 scope='repo' (.pi/agent/memory in the repository root).",
+			"- Global or cross-repository requests \u2192 scope='user' (~/.pi/agent/memory). Neutral requests default to user scope.",
 			"- Use memory_search to find past context across all memory files (keyword, semantic, or deep search).",
 			"- Use #tags (e.g. #decision, #preference) and [[links]] (e.g. [[auth-strategy]]) in memory content to improve future search recall.",
 			'- If someone says "remember this," write it immediately.',
@@ -1636,9 +1821,10 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description: [
-			"Write to memory files. Two targets:",
+			"Write to user-wide or repository-scoped memory files. Two targets:",
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
+			"Scope defaults to 'user'. Use scope='repo' when the request says 'for this repo/project/codebase' or otherwise makes the memory repository-specific. Use scope='user' for global, cross-repository preferences.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
 			"Use #tags (e.g. #decision, #preference, #lesson, #bug) and [[links]] (e.g. [[auth-strategy]]) in content to improve searchability.",
 		].join("\n"),
@@ -1652,15 +1838,22 @@ export default function (pi: ExtensionAPI) {
 					description: "Write mode for long_term target. Default: 'append'. Daily always appends.",
 				}),
 			),
+			scope: Type.Optional(
+				StringEnum(["user", "repo"] as const, {
+					description:
+						"Memory scope. Use 'repo' for this repository/project/codebase; use 'user' for global cross-repository memory. Inferred from the active user request when omitted.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
+			const paths = selectedMemoryPaths(params.scope, ctx);
+			ensureMemoryDirs(paths);
 			const { target, content, mode } = params;
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
 			if (target === "daily") {
-				const filePath = dailyPath(todayStr());
+				const filePath = dailyPathFor(paths, todayStr());
 				const existing = readFileSafe(filePath) ?? "";
 				const existingPreview = buildPreview(existing, {
 					maxLines: RESPONSE_PREVIEW_MAX_LINES,
@@ -1674,7 +1867,7 @@ export default function (pi: ExtensionAPI) {
 				const separator = existing.trim() ? "\n\n" : "";
 				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
 				fs.writeFileSync(filePath, existing + separator + stamped, "utf-8");
-				await ensureQmdAvailableForUpdate();
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 				return {
 					content: [
@@ -1685,6 +1878,7 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: {
 						path: filePath,
+						scope: paths.scope,
 						target,
 						mode: "append",
 						sessionId: sid,
@@ -1696,7 +1890,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// long_term
-			const existing = readFileSafe(MEMORY_FILE) ?? "";
+			const existing = readFileSafe(paths.memoryFile) ?? "";
 			const existingPreview = buildPreview(existing, {
 				maxLines: RESPONSE_PREVIEW_MAX_LINES,
 				maxChars: RESPONSE_PREVIEW_MAX_CHARS,
@@ -1714,13 +1908,14 @@ export default function (pi: ExtensionAPI) {
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
-				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
-				await ensureQmdAvailableForUpdate();
+				fs.writeFileSync(paths.memoryFile, stamped, "utf-8");
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 				return {
 					content: [{ type: "text", text: `Overwrote MEMORY.md${existingSnippet}` }],
 					details: {
-						path: MEMORY_FILE,
+						path: paths.memoryFile,
+						scope: paths.scope,
 						target,
 						mode: "overwrite",
 						sessionId: sid,
@@ -1734,13 +1929,14 @@ export default function (pi: ExtensionAPI) {
 			// append (default)
 			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
-			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
-			await ensureQmdAvailableForUpdate();
+			fs.writeFileSync(paths.memoryFile, existing + separator + stamped, "utf-8");
+			await ensureMemoryCollectionForUpdate(paths);
 			scheduleQmdUpdate();
 			return {
 				content: [{ type: "text", text: `Appended to MEMORY.md${existingSnippet}` }],
 				details: {
-					path: MEMORY_FILE,
+					path: paths.memoryFile,
+					scope: paths.scope,
 					target,
 					mode: "append",
 					sessionId: sid,
@@ -1757,7 +1953,7 @@ export default function (pi: ExtensionAPI) {
 		name: "scratchpad",
 		label: "Scratchpad",
 		description: [
-			"Manage a checklist of things to fix later or keep in mind. Actions:",
+			"Manage a user-wide or repository-scoped checklist of things to fix later or keep in mind. Scope defaults to user and follows repository clues in the active request. Actions:",
 			"- 'add': Add a new unchecked item (- [ ] text)",
 			"- 'done': Mark an item as done (- [x] text). Match by substring.",
 			"- 'undo': Uncheck a done item back to open. Match by substring.",
@@ -1773,14 +1969,20 @@ export default function (pi: ExtensionAPI) {
 					description: "Item text for add, or substring to match for done/undo",
 				}),
 			),
+			scope: Type.Optional(
+				StringEnum(["user", "repo"] as const, {
+					description: "Checklist scope. Use 'repo' for this repository and 'user' for the user-wide checklist.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
+			const paths = selectedMemoryPaths(params.scope, ctx);
+			ensureMemoryDirs(paths);
 			const { action, text } = params;
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
-			const existing = readFileSafe(SCRATCHPAD_FILE) ?? "";
+			const existing = readFileSafe(paths.scratchpadFile) ?? "";
 			const items = parseScratchpad(existing);
 
 			if (action === "list") {
@@ -1824,8 +2026,8 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
-				await ensureQmdAvailableForUpdate();
+				fs.writeFileSync(paths.scratchpadFile, serialized, "utf-8");
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 				return {
 					content: [
@@ -1836,6 +2038,8 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: {
 						action,
+						scope: paths.scope,
+						path: paths.scratchpadFile,
 						sessionId: sid,
 						timestamp: ts,
 						qmdUpdateMode: getQmdUpdateMode(),
@@ -1875,8 +2079,8 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
-				await ensureQmdAvailableForUpdate();
+				fs.writeFileSync(paths.scratchpadFile, serialized, "utf-8");
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 				return {
 					content: [
@@ -1887,6 +2091,8 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: {
 						action,
+						scope: paths.scope,
+						path: paths.scratchpadFile,
 						sessionId: sid,
 						timestamp: ts,
 						qmdUpdateMode: getQmdUpdateMode(),
@@ -1904,8 +2110,8 @@ export default function (pi: ExtensionAPI) {
 					maxChars: RESPONSE_PREVIEW_MAX_CHARS,
 					mode: "start",
 				});
-				fs.writeFileSync(SCRATCHPAD_FILE, serialized, "utf-8");
-				await ensureQmdAvailableForUpdate();
+				fs.writeFileSync(paths.scratchpadFile, serialized, "utf-8");
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 				return {
 					content: [
@@ -1916,6 +2122,8 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: {
 						action,
+						scope: paths.scope,
+						path: paths.scratchpadFile,
 						removed,
 						qmdUpdateMode: getQmdUpdateMode(),
 						preview,
@@ -1935,7 +2143,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_read",
 		label: "Memory Read",
 		description: [
-			"Read a memory file. Targets:",
+			"Read a user-wide or repository-scoped memory file. Scope defaults to user and follows repository clues in the active request. Targets:",
 			"- 'long_term': Read MEMORY.md",
 			"- 'scratchpad': Read SCRATCHPAD.md",
 			"- 'daily': Read a specific day's log (default: today). Pass date as YYYY-MM-DD.",
@@ -1950,15 +2158,21 @@ export default function (pi: ExtensionAPI) {
 					description: "Date for daily log (YYYY-MM-DD). Default: today.",
 				}),
 			),
+			scope: Type.Optional(
+				StringEnum(["user", "repo"] as const, {
+					description: "Memory scope to read: 'user' (default) or 'repo' for the current repository.",
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			ensureDirs();
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const paths = selectedMemoryPaths(params.scope, ctx);
+			ensureMemoryDirs(paths);
 			const { target, date } = params;
 
 			if (target === "list") {
 				try {
 					const files = fs
-						.readdirSync(DAILY_DIR)
+						.readdirSync(paths.dailyDir)
 						.filter((f) => f.endsWith(".md"))
 						.sort()
 						.reverse();
@@ -1975,7 +2189,7 @@ export default function (pi: ExtensionAPI) {
 								text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}`,
 							},
 						],
-						details: { files },
+						details: { files, scope: paths.scope, dir: paths.dailyDir },
 					};
 				} catch {
 					return {
@@ -1994,7 +2208,7 @@ export default function (pi: ExtensionAPI) {
 						details: { date: d },
 					};
 				}
-				const filePath = dailyPath(d);
+				const filePath = dailyPathFor(paths, d);
 				const content = readFileSafe(filePath);
 				if (!content) {
 					return {
@@ -2004,12 +2218,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: content }],
-					details: { path: filePath, date: d },
+					details: { path: filePath, date: d, scope: paths.scope },
 				};
 			}
 
 			if (target === "scratchpad") {
-				const content = readFileSafe(SCRATCHPAD_FILE);
+				const content = readFileSafe(paths.scratchpadFile);
 				if (!content?.trim()) {
 					return {
 						content: [
@@ -2023,12 +2237,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: content }],
-					details: { path: SCRATCHPAD_FILE },
+					details: { path: paths.scratchpadFile, scope: paths.scope },
 				};
 			}
 
 			// long_term
-			const content = readFileSafe(MEMORY_FILE);
+			const content = readFileSafe(paths.memoryFile);
 			if (!content) {
 				return {
 					content: [{ type: "text", text: "MEMORY.md is empty or does not exist." }],
@@ -2037,7 +2251,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return {
 				content: [{ type: "text", text: content }],
-				details: { path: MEMORY_FILE },
+				details: { path: paths.memoryFile, scope: paths.scope },
 			};
 		},
 	});
@@ -2047,7 +2261,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_forget",
 		label: "Memory Forget",
 		description: [
-			"Delete outdated or incorrect facts from memory. Removes every entry/paragraph",
+			"Delete outdated or incorrect facts from user-wide or repository-scoped memory. Scope defaults to user and follows repository clues in the active request. Removes every entry/paragraph",
 			"containing the match string (case-insensitive substring) from MEMORY.md, or from",
 			"a daily log when target='daily'. Every deletion creates a durable recovery record",
 			"whose visible recovery ID can be passed to memory_restore if the deletion was wrong.",
@@ -2066,9 +2280,15 @@ export default function (pi: ExtensionAPI) {
 			date: Type.Optional(
 				Type.String({ description: "Daily log date (YYYY-MM-DD) when target='daily'. Default: today." }),
 			),
+			scope: Type.Optional(
+				StringEnum(["user", "repo"] as const, {
+					description: "Memory scope to change: 'user' (default) or 'repo' for the current repository.",
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			ensureDirs();
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const paths = selectedMemoryPaths(params.scope, ctx);
+			ensureMemoryDirs(paths);
 			const target: MemoryTarget = params.target ?? "long_term";
 			if (!params.match.trim()) {
 				return {
@@ -2088,10 +2308,10 @@ export default function (pi: ExtensionAPI) {
 						details: { date: d },
 					};
 				}
-				filePath = dailyPath(d);
+				filePath = dailyPathFor(paths, d);
 				recoveryDate = d;
 			} else {
-				filePath = MEMORY_FILE;
+				filePath = paths.memoryFile;
 			}
 
 			const existing = readFileSafe(filePath);
@@ -2112,13 +2332,13 @@ export default function (pi: ExtensionAPI) {
 
 			// Persist the complete recovery payload before mutating the source file.
 			// If either write fails, we never report a successful unrecoverable deletion.
-			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
+			const recovery = writeRecoveryRecord(paths, target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
 			// Deleted facts must leave the injected snapshot too, whichever file
 			// they lived in — a forgotten-but-still-injected memory defeats the
 			// point of forgetting.
 			snapshotDirty = true;
-			await ensureQmdAvailableForUpdate();
+			await ensureMemoryCollectionForUpdate(paths);
 			scheduleQmdUpdate();
 
 			const removedPreview = buildPreview(result.removed.join("\n\n"), {
@@ -2139,10 +2359,11 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: {
 					path: filePath,
+					scope: paths.scope,
 					target,
 					removed: result.removed.length,
 					recoveryId: recovery.id,
-					recoveryPath: recoveryPath(recovery.id),
+					recoveryPath: recoveryPathFor(paths, recovery.id),
 					removedPreview,
 				},
 			};
@@ -2159,10 +2380,19 @@ export default function (pi: ExtensionAPI) {
 		].join("\n"),
 		parameters: Type.Object({
 			recoveryId: Type.String({ description: "Recovery ID returned by memory_forget" }),
+			scope: Type.Optional(
+				StringEnum(["user", "repo"] as const, {
+					description: "Optional scope hint. By default recovery records are searched in both scopes.",
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			ensureDirs();
-			const loaded = readRecoveryRecord(params.recoveryId);
+			const repoPaths = repoPathsFromContext(ctx);
+			const candidatePaths = params.scope
+				? [selectedMemoryPaths(params.scope, ctx)]
+				: [...(repoPaths ? [repoPaths] : []), getUserMemoryPaths()];
+			const loaded = readRecoveryRecord(params.recoveryId, candidatePaths);
 			if (!loaded) {
 				return {
 					content: [{ type: "text", text: `No valid recovery record found for ID ${params.recoveryId}.` }],
@@ -2171,7 +2401,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const { record, filePath: recordPath } = loaded;
+			const { record, filePath: recordPath, paths } = loaded;
 			if (record.restoredAt) {
 				return {
 					content: [{ type: "text", text: `Recovery ${record.id} was already restored at ${record.restoredAt}.` }],
@@ -2179,14 +2409,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const targetPath = record.target === "daily" ? dailyPath(record.date as string) : MEMORY_FILE;
+			const targetPath = record.target === "daily" ? dailyPathFor(paths, record.date as string) : paths.memoryFile;
 			const existing = readFileSafe(targetPath) ?? "";
 			const missingEntries = record.removedContent.filter((entry) => !existing.includes(entry));
 			if (missingEntries.length > 0) {
 				const separator = existing.trim() ? "\n\n" : "";
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
 				snapshotDirty = true;
-				await ensureQmdAvailableForUpdate();
+				await ensureMemoryCollectionForUpdate(paths);
 				scheduleQmdUpdate();
 			}
 
@@ -2204,6 +2434,7 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: {
 					recoveryId: record.id,
+					scope: record.scope ?? paths.scope,
 					target: record.target,
 					path: targetPath,
 					restored: missingEntries.length,
@@ -2217,7 +2448,7 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_search",
 		label: "Memory Search",
 		description:
-			"Search across all memory files (MEMORY.md, SCRATCHPAD.md, daily logs).\n" +
+			"Search user and repository memory files (MEMORY.md, SCRATCHPAD.md, daily logs). Scope defaults to 'all'.\n" +
 			"Modes:\n" +
 			"- 'keyword' (default, ~30ms): Fast BM25 search. Best for specific terms, dates, names, #tags, [[links]].\n" +
 			"- 'semantic' (~2s): Meaning-based search. Finds related concepts even with different wording.\n" +
@@ -2233,8 +2464,13 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
+			scope: Type.Optional(
+				StringEnum(["all", "user", "repo"] as const, {
+					description: "Search scope. Default: 'all' (user and current repository memory).",
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!qmdAvailable) {
 				// Re-check on demand in case qmd was installed after session start.
 				qmdAvailable = await detectQmd();
@@ -2253,23 +2489,33 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			let hasCollection = await checkCollection("pi-memory");
-			if (!hasCollection) {
-				const created = await setupQmdCollection();
-				if (created) {
-					hasCollection = true;
-				}
+			const scope: MemorySearchScope = params.scope ?? "all";
+			const repoPaths = repoPathsFromContext(ctx);
+			const pathsToSearch = [
+				...(scope === "all" || scope === "user" ? [getUserMemoryPaths()] : []),
+				...(repoPaths && fs.existsSync(repoPaths.dir) && (scope === "all" || scope === "repo") ? [repoPaths] : []),
+			];
+			if (pathsToSearch.length === 0) {
+				return {
+					content: [{ type: "text", text: "No repository memory exists for the current repository." }],
+					details: { scope, count: 0 },
+				};
 			}
-			if (!hasCollection) {
+
+			const collectionNames: string[] = [];
+			for (const paths of pathsToSearch) {
+				if (await ensureQmdCollection(paths)) collectionNames.push(paths.collectionName);
+			}
+			if (collectionNames.length === 0) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: "Could not set up qmd pi-memory collection. Check that qmd is working and the memory directory exists.",
+							text: "Could not set up the requested qmd memory collections. Check that qmd is working and the memory directories exist.",
 						},
 					],
 					isError: true,
-					details: {},
+					details: { scope },
 				};
 			}
 
@@ -2277,7 +2523,7 @@ export default function (pi: ExtensionAPI) {
 			const limit = clampSearchLimit(params.limit);
 
 			try {
-				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
+				const { results, stderr } = await runQmdSearch(mode, params.query, limit, collectionNames);
 				const needsEmbed = /need embeddings/i.test(stderr ?? "");
 				// Self-heal: any "need embeddings" warning (even with partial
 				// results) kicks off an incremental background embed.
@@ -2302,7 +2548,7 @@ export default function (pi: ExtensionAPI) {
 									].join("\n"),
 								},
 							],
-							details: { mode, query: params.query, count: 0, needsEmbed: true, embedStarted },
+							details: { mode, scope, query: params.query, count: 0, needsEmbed: true, embedStarted },
 						};
 					}
 					return {
@@ -2312,7 +2558,7 @@ export default function (pi: ExtensionAPI) {
 								text: `No results found for "${params.query}" (mode: ${mode}).`,
 							},
 						],
-						details: { mode, query: params.query, count: 0, needsEmbed },
+						details: { mode, scope, query: params.query, count: 0, needsEmbed },
 					};
 				}
 
@@ -2330,7 +2576,7 @@ export default function (pi: ExtensionAPI) {
 
 				return {
 					content: [{ type: "text", text: formatted }],
-					details: { mode, query: params.query, count: results.length, needsEmbed },
+					details: { mode, scope, query: params.query, count: results.length, needsEmbed },
 				};
 			} catch (err) {
 				return {
@@ -2352,39 +2598,60 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_status",
 		label: "Memory Status",
 		description:
-			"Report the health of the memory system: where files live, what's stored, " +
-			"whether qmd search is available, whether the pi-memory collection exists, " +
+			"Report the health of user-wide and repository memory: where files live, what's stored, " +
+			"whether qmd search is available, whether the memory collections exist, " +
 			"whether embeddings are ready, and the active configuration. " +
 			"Use this when search behaves unexpectedly or to confirm setup.",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			ensureDirs();
-			const inv = getMemoryInventory();
+			const userPaths = getUserMemoryPaths();
+			const repoPaths = repoPathsFromContext(ctx);
+			const user = getMemoryInventoryFor(userPaths);
+			const repo = repoPaths ? getMemoryInventoryFor(repoPaths) : null;
 
 			const qmdOk = qmdAvailable || (await detectQmd());
-			let collectionOk = false;
+			let userCollection = false;
+			let repoCollection = false;
 			let embeddings: "ready" | "missing" | "unknown" | "n/a" = "n/a";
 			if (qmdOk) {
-				collectionOk = await checkCollection("pi-memory");
-				embeddings = collectionOk ? await probeEmbeddings() : "n/a";
+				userCollection = await checkCollection(userPaths.collectionName);
+				repoCollection = repoPaths ? await checkCollection(repoPaths.collectionName) : false;
+				const collectionNames = [
+					...(userCollection ? [userPaths.collectionName] : []),
+					...(repoCollection && repoPaths ? [repoPaths.collectionName] : []),
+				];
+				embeddings = collectionNames.length > 0 ? await probeEmbeddings(collectionNames) : "n/a";
 			}
 
 			const mark = (ok: boolean) => (ok ? "✓" : "✗");
-			const lines: string[] = [
-				"# Memory status",
-				"",
-				`- Memory dir: ${inv.dir}`,
+			const inventoryLines = (inv: MemoryInventory) => [
 				`- MEMORY.md: ${inv.longTermChars} chars`,
 				`- Scratchpad: ${inv.scratchpadOpen} open / ${inv.scratchpadTotal} total`,
 				`- Daily logs: ${inv.dailyCount}${inv.latestDaily ? ` (latest ${inv.latestDaily})` : ""}`,
+			];
+			const lines: string[] = [
+				"# Memory status",
+				"",
+				"## User memory",
+				`- User memory dir: ${user.dir}`,
+				...inventoryLines(user),
+				"",
+				"## Repository memory",
+				...(repo
+					? [`- Repository memory dir: ${repo.dir}`, ...inventoryLines(repo)]
+					: ["- Repository memory unavailable: no session working directory"]),
 				"",
 				"## Search (qmd)",
 				`- qmd available: ${mark(qmdOk)}`,
 			];
 
 			if (qmdOk) {
-				lines.push(`- Collection \`pi-memory\`: ${mark(collectionOk)}`);
-				if (collectionOk) {
+				lines.push(`- User collection \`${userPaths.collectionName}\`: ${mark(userCollection)}`);
+				if (repoPaths) {
+					lines.push(`- Repository collection \`${repoPaths.collectionName}\`: ${mark(repoCollection)}`);
+				}
+				if (userCollection || repoCollection) {
 					const embMark = embeddings === "ready" ? "✓" : embeddings === "missing" ? "⚠" : "?";
 					lines.push(`- Embeddings (semantic/deep): ${embMark} ${embeddings}`);
 					if (embeddings === "missing") {
@@ -2397,7 +2664,7 @@ export default function (pi: ExtensionAPI) {
 						lines.push("  - Could not verify within the probe timeout; run a semantic search to confirm.");
 					}
 				} else {
-					lines.push("  - Run a `memory_search` (auto-creates it) or `qmd collection add` manually.");
+					lines.push("  - Run a `memory_search` to create the requested collection(s).");
 				}
 			} else {
 				lines.push("", qmdInstallInstructions());
@@ -2418,9 +2685,12 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: {
-					...inv,
+					...user,
+					user,
+					repo,
 					qmd: qmdOk,
-					collection: collectionOk,
+					collection: userCollection,
+					collections: { user: userCollection, repo: repoCollection },
 					embeddings,
 					snapshotMode: getSnapshotMode(),
 					qmdUpdateMode: getQmdUpdateMode(),
