@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added repository-scoped memory under `.pi/agent/memory/` alongside user-wide
+  memory under `~/.pi/agent/memory/`. Repository paths resolve from the nearest
+  Git root, or from the session working directory outside Git.
+- Memory tools now accept user/repository scopes. Natural-language clues such as
+  “remember this for this repo” select repository memory when the tool omits an
+  explicit scope; neutral requests continue to default to user memory.
+- Context injection loads and labels both scopes, with repository memory taking
+  priority. `memory_search` searches both scopes by default through separate qmd
+  collections, and `memory_status` reports both inventories and collections.
+
+### Changed
+
+- New recovery records include their memory scope so repository deletions restore
+  to the correct location. Existing recovery records remain readable.
+- `PI_MEMORY_DIR` now explicitly overrides only the user-wide memory directory;
+  repository memory remains at `.pi/agent/memory/`.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

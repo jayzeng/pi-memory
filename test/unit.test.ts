@@ -13,6 +13,7 @@ import * as path from "node:path";
 
 import {
 	_clearEmbedInFlight,
+	_clearQmdStatusCaches,
 	_clearUpdateTimer,
 	_getEmbedInFlight,
 	_getUpdateTimer,
@@ -33,6 +34,7 @@ import {
 	forgetBlocks,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
+	inferMemoryScope,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
@@ -40,8 +42,11 @@ import {
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
 	readFileSafe,
+	repoCollectionName,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	resolveRepoMemoryDir,
+	resolveRepositoryRoot,
 	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
@@ -90,8 +95,9 @@ function createMockPi() {
 }
 
 /** Create a mock tool execution context. */
-function createMockCtx(sessionId = "abcdef1234567890") {
+function createMockCtx(sessionId = "abcdef1234567890", cwd?: string) {
 	return {
+		...(cwd ? { cwd } : {}),
 		sessionManager: {
 			getSessionId: () => sessionId,
 		},
@@ -264,6 +270,57 @@ describe("resolveMemoryDir", () => {
 		};
 
 		expect(resolveMemoryDir(env)).toBe(path.join(env.USERPROFILE, ".pi", "agent", "memory"));
+	});
+});
+
+describe("repository memory paths and scope inference", () => {
+	let root: string;
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-repo-path-"));
+		fs.mkdirSync(path.join(root, ".git"));
+	});
+	afterEach(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("resolves repository memory from the git root", () => {
+		const nested = path.join(root, "packages", "app");
+		fs.mkdirSync(nested, { recursive: true });
+
+		expect(resolveRepositoryRoot(nested)).toBe(root);
+		expect(resolveRepoMemoryDir(nested)).toBe(path.join(root, ".pi", "agent", "memory"));
+	});
+
+	test("uses cwd as the project root outside git", () => {
+		const plain = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-nonrepo-"));
+		try {
+			expect(resolveRepositoryRoot(plain)).toBe(plain);
+		} finally {
+			fs.rmSync(plain, { recursive: true, force: true });
+		}
+	});
+
+	test("creates a stable, repository-specific qmd collection name", () => {
+		expect(repoCollectionName(root)).toMatch(/^pi-memory-repo-[0-9a-f]{12}$/);
+		expect(repoCollectionName(root)).toBe(repoCollectionName(path.join(root, ".")));
+		expect(repoCollectionName(path.join(root, "other"))).not.toBe(repoCollectionName(root));
+	});
+
+	test("recognizes repository-scoped remember requests", () => {
+		for (const prompt of [
+			"Remember that we use pnpm for this repo",
+			"Save this in the current project memory",
+			"This is a repository-specific decision",
+			"Keep this preference for this codebase only",
+		]) {
+			expect(inferMemoryScope(prompt)).toBe("repo");
+		}
+	});
+
+	test("recognizes explicit user-wide requests and leaves neutral prompts unset", () => {
+		expect(inferMemoryScope("Remember this across all repositories")).toBe("user");
+		expect(inferMemoryScope("Save this globally for every project")).toBe("user");
+		expect(inferMemoryScope("Remember that I like concise answers")).toBeNull();
 	});
 });
 
@@ -620,6 +677,21 @@ describe("buildMemoryContext", () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "   \n\n  ", "utf-8");
 		expect(buildMemoryContext()).toBe("");
 	});
+
+	test("combines user and repository memories with clear scope labels", () => {
+		ensureDirs();
+		const repoDir = path.join(tmpDir, "repo-memory");
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Global preference", "utf-8");
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Repository decision", "utf-8");
+
+		const ctx = buildMemoryContext("", repoDir);
+		expect(ctx).toContain("## Repository MEMORY.md (long-term)");
+		expect(ctx).toContain("Repository decision");
+		expect(ctx).toContain("## User MEMORY.md (long-term)");
+		expect(ctx).toContain("Global preference");
+		expect(ctx.indexOf("Repository decision")).toBeLessThan(ctx.indexOf("Global preference"));
+	});
 });
 
 // ==========================================================================
@@ -895,6 +967,74 @@ describe("memory_write tool", () => {
 		expect(content).toContain("New");
 		expect(result.details.mode).toBe("append");
 	});
+
+	test("writes explicit repository memory under the repository root", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		const nested = path.join(repoRoot, "src", "feature");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(nested, { recursive: true });
+
+		const result = await tools.memory_write.execute(
+			"call1",
+			{ target: "long_term", content: "Use pnpm here", scope: "repo" },
+			null,
+			null,
+			createMockCtx("abcdef1234567890", nested),
+		);
+
+		const repoFile = path.join(repoRoot, ".pi", "agent", "memory", "MEMORY.md");
+		expect(fs.readFileSync(repoFile, "utf-8")).toContain("Use pnpm here");
+		expect(fs.existsSync(path.join(tmpDir, "MEMORY.md"))).toBe(false);
+		expect(result.details.scope).toBe("repo");
+		expect(result.details.path).toBe(repoFile);
+	});
+
+	test("infers repository scope from the active remember request", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		const ctx = createMockCtx("abcdef1234567890", repoRoot);
+
+		await mockPi.hooks.before_agent_start(
+			{ systemPrompt: "base", prompt: "Remember that tests use fake timers for this repo" },
+			ctx,
+		);
+		await mockPi.tools.memory_write.execute(
+			"call1",
+			{ target: "long_term", content: "Tests use fake timers" },
+			null,
+			null,
+			ctx,
+		);
+
+		const repoFile = path.join(repoRoot, ".pi", "agent", "memory", "MEMORY.md");
+		expect(fs.readFileSync(repoFile, "utf-8")).toContain("Tests use fake timers");
+		expect(fs.existsSync(path.join(tmpDir, "MEMORY.md"))).toBe(false);
+	});
+
+	test("defaults neutral remember requests to user memory", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		const mockPi = createMockPi();
+		registerExtension(mockPi.pi as any);
+		const ctx = createMockCtx("abcdef1234567890", repoRoot);
+
+		await mockPi.hooks.before_agent_start(
+			{ systemPrompt: "base", prompt: "Remember that I prefer concise answers" },
+			ctx,
+		);
+		const result = await mockPi.tools.memory_write.execute(
+			"call1",
+			{ target: "long_term", content: "User prefers concise answers" },
+			null,
+			null,
+			ctx,
+		);
+
+		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toContain("concise answers");
+		expect(result.details.scope).toBe("user");
+	});
 });
 
 // ==========================================================================
@@ -933,6 +1073,21 @@ describe("scratchpad tool", () => {
 		const content = fs.readFileSync(path.join(tmpDir, "SCRATCHPAD.md"), "utf-8");
 		expect(content).toContain("Fix login bug");
 		expect(content).toContain("[ ]");
+	});
+
+	test("manages a repository-scoped scratchpad", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		const result = await tools.scratchpad.execute(
+			"call1",
+			{ action: "add", text: "Fix project build", scope: "repo" },
+			null,
+			null,
+			createMockCtx("abcdef1234567890", repoRoot),
+		);
+		const repoScratchpad = path.join(repoRoot, ".pi", "agent", "memory", "SCRATCHPAD.md");
+		expect(fs.readFileSync(repoScratchpad, "utf-8")).toContain("Fix project build");
+		expect(result.details.scope).toBe("repo");
 	});
 
 	test("add without text returns error", async () => {
@@ -1079,6 +1234,23 @@ describe("memory_read tool", () => {
 		expect(result.content[0].text).toBe("My memories");
 	});
 
+	test("reads repository-scoped long-term memory", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		const repoDir = path.join(repoRoot, ".pi", "agent", "memory");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Repository memory", "utf-8");
+		const result = await tools.memory_read.execute(
+			"c1",
+			{ target: "long_term", scope: "repo" },
+			null,
+			null,
+			createMockCtx("abcdef1234567890", repoRoot),
+		);
+		expect(result.content[0].text).toBe("Repository memory");
+		expect(result.details.scope).toBe("repo");
+	});
+
 	test("read long_term when file does not exist", async () => {
 		const result = await tools.memory_read.execute("c1", { target: "long_term" }, null, null, {});
 		expect(result.content[0].text).toContain("empty or does not exist");
@@ -1189,6 +1361,28 @@ describe("memory_read tool", () => {
 describe("runQmdSearch qmd diagnostics", () => {
 	afterEach(() => {
 		_resetExecFileForTest();
+	});
+
+	test("passes repeated collection filters when searching user and repository memory", async () => {
+		let observedArgs: string[] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			observedArgs = args;
+			cb(null, "[]", "");
+		}) as any);
+
+		await runQmdSearch("keyword", "query", 5, ["pi-memory", "pi-memory-repo-123456789abc"]);
+
+		expect(observedArgs).toEqual([
+			"search",
+			"--json",
+			"-c",
+			"pi-memory",
+			"-c",
+			"pi-memory-repo-123456789abc",
+			"-n",
+			"5",
+			"query",
+		]);
 	});
 
 	test("strips qmd spinner control sequences from stderr failures", async () => {
@@ -1303,6 +1497,43 @@ describe("memory_search tool", () => {
 		expect(desc).toContain("semantic");
 		expect(desc).toContain("deep");
 	});
+
+	test("searches user and repository qmd collections by default", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		const repoDir = path.join(repoRoot, ".pi", "agent", "memory");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Repository fact", "utf-8");
+		const repoCollection = repoCollectionName(repoRoot);
+		let searchArgs: string[] = [];
+		_clearQmdStatusCaches();
+		_setQmdAvailable(true);
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			if (args[0] === "collection" && args[1] === "list") {
+				cb(null, JSON.stringify([{ name: "pi-memory" }, { name: repoCollection }]), "");
+				return;
+			}
+			if (args[0] === "search") {
+				searchArgs = args;
+				cb(null, "[]", "");
+				return;
+			}
+			cb(null, "", "");
+		}) as any);
+
+		const result = await tools.memory_search.execute(
+			"c1",
+			{ query: "fact" },
+			null,
+			null,
+			createMockCtx("abcdef1234567890", repoRoot),
+		);
+
+		expect(result.isError).not.toBe(true);
+		expect(searchArgs).toContain("pi-memory");
+		expect(searchArgs).toContain(repoCollection);
+		expect(result.details.scope).toBe("all");
+	});
 });
 
 describe("memory_status tool", () => {
@@ -1342,6 +1573,32 @@ describe("memory_status tool", () => {
 		expect(text).toContain("qmd available: ✗");
 		expect(result.details.qmd).toBe(false);
 		expect(result.details.longTermChars).toBeGreaterThan(0);
+	});
+
+	test("reports separate user and repository inventories", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(new Error("qmd not found"), "", "");
+		}) as any);
+		_setQmdAvailable(false);
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "User fact", "utf-8");
+		const repoRoot = path.join(tmpDir, "project");
+		const repoDir = path.join(repoRoot, ".pi", "agent", "memory");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Repo fact", "utf-8");
+
+		const result = await tools.memory_status.execute(
+			"c1",
+			{},
+			null,
+			null,
+			createMockCtx("abcdef1234567890", repoRoot),
+		);
+		const text = result.content[0].text;
+		expect(text).toContain(`User memory dir: ${tmpDir}`);
+		expect(text).toContain(`Repository memory dir: ${repoDir}`);
+		expect(result.details.user.longTermChars).toBeGreaterThan(0);
+		expect(result.details.repo.longTermChars).toBeGreaterThan(0);
 	});
 });
 
@@ -1396,6 +1653,23 @@ describe("lifecycle hooks", () => {
 		expect(result.systemPrompt).toContain("memory_write");
 		expect(result.systemPrompt).toContain("memory_search");
 		expect(result.systemPrompt).toContain("scratchpad");
+	});
+
+	test("before_agent_start injects both repository and user memory", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		const repoDir = path.join(repoRoot, ".pi", "agent", "memory");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "User-wide preference", "utf-8");
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Repository-only decision", "utf-8");
+
+		const result = await hooks.before_agent_start(
+			{ systemPrompt: "base", prompt: "What should I work on?" },
+			createMockCtx("abcdef1234567890", repoRoot),
+		);
+		expect(result.systemPrompt).toContain("Repository-only decision");
+		expect(result.systemPrompt).toContain("User-wide preference");
+		expect(result.systemPrompt).toContain("scope='repo'");
 	});
 
 	// -- session_shutdown --
@@ -2307,6 +2581,35 @@ describe("memory_forget tool", () => {
 		const result = await tools.memory_forget.execute("c1", { match: "zzz" }, null, null, {});
 		expect(result.content[0].text).toContain("No entries matching");
 		expect(fs.readFileSync(path.join(tmpDir, "MEMORY.md"), "utf-8")).toBe("a fact\n");
+	});
+
+	test("forgets and restores repository-scoped memory", async () => {
+		const repoRoot = path.join(tmpDir, "project");
+		const repoDir = path.join(repoRoot, ".pi", "agent", "memory");
+		fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+		fs.mkdirSync(repoDir, { recursive: true });
+		fs.writeFileSync(path.join(repoDir, "MEMORY.md"), "Old repository fact\n", "utf-8");
+		const ctx = createMockCtx("abcdef1234567890", repoRoot);
+
+		const forgotten = await tools.memory_forget.execute(
+			"c1",
+			{ match: "Old repository", scope: "repo" },
+			null,
+			null,
+			ctx,
+		);
+		expect(fs.readFileSync(path.join(repoDir, "MEMORY.md"), "utf-8")).not.toContain("Old repository fact");
+		expect(forgotten.details.scope).toBe("repo");
+
+		const restored = await tools.memory_restore.execute(
+			"c2",
+			{ recoveryId: forgotten.details.recoveryId },
+			null,
+			null,
+			ctx,
+		);
+		expect(restored.details.scope).toBe("repo");
+		expect(fs.readFileSync(path.join(repoDir, "MEMORY.md"), "utf-8")).toContain("Old repository fact");
 	});
 
 	test("targets a specific daily log by date", async () => {
