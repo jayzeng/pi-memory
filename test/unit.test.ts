@@ -31,12 +31,14 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getEmbedProbeTimeoutMs,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
 	parseScratchpad,
+	probeEmbeddings,
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
 	readFileSafe,
@@ -2397,4 +2399,96 @@ describe("memory_forget tool", () => {
 		);
 		expect(secondRestore.content[0].text).toContain("already restored");
 	});
+});
+
+// ==========================================================================
+// 13. probeEmbeddings timeout behavior
+// ==========================================================================
+
+describe("probeEmbeddings", () => {
+	const ENV_KEY = "PI_MEMORY_EMBED_PROBE_TIMEOUT_MS";
+	let previous: string | undefined;
+
+	beforeEach(() => {
+		previous = process.env[ENV_KEY];
+		delete process.env[ENV_KEY];
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		if (previous === undefined) delete process.env[ENV_KEY];
+		else process.env[ENV_KEY] = previous;
+	});
+
+	test("defaults to a probe timeout with headroom over a contended qmd call", () => {
+		// Measured cold/contended `qmd vsearch` latency exceeds 4s, so the
+		// default must leave real headroom instead of racing the common case.
+		expect(getEmbedProbeTimeoutMs()).toBeGreaterThanOrEqual(15_000);
+	});
+
+	test("honors PI_MEMORY_EMBED_PROBE_TIMEOUT_MS override", () => {
+		process.env[ENV_KEY] = "9000";
+		expect(getEmbedProbeTimeoutMs()).toBe(9_000);
+	});
+
+	test("ignores invalid PI_MEMORY_EMBED_PROBE_TIMEOUT_MS values", () => {
+		for (const bad of ["0", "-1", "abc", "1.5"]) {
+			process.env[ENV_KEY] = bad;
+			expect(getEmbedProbeTimeoutMs()).toBeGreaterThanOrEqual(15_000);
+		}
+	});
+
+	test("reports ready when qmd answers without an embeddings warning", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(null, "[]", "");
+		}) as any);
+
+		expect(await probeEmbeddings()).toBe("ready");
+	});
+
+	test("reports missing when qmd warns that embeddings are needed", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(null, "[]", "warning: need embeddings for vector search");
+		}) as any);
+
+		expect(await probeEmbeddings()).toBe("missing");
+	});
+
+	test("survives a slow probe that would trip the old hardcoded 4s race", async () => {
+		// Regression: a background re-index makes the probe take >4s. The old
+		// implementation raced a hardcoded 4_000ms timer and returned "unknown".
+		process.env[ENV_KEY] = "20000";
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			setTimeout(() => cb(null, "[]", ""), 4_200);
+		}) as any);
+
+		expect(await probeEmbeddings()).toBe("ready");
+	}, 30_000);
+
+	test("bounds the qmd child process by the probe timeout, not the search timeout", async () => {
+		// The probe must not leave a 60s LLM query running after it gives up.
+		process.env[ENV_KEY] = "15000";
+		process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = "60000";
+		let observedTimeout: number | undefined;
+		try {
+			_setExecFileForTest(((_file: string, _args: string[], opts: any, cb: any) => {
+				observedTimeout = opts.timeout;
+				cb(null, "[]", "");
+			}) as any);
+
+			await probeEmbeddings();
+			expect(observedTimeout).toBe(15_000);
+		} finally {
+			delete process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+		}
+	});
+
+	test("still reports unknown when the probe genuinely times out", async () => {
+		process.env[ENV_KEY] = "150";
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			setTimeout(() => cb(null, "[]", ""), 2_000);
+		}) as any);
+
+		expect(await probeEmbeddings()).toBe("unknown");
+	}, 10_000);
 });
