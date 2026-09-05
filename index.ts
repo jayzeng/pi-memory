@@ -955,6 +955,7 @@ let qmdAvailabilityCheckedAt = 0;
 const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
 const DEFAULT_QMD_SEARCH_TIMEOUT_MS = 60_000;
+const DEFAULT_EMBED_PROBE_TIMEOUT_MS = 15_000;
 const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
 
 function qmdStatusTtl(positive: boolean): number {
@@ -964,6 +965,11 @@ function qmdStatusTtl(positive: boolean): number {
 export function getQmdSearchTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
 	const configured = Number(env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS);
 	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_QMD_SEARCH_TIMEOUT_MS;
+}
+
+export function getEmbedProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const configured = Number(env.PI_MEMORY_EMBED_PROBE_TIMEOUT_MS);
+	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_EMBED_PROBE_TIMEOUT_MS;
 }
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
@@ -1292,10 +1298,11 @@ export function runQmdSearch(
 	mode: "keyword" | "semantic" | "deep",
 	query: string,
 	limit: number,
+	timeoutOverrideMs?: number,
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
 	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
-	const timeoutMs = getQmdSearchTimeoutMs();
+	const timeoutMs = timeoutOverrideMs ?? getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
 		execFileFn("qmd", args, { timeout: timeoutMs }, (err, stdout, stderr) => {
@@ -1326,18 +1333,27 @@ export function runQmdSearch(
 
 /**
  * Best-effort check of whether vector embeddings are ready for semantic/deep
- * search. Bounded by a short timeout because the first semantic query can
- * trigger a model download. Returns "unknown" rather than blocking on it.
+ * search. Bounded by a timeout because the first semantic query can trigger a
+ * model download. Returns "unknown" rather than blocking on it.
  * "ready" means a probe query ran without qmd's "need embeddings" warning —
  * it does not prove the index has content.
+ *
+ * The bound must stay well clear of normal `qmd vsearch` latency: the probe
+ * runs an embed + rerank pass (measured ~2.4-3.6s idle, >4s while a background
+ * re-index competes for CPU and the embedding model). A tighter bound made
+ * `memory_status` report "unknown" immediately after a write, which is exactly
+ * when the index is busy. Override with PI_MEMORY_EMBED_PROBE_TIMEOUT_MS.
  */
 export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"> {
+	const probeTimeoutMs = getEmbedProbeTimeoutMs();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const { stderr } = await Promise.race([
-			runQmdSearch("semantic", "memory", 1),
+			// Bound the child by the same budget so a probe we abandon does not
+			// leave a long-running LLM query behind.
+			runQmdSearch("semantic", "memory", 1, probeTimeoutMs),
 			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error("timeout")), 4_000);
+				timer = setTimeout(() => reject(new Error("timeout")), probeTimeoutMs);
 			}),
 		]);
 		return /need embeddings/i.test(stderr ?? "") ? "missing" : "ready";
@@ -2394,7 +2410,10 @@ export default function (pi: ExtensionAPI) {
 							lines.push("  - Run `qmd embed` once to enable semantic/deep search.");
 						}
 					} else if (embeddings === "unknown") {
-						lines.push("  - Could not verify within the probe timeout; run a semantic search to confirm.");
+						lines.push(
+							`  - Could not verify within the ${getEmbedProbeTimeoutMs() / 1000}s probe timeout; run a semantic search to confirm.`,
+							"  - A background re-index can slow the probe. Raise PI_MEMORY_EMBED_PROBE_TIMEOUT_MS if it persists.",
+						);
 					}
 				} else {
 					lines.push("  - Run a `memory_search` (auto-creates it) or `qmd collection add` manually.");
@@ -2409,6 +2428,7 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_SNAPSHOT: ${getSnapshotMode()}`,
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
+				`- PI_MEMORY_EMBED_PROBE_TIMEOUT_MS: ${getEmbedProbeTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
