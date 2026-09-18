@@ -20,9 +20,11 @@ import {
 	_resetExecFileForTest,
 	_resetMemorySnapshot,
 	_resetQmdJsResolutionForTest,
+	_resetSpawnForTest,
 	_setBaseDir,
 	_setExecFileForTest,
 	_setQmdAvailable,
+	_setSpawnForTest,
 	buildMemoryContext,
 	buildQmdEnv,
 	buildQmdSpawn,
@@ -31,6 +33,7 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getExitSummaryMode,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
@@ -42,6 +45,7 @@ import {
 	readFileSafe,
 	resolveMemoryDir,
 	resolveQmdJsPath,
+	runExitSummaryWorker,
 	runQmdSearch,
 	type ScratchpadItem,
 	scheduleQmdUpdate,
@@ -1674,6 +1678,207 @@ describe("lifecycle hooks", () => {
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
 
 			expect(getApiKey).toHaveBeenCalledWith(sessionModel);
+		});
+	});
+
+	describe("exit summary detached mode", () => {
+		const fourMessageBranch = () => [
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Please remember we chose dark mode." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Noted, using it for the storage layer." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Also migrate the config to match." }],
+					timestamp: Date.now(),
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done — config migrated and tests pass." }],
+					timestamp: Date.now(),
+				},
+			},
+		];
+
+		let savedSummary: string | undefined;
+		beforeEach(() => {
+			savedSummary = process.env.PI_MEMORY_EXIT_SUMMARY;
+		});
+		afterEach(() => {
+			if (savedSummary === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY;
+			else process.env.PI_MEMORY_EXIT_SUMMARY = savedSummary;
+			_resetSpawnForTest();
+		});
+
+		test("getExitSummaryMode parses disabled/detached/inline", () => {
+			delete process.env.PI_MEMORY_EXIT_SUMMARY;
+			expect(getExitSummaryMode()).toBe("inline");
+			for (const value of ["0", "off", "false", "no"]) {
+				process.env.PI_MEMORY_EXIT_SUMMARY = value;
+				expect(getExitSummaryMode()).toBe("disabled");
+			}
+			for (const value of ["detached", "background"]) {
+				process.env.PI_MEMORY_EXIT_SUMMARY = value;
+				expect(getExitSummaryMode()).toBe("detached");
+				expect(isExitSummaryEnabled()).toBe(true);
+			}
+			process.env.PI_MEMORY_EXIT_SUMMARY = "1";
+			expect(getExitSummaryMode()).toBe("inline");
+		});
+
+		test("detached mode spawns the worker instead of summarizing inline", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
+			const spawnMock = mock(() => ({ on: mock(() => {}), unref: mock(() => {}) }));
+			_setSpawnForTest(spawnMock as never);
+			const getApiKey = mock(async () => "secret-key");
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			const [, args, opts] = (spawnMock as ReturnType<typeof mock>).mock.calls[0] as [
+				string,
+				string[],
+				{ detached: boolean },
+			];
+			expect(opts.detached).toBe(true);
+			expect(args).toContain("--exit-summary-worker");
+			const payloadPath = args[args.length - 1];
+			const payload = JSON.parse(fs.readFileSync(payloadPath, "utf-8")) as Record<string, unknown>;
+			expect(payload.apiKey).toBe("secret-key");
+			expect(payload.model).toEqual({ provider: "openai", id: "gpt-4o-mini" });
+			expect(payload.prompt).toContain("<conversation>");
+			expect(payload.sessionId).toBe("abcdef1234567890");
+			// the parent must not write the summary itself — the worker owns persistence
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+			fs.rmSync(path.dirname(payloadPath), { recursive: true, force: true });
+		});
+
+		test("detached mode still skips trivial sessions without spawning", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
+			const spawnMock = mock(() => ({ on: mock(() => {}), unref: mock(() => {}) }));
+			_setSpawnForTest(spawnMock as never);
+			const getApiKey = mock(async () => "key");
+			const ctx = createShutdownCtx({
+				branch: [
+					{
+						type: "message",
+						message: { role: "user", content: [{ type: "text", text: "ls" }], timestamp: Date.now() },
+					},
+					{
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "file.txt" }],
+							timestamp: Date.now(),
+						},
+					},
+				],
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(spawnMock).not.toHaveBeenCalled();
+			expect(getApiKey).not.toHaveBeenCalled();
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		});
+
+		test("detached mode falls back to inline when spawn fails", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
+			_setSpawnForTest(() => {
+				throw new Error("spawn failed");
+			});
+			const getApiKey = mock(async () => undefined);
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			// Inline attempt observed via the API-key lookup; no write (no key).
+			expect(getApiKey).toHaveBeenCalled();
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		});
+
+		describe("runExitSummaryWorker", () => {
+			test("writes the daily-log entry for a real summary", async () => {
+				_setQmdAvailable(false);
+				const completeFn = mock(async () => ({
+					content: [
+						{
+							type: "text",
+							text: "### Decisions\n- Adopt detached exit summaries.\n### Lessons Learned\nNone.\n### Notes\nNone.\n### Follow-ups\nNone.",
+						},
+					],
+				}));
+
+				await runExitSummaryWorker(
+					{
+						prompt: "<conversation>user: hi</conversation>",
+						model: { provider: "openai", id: "gpt-4o-mini" },
+						apiKey: "k",
+						sessionId: "abcdef1234567890",
+						reason: "ctrl+d",
+					},
+					{ completeFn: completeFn as never },
+				);
+
+				expect(completeFn).toHaveBeenCalledTimes(1);
+				const entry = readFileSafe(dailyPath(todayStr()));
+				expect(entry).toContain("## Session Summary (auto, exit: ctrl+d)");
+				expect(entry).toContain("[abcdef12]");
+				expect(entry).toContain("Adopt detached exit summaries.");
+			});
+
+			test("drops empty summaries without writing", async () => {
+				_setQmdAvailable(false);
+				const completeFn = mock(async () => ({
+					content: [
+						{
+							type: "text",
+							text: "### Decisions\nNone.\n### Lessons Learned\nNone.\n### Notes\nNone.\n### Follow-ups\nNone.",
+						},
+					],
+				}));
+
+				await runExitSummaryWorker(
+					{
+						prompt: "<conversation>user: hi</conversation>",
+						model: { provider: "openai", id: "gpt-4o-mini" },
+						apiKey: "k",
+						sessionId: "abcdef1234567890",
+						reason: "session-end",
+					},
+					{ completeFn: completeFn as never },
+				);
+
+				expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+			});
 		});
 	});
 
