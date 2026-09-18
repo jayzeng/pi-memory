@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Detached exit summaries** (`PI_MEMORY_EXIT_SUMMARY=detached`, alias
+  `background`): the exit summary is handed to a detached worker process, so
+  quitting pi is instant and the 10s shutdown timeout no longer applies. The
+  worker performs the LLM call, appends the daily log, and refreshes `qmd`
+  after pi has already exited. If spawning fails, the shutdown handler falls
+  back to the inline path. The inline behavior remains the default and is
+  unchanged.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

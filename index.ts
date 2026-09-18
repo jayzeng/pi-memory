@@ -23,10 +23,12 @@
  *   - MEMORY.md + SCRATCHPAD.md + today's + yesterday's daily logs injected into every turn
  */
 
-import { type ExecFileOptions, execFile } from "node:child_process";
+import { type ExecFileOptions, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import {
@@ -416,10 +418,22 @@ function resolveExitSummaryModel(ctx: ExtensionContext): ExtensionContext["model
 	return ctx.model;
 }
 
-async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
+type PreparedExitSummary =
+	| { kind: "skip" }
+	| { kind: "error" }
+	| { kind: "ok"; prompt: string; model: NonNullable<ExtensionContext["model"]>; apiKey: string };
+
+/**
+ * Shared pre-flight for the exit summary (inline and detached modes): resolves
+ * the session branch, applies the curated-write gate, resolves model + API
+ * key, and builds the summary prompt. "skip" means there is nothing to
+ * summarize (no branch or trivial session); "error" means a summary was
+ * warranted but cannot be produced (no model/key, empty transcript).
+ */
+async function prepareExitSummaryRequest(ctx: ExtensionContext): Promise<PreparedExitSummary> {
 	const branch = getSessionBranch(ctx);
 	if (!branch) {
-		return { summary: null, error: "Session branch unavailable", hasMessages: false };
+		return { kind: "skip" };
 	}
 
 	const messages = branch
@@ -431,43 +445,53 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 	// faithfully resurface forever. Only sessions with enough exchange to
 	// plausibly contain decisions/lessons earn an automatic summary.
 	if (messages.length < EXIT_SUMMARY_MIN_MESSAGES) {
-		return { summary: null, hasMessages: false };
+		return { kind: "skip" };
 	}
 
 	const model = resolveExitSummaryModel(ctx);
 	if (!model) {
-		return { summary: null, error: "No active model", hasMessages: true };
+		return { kind: "error" };
 	}
 
 	const apiKey = await resolveExitSummaryApiKey(ctx, model);
 	if (!apiKey) {
-		return {
-			summary: null,
-			error: `API key resolution unavailable for ${model.provider}/${model.id}`,
-			hasMessages: true,
-		};
+		return { kind: "error" };
 	}
 
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const { text: truncatedText, truncated, totalChars } = truncateConversationForSummary(conversationText);
 	if (!truncatedText.trim()) {
-		return { summary: null, error: "No conversation text to summarize", hasMessages: true };
+		return { kind: "error" };
+	}
+
+	return {
+		kind: "ok",
+		prompt: buildExitSummaryPrompt(truncatedText, truncated, totalChars),
+		model,
+		apiKey,
+	};
+}
+
+async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
+	const prepared = await prepareExitSummaryRequest(ctx);
+	if (prepared.kind !== "ok") {
+		return { summary: null, hasMessages: prepared.kind === "error" };
 	}
 
 	const summaryMessages: Message[] = [
 		{
 			role: "user",
-			content: [{ type: "text", text: buildExitSummaryPrompt(truncatedText, truncated, totalChars) }],
+			content: [{ type: "text", text: prepared.prompt }],
 			timestamp: Date.now(),
 		},
 	];
 
 	try {
 		const response = await complete(
-			model,
+			prepared.model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: "low" },
+			{ apiKey: prepared.apiKey, reasoningEffort: "low" },
 		);
 
 		const summaryText = response.content
@@ -484,6 +508,154 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 	} catch (err) {
 		return { summary: null, error: err instanceof Error ? err.message : String(err), hasMessages: true };
 	}
+}
+
+// --- Detached exit summary -------------------------------------------------
+
+interface DetachedExitSummaryPayload {
+	prompt: string;
+	model: NonNullable<ExtensionContext["model"]>;
+	apiKey: string;
+	sessionId: string;
+	reason: ExitSummaryReason;
+}
+
+const EXIT_SUMMARY_WORKER_ARG = "--exit-summary-worker";
+
+/**
+ * Spawn the exit-summary worker as a detached child process. The payload
+ * (prompt, model, API key) is handed over via a 0600 temp file; the worker
+ * deletes it after reading. Returns false when spawning failed, so the caller
+ * can fall back to the inline path.
+ */
+function spawnDetachedExitSummaryWorker(payload: DetachedExitSummaryPayload): boolean {
+	let payloadDir: string | undefined;
+	try {
+		payloadDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-exit-summary-"));
+		const payloadPath = path.join(payloadDir, "payload.json");
+		fs.writeFileSync(payloadPath, JSON.stringify(payload), { encoding: "utf-8", mode: 0o600 });
+		const selfPath = fileURLToPath(import.meta.url);
+		const args = [selfPath, EXIT_SUMMARY_WORKER_ARG, payloadPath];
+		const child = spawnForTest
+			? spawnForTest(process.execPath, args, { detached: true, stdio: "ignore" })
+			: spawn(process.execPath, args, { detached: true, stdio: "ignore" });
+		child.on("error", () => {
+			// Async spawn failure (e.g. execPath vanished): pi is already gone, so
+			// the summary is dropped — same as inline timeout expiry.
+			try {
+				fs.rmSync(payloadDir as string, { recursive: true, force: true });
+			} catch {
+				/* best-effort cleanup */
+			}
+		});
+		child.unref();
+		return true;
+	} catch {
+		if (payloadDir) {
+			try {
+				fs.rmSync(payloadDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort cleanup */
+			}
+		}
+		return false;
+	}
+}
+
+/**
+ * Try to hand the exit summary to a detached worker. Returns "spawned" when
+ * the worker owns the summary, "skip" when there is nothing to summarize
+ * (shared curated-write gate), and "fallback" when the caller should run the
+ * inline path instead (spawn failed, or the summary could not be prepared).
+ */
+async function trySpawnDetachedExitSummary(
+	ctx: ExtensionContext,
+	reason: ExitSummaryReason,
+): Promise<"spawned" | "skip" | "fallback"> {
+	const prepared = await prepareExitSummaryRequest(ctx);
+	if (prepared.kind !== "ok") {
+		return prepared.kind === "skip" ? "skip" : "fallback";
+	}
+
+	const payload: DetachedExitSummaryPayload = {
+		prompt: prepared.prompt,
+		model: JSON.parse(JSON.stringify(prepared.model)) as typeof prepared.model,
+		apiKey: prepared.apiKey,
+		sessionId: ctx.sessionManager.getSessionId(),
+		reason,
+	};
+	return spawnDetachedExitSummaryWorker(payload) ? "spawned" : "fallback";
+}
+
+/**
+ * Worker body: performs the LLM call and persists the summary to the daily
+ * log, then refreshes qmd. Runs in the detached worker process; exported (and
+ * injectable `completeFn`) so the write path stays unit-testable.
+ */
+export async function runExitSummaryWorker(
+	payload: DetachedExitSummaryPayload,
+	deps: { completeFn: typeof complete } = { completeFn: complete },
+): Promise<void> {
+	const summaryMessages: Message[] = [
+		{
+			role: "user",
+			content: [{ type: "text", text: payload.prompt }],
+			timestamp: Date.now(),
+		},
+	];
+
+	let summaryText = "";
+	try {
+		const response = await deps.completeFn(
+			payload.model,
+			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
+			{ apiKey: payload.apiKey, reasoningEffort: "low" },
+		);
+		summaryText = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n")
+			.trim();
+	} catch {
+		// Provider failure: drop the summary (same as inline timeout expiry).
+		return;
+	}
+	if (!summaryText || isExitSummaryEmpty(summaryText)) return;
+
+	const entry = formatExitSummaryEntry(summaryText, payload.reason, shortSessionId(payload.sessionId), nowTimestamp());
+	ensureDirs();
+	const filePath = dailyPath(todayStr());
+	const existing = readFileSafe(filePath) ?? "";
+	const separator = existing.trim() ? "\n\n" : "";
+	fs.writeFileSync(filePath, existing + separator + entry, "utf-8");
+	await ensureQmdAvailableForUpdate();
+	await runQmdUpdateNow();
+}
+
+/**
+ * Entry point when this file is executed directly as the detached worker:
+ * `bun index.ts --exit-summary-worker <payload.json>`. Reads and deletes the
+ * payload, then runs the summary. Never runs when pi loads this file as an
+ * extension (import.meta.main is false there).
+ */
+async function runExitSummaryWorkerProcess(argv: string[]): Promise<void> {
+	const argIndex = argv.indexOf(EXIT_SUMMARY_WORKER_ARG);
+	const payloadPath = argIndex >= 0 ? argv[argIndex + 1] : undefined;
+	if (!payloadPath) return;
+
+	let payload: DetachedExitSummaryPayload;
+	try {
+		payload = JSON.parse(fs.readFileSync(payloadPath, "utf-8")) as DetachedExitSummaryPayload;
+	} catch {
+		return;
+	}
+	try {
+		fs.rmSync(path.dirname(payloadPath), { recursive: true, force: true });
+	} catch {
+		/* best-effort cleanup */
+	}
+	if (!payload?.prompt || !payload.model || !payload.apiKey) return;
+	await runExitSummaryWorker(payload);
 }
 
 function getQmdUpdateMode(): "background" | "manual" | "off" {
@@ -503,9 +675,24 @@ export function shouldSummarizeLifecycleTransitions(): boolean {
  * Exit summaries on real quit (Ctrl+D, /quit, session end) can be disabled
  * with PI_MEMORY_EXIT_SUMMARY=0 (aliases: off/false/no). Default: enabled.
  */
-export function isExitSummaryEnabled(): boolean {
+/**
+ * Exit summary run mode. PI_MEMORY_EXIT_SUMMARY accepts:
+ *   - `0`/`off`/`false`/`no`: disabled (no exit summary at all)
+ *   - `detached` (alias `background`): the summary runs in a detached worker
+ *     process after pi has exited, so quitting is instant and no shutdown
+ *     timeout applies
+ *   - anything else (including unset): inline (default; the summary is
+ *     generated during session_shutdown, bounded by PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS)
+ */
+export function getExitSummaryMode(): "disabled" | "detached" | "inline" {
 	const value = (process.env.PI_MEMORY_EXIT_SUMMARY ?? "").trim().toLowerCase();
-	return !(value === "0" || value === "off" || value === "false" || value === "no");
+	if (value === "0" || value === "off" || value === "false" || value === "no") return "disabled";
+	if (value === "detached" || value === "background") return "detached";
+	return "inline";
+}
+
+export function isExitSummaryEnabled(): boolean {
+	return getExitSummaryMode() !== "disabled";
 }
 
 /**
@@ -977,6 +1164,18 @@ export function _setExecFileForTest(fn: ExecFileFn) {
 /** Reset execFile implementation (for testing). */
 export function _resetExecFileForTest() {
 	execFileFn = execFileWithQmdOptions;
+}
+
+let spawnForTest: typeof spawn | null = null;
+
+/** Override spawn implementation (for testing the detached exit summary). */
+export function _setSpawnForTest(fn: typeof spawn) {
+	spawnForTest = fn;
+}
+
+/** Reset spawn implementation (for testing). */
+export function _resetSpawnForTest() {
+	spawnForTest = null;
 }
 
 /** Set qmd availability flag (for testing). */
@@ -1486,6 +1685,13 @@ export default function (pi: ExtensionAPI) {
 
 		const reason = exitSummaryReason ?? "session-end";
 		exitSummaryReason = null;
+
+		if (getExitSummaryMode() === "detached") {
+			const outcome = await trySpawnDetachedExitSummary(ctx, reason);
+			if (outcome !== "fallback") return;
+			// Spawn failed: fall through to the inline path below so the summary
+			// attempt is not silently lost.
+		}
 
 		let summaryTimer: ReturnType<typeof setTimeout> | undefined;
 		try {
@@ -2428,4 +2634,17 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Detached exit-summary worker entry
+// ---------------------------------------------------------------------------
+
+// Spawned by spawnDetachedExitSummaryWorker() as:
+//   <runtime> index.ts --exit-summary-worker <payload.json>
+// Runs after pi has already exited: performs the LLM call, appends the daily
+// log, and refreshes qmd. Never runs when pi loads this file as an extension
+// (import.meta.main is false there).
+if (import.meta.main) {
+	await runExitSummaryWorkerProcess(process.argv);
 }
