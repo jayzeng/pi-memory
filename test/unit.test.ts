@@ -31,6 +31,7 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
@@ -1787,6 +1788,44 @@ describe("lifecycle hooks", () => {
 
 			expect(getApiKey).toHaveBeenCalled();
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		});
+	});
+
+	describe("exit summary reasoning effort", () => {
+		let savedEffort: string | undefined;
+		beforeEach(() => {
+			savedEffort = process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+		});
+		afterEach(() => {
+			if (savedEffort === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+			else process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = savedEffort;
+		});
+
+		test("getExitSummaryReasoningEffort defaults to low", () => {
+			delete process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+			expect(getExitSummaryReasoningEffort()).toBe("low");
+		});
+
+		test("getExitSummaryReasoningEffort passes through configured values", () => {
+			for (const value of ["high", "max", "none", "medium", "minimal", "xhigh"]) {
+				process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = value;
+				expect(getExitSummaryReasoningEffort()).toBe(value);
+			}
+		});
+
+		test("getExitSummaryReasoningEffort is case-insensitive", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "HIGH";
+			expect(getExitSummaryReasoningEffort()).toBe("high");
+		});
+
+		test("getExitSummaryReasoningEffort returns undefined for off", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "off";
+			expect(getExitSummaryReasoningEffort()).toBeUndefined();
+		});
+
+		test("getExitSummaryReasoningEffort treats empty string as default", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "   ";
+			expect(getExitSummaryReasoningEffort()).toBe("low");
 		});
 	});
 
