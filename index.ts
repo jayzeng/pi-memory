@@ -984,7 +984,60 @@ export function getQmdSearchTimeoutMs(env: NodeJS.ProcessEnv = process.env): num
 	const configured = Number(env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS);
 	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_QMD_SEARCH_TIMEOUT_MS;
 }
-let updateTimer: ReturnType<typeof setTimeout> | null = null;
+// ---------------------------------------------------------------------------
+// Background QMD lifecycle state
+//
+// One process can host more than one Pi instance (embedded hosts, tests), and
+// a shutdown in one instance must never cancel another instance's background
+// embeds/updates. All mutable QMD background bookkeeping therefore lives in a
+// per-registration state object instead of module-level globals. (Scope: QMD
+// bookkeeping only — exit-summary and terminal-input state remain module-level.)
+// ---------------------------------------------------------------------------
+type BackgroundQmdChild = ReturnType<ExecFileFn>;
+
+/** One tracked background qmd direct child. */
+interface QmdBackgroundHandle {
+	child: BackgroundQmdChild | null;
+	/** Deadline in ms; enforced by our own watchdog, not by execFile. */
+	deadlineMs: number;
+	/** Kill the direct child only (never the grandchild tree). */
+	kill: () => void;
+	/** Fire the deadline path: kill the direct child, then complete once. */
+	expire: () => void;
+	/** Resolves once the bookkeeping is settled. */
+	exited: Promise<void>;
+	/** Drop bookkeeping without invoking the completion callback. */
+	dispose: () => void;
+}
+
+interface QmdBackgroundState {
+	/** False for print/headless sessions: no fire-and-forget QMD work at all. */
+	enabled: boolean;
+	/** Bumped on each session boundary; stale callbacks compare against it. */
+	lifecycle: number;
+	embedInFlight: boolean;
+	embedPending: boolean;
+	updateTimer: ReturnType<typeof setTimeout> | null;
+	/** Live background qmd direct children owned by this instance. */
+	handles: Set<QmdBackgroundHandle>;
+}
+
+function createQmdBackgroundState(): QmdBackgroundState {
+	return {
+		enabled: true,
+		lifecycle: 0,
+		embedInFlight: false,
+		embedPending: false,
+		updateTimer: null,
+		handles: new Set(),
+	};
+}
+
+// The exported module-level helpers below are back-compat/test seams: they act
+// on the most recently registered instance. Production handlers close over
+// their own state object instead.
+let activeQmdState: QmdBackgroundState = createQmdBackgroundState();
+
 let exitSummaryReason: ExitSummaryReason | null = null;
 let terminalInputUnsubscribe: (() => void) | null = null;
 
@@ -1009,17 +1062,21 @@ export function _getQmdAvailable(): boolean {
 	return qmdAvailable;
 }
 
+function clearQmdUpdateTimer(state: QmdBackgroundState) {
+	if (state.updateTimer) {
+		clearTimeout(state.updateTimer);
+		state.updateTimer = null;
+	}
+}
+
 /** Get current update timer (for testing). */
 export function _getUpdateTimer(): ReturnType<typeof setTimeout> | null {
-	return updateTimer;
+	return activeQmdState.updateTimer;
 }
 
 /** Clear the update timer (for testing). */
 export function _clearUpdateTimer() {
-	if (updateTimer) {
-		clearTimeout(updateTimer);
-		updateTimer = null;
-	}
+	clearQmdUpdateTimer(activeQmdState);
 }
 
 /** Clear qmd status caches (for testing). */
@@ -1146,66 +1203,212 @@ export function checkCollection(name: string): Promise<boolean> {
 
 // `qmd embed` is incremental: it only embeds new/changed chunks and no-ops in
 // well under a second when everything is current. The first run ever may
-// download the embedding model, hence the generous timeout.
-const QMD_EMBED_TIMEOUT_MS = 10 * 60 * 1000;
-let embedInFlight = false;
-let embedPending = false;
+// download the embedding model, hence the generous deadline.
+const DEFAULT_QMD_EMBED_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_QMD_UPDATE_TIMEOUT_MS = 30_000;
+/** Upper bound on how long shutdown waits for killed qmd children to exit. */
+const SHUTDOWN_CHILD_WAIT_MS = 1_000;
+
+/**
+ * Start a fire-and-forget `qmd <args>` child and own its deadline.
+ *
+ * The deadline is deliberately *not* execFile's `timeout` option: that timer is
+ * ref'd, so a launcher whose grandchild inherits its stdio keeps the host's
+ * event loop alive for the whole deadline (measured: a 600s deadline blocked
+ * exit for 600s even with the child and both pipes unref'd). Our watchdog is
+ * unref'd, so it never delays host exit, and it kills the direct launcher when
+ * it fires.
+ *
+ * `onComplete` runs exactly once per child on real completion or deadline; the
+ * `dispose` path drops bookkeeping without notifying. The `settled` guard makes
+ * every race terminal exactly once.
+ */
+function runBackgroundQmd(state: QmdBackgroundState, args: string[], timeoutMs: number, onComplete: () => void) {
+	let child: BackgroundQmdChild | null = null;
+	let watchdog: ReturnType<typeof setTimeout> | null = null;
+	let handle: QmdBackgroundHandle | null = null;
+	let settled = false;
+	let resolveExited: () => void = () => {};
+	const exited = new Promise<void>((resolve) => {
+		resolveExited = resolve;
+	});
+
+	const settle = (notify: boolean) => {
+		if (settled) return;
+		settled = true;
+		if (watchdog) {
+			clearTimeout(watchdog);
+			watchdog = null;
+		}
+		if (handle) {
+			state.handles.delete(handle);
+			handle = null;
+		}
+		resolveExited();
+		if (notify) onComplete();
+	};
+
+	const killChild = () => {
+		try {
+			// Direct launcher only: qmd's grandchild is detached by design and is
+			// not promised to die with it.
+			child?.kill?.();
+		} catch {
+			// Already gone — nothing to do.
+		}
+	};
+
+	// No `timeout` here on purpose (see above).
+	const spawned = execFileFn("qmd", args, {}, () => settle(true));
+	child = (spawned as unknown as BackgroundQmdChild | undefined) ?? null;
+	if (child) {
+		// Unref everything we own so background work never keeps the host alive.
+		// A grandchild holding our pipes open is explicitly tolerated.
+		child.unref?.();
+		(child.stdout as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
+		(child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
+		// The launcher exiting means our child is done, even if a grandchild keeps
+		// the collected pipes open (execFile's callback fires on `close`).
+		if (typeof (child as { once?: unknown }).once === "function") {
+			child.once("exit", () => settle(true));
+			child.once("error", () => settle(true));
+		}
+	}
+
+	// A synchronous test seam may have completed the child during execFileFn.
+	if (settled) return;
+
+	watchdog = setTimeout(() => {
+		killChild();
+		settle(true);
+	}, timeoutMs);
+	// The deadline must never be a reason for the host to stay alive.
+	watchdog.unref?.();
+
+	handle = {
+		child,
+		deadlineMs: timeoutMs,
+		kill: killChild,
+		exited,
+		expire: () => {
+			killChild();
+			settle(true);
+		},
+		dispose: () => settle(false),
+	};
+	state.handles.add(handle);
+}
+
+/**
+ * Stop every background QMD task owned by this instance: clear the debounce
+ * timer and watchdogs, kill tracked direct children, and give them at most
+ * `SHUTDOWN_CHILD_WAIT_MS` to exit. Grandchildren are not tracked and not
+ * promised to be killed. Safe to call repeatedly (a late/duplicate shutdown is
+ * a no-op once nothing is tracked).
+ */
+async function stopBackgroundQmd(state: QmdBackgroundState): Promise<void> {
+	state.enabled = false;
+	state.lifecycle++;
+	state.embedPending = false;
+	state.embedInFlight = false;
+	clearQmdUpdateTimer(state);
+
+	const pending = [...state.handles];
+	if (pending.length === 0) return;
+
+	for (const handle of pending) handle.kill();
+
+	await Promise.race([
+		Promise.all(pending.map((handle) => handle.exited)),
+		new Promise<void>((resolve) => {
+			// Bounded and unref'd: teardown must not extend the host's life.
+			const timer = setTimeout(resolve, SHUTDOWN_CHILD_WAIT_MS);
+			timer.unref?.();
+		}),
+	]);
+
+	// Exited, or we stopped waiting. Either way nothing stays tracked.
+	for (const handle of pending) handle.dispose();
+}
 
 /**
  * Ensure a background `qmd embed` is running so semantic/deep search stays
  * usable without the user ever running it manually. Returns true if an embed
  * is now running (started here or already in flight), false if embedding is
- * unavailable (qmd missing or background updates disabled).
+ * unavailable (qmd missing, shutdown started, or background updates disabled).
  *
  * If an embed is already running, the request is queued: another embed runs
  * immediately after the current one finishes, so chunks written while the
  * first embed was already underway don't have to wait for the next session.
  */
-export function ensureQmdEmbed(): boolean {
-	if (getQmdUpdateMode() !== "background") return false;
+function startQmdEmbed(state: QmdBackgroundState): boolean {
+	if (!state.enabled || getQmdUpdateMode() !== "background") return false;
 	if (!qmdAvailable) return false;
-	if (embedInFlight) {
-		embedPending = true;
+	if (state.embedInFlight) {
+		state.embedPending = true;
 		return true;
 	}
-	embedInFlight = true;
-	execFileFn("qmd", ["embed"], { timeout: QMD_EMBED_TIMEOUT_MS }, () => {
-		embedInFlight = false;
-		if (embedPending) {
-			embedPending = false;
-			ensureQmdEmbed();
+	state.embedInFlight = true;
+	const lifecycle = state.lifecycle;
+	runBackgroundQmd(state, ["embed"], DEFAULT_QMD_EMBED_TIMEOUT_MS, () => {
+		if (!state.enabled || lifecycle !== state.lifecycle) return;
+		state.embedInFlight = false;
+		if (state.embedPending) {
+			state.embedPending = false;
+			startQmdEmbed(state);
 		}
 	});
 	return true;
 }
 
-/** Get/clear the embed-in-flight flag (for testing). */
-export function _getEmbedInFlight(): boolean {
-	return embedInFlight;
-}
-export function _clearEmbedInFlight() {
-	embedInFlight = false;
-	embedPending = false;
-}
-
-export function scheduleQmdUpdate() {
-	if (getQmdUpdateMode() !== "background") return;
+function scheduleQmdUpdateForState(state: QmdBackgroundState) {
+	if (!state.enabled || getQmdUpdateMode() !== "background") return;
 	if (!qmdAvailable) return;
-	if (updateTimer) clearTimeout(updateTimer);
-	updateTimer = setTimeout(() => {
-		updateTimer = null;
-		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => ensureQmdEmbed());
+	clearQmdUpdateTimer(state);
+	state.updateTimer = setTimeout(() => {
+		state.updateTimer = null;
+		const lifecycle = state.lifecycle;
+		runBackgroundQmd(state, ["update"], DEFAULT_QMD_UPDATE_TIMEOUT_MS, () => {
+			if (state.enabled && lifecycle === state.lifecycle) startQmdEmbed(state);
+		});
 	}, 500);
 }
 
-async function runQmdUpdateNow() {
-	if (getQmdUpdateMode() !== "background") return;
-	if (!qmdAvailable) return;
-	await new Promise<void>((resolve) => {
-		execFileFn("qmd", ["update"], { timeout: 30_000 }, () => resolve());
-	});
-	// Embeds for the final writes are picked up by the session_start catch-up
-	// embed; not chained here so shutdown stays fast.
+/**
+ * Ensure a background `qmd embed` is running (see `startQmdEmbed`). Module-level
+ * seam: acts on the most recently registered instance.
+ */
+export function ensureQmdEmbed(): boolean {
+	return startQmdEmbed(activeQmdState);
+}
+
+/** Get/clear the embed-in-flight flag (for testing). */
+export function _getEmbedInFlight(): boolean {
+	return activeQmdState.embedInFlight;
+}
+export function _clearEmbedInFlight() {
+	activeQmdState.lifecycle++;
+	activeQmdState.enabled = true;
+	activeQmdState.embedInFlight = false;
+	activeQmdState.embedPending = false;
+	for (const handle of [...activeQmdState.handles]) handle.dispose();
+}
+
+/** Test seam: pending background-qmd watchdog deadlines, in ms. */
+export function _getTrackedBackgroundQmdDeadlines(): number[] {
+	return [...activeQmdState.handles].map((handle) => handle.deadlineMs);
+}
+
+/** Test seam: fire every pending background-qmd watchdog immediately. */
+export function _fireBackgroundWatchdogsForTest(): number {
+	const handles = [...activeQmdState.handles];
+	for (const handle of handles) handle.expire();
+	return handles.length;
+}
+
+/** Debounce a background `qmd update` (module-level seam, see above). */
+export function scheduleQmdUpdate() {
+	scheduleQmdUpdateForState(activeQmdState);
 }
 
 /** Search for memories relevant to the user's prompt. Returns formatted markdown or empty string on error. */
@@ -1443,8 +1646,24 @@ export function _resetMemorySnapshot() {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Per-instance QMD background bookkeeping: another Pi instance in the same
+	// process must not be able to cancel (or be cancelled by) this one's embeds
+	// and updates.
+	const qmdState = createQmdBackgroundState();
+	activeQmdState = qmdState;
+	// Shadow the module-level test seams so every handler below uses this
+	// instance's state.
+	const ensureQmdEmbed = () => startQmdEmbed(qmdState);
+	const scheduleQmdUpdate = () => scheduleQmdUpdateForState(qmdState);
+
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
+		// Print/headless sessions must never start fire-and-forget QMD work: a
+		// qmd launcher can leave a model-loading grandchild holding the host's
+		// pipes open after the run is over. Awaited queries (memory_search) are
+		// unaffected.
+		qmdState.enabled = ctx.hasUI;
+		qmdState.lifecycle++;
 		exitSummaryReason = null;
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
@@ -1484,6 +1703,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event, ctx) => {
 		const shutdownReason = (event as { reason?: string }).reason;
 
+		await stopBackgroundQmd(qmdState);
+
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -1496,10 +1717,6 @@ export default function (pi: ExtensionAPI) {
 		// PI_MEMORY_SUMMARIZE_TRANSITIONS=1.
 		if (shouldSkipExitSummaryForReason(shutdownReason) || !isExitSummaryEnabled()) {
 			exitSummaryReason = null;
-			if (updateTimer) {
-				clearTimeout(updateTimer);
-				updateTimer = null;
-			}
 			return;
 		}
 
@@ -1534,16 +1751,14 @@ export default function (pi: ExtensionAPI) {
 					const existing = readFileSafe(filePath) ?? "";
 					const separator = existing.trim() ? "\n\n" : "";
 					fs.writeFileSync(filePath, existing + separator + entry, "utf-8");
-					await ensureQmdAvailableForUpdate();
-					await runQmdUpdateNow();
+					// No QMD work here: stopBackgroundQmd() already ran at the top of
+					// this handler, so an update/embed at this point could only be a
+					// no-op that still risks spawning a process during teardown.
+					// The next session_start catch-up embed picks up these writes.
 				}
 			}
 		} finally {
 			if (summaryTimer) clearTimeout(summaryTimer);
-			if (updateTimer) {
-				clearTimeout(updateTimer);
-				updateTimer = null;
-			}
 		}
 	});
 

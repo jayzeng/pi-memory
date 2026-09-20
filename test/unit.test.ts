@@ -7,14 +7,19 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
 	_clearEmbedInFlight,
+	_clearQmdStatusCaches,
 	_clearUpdateTimer,
+	_fireBackgroundWatchdogsForTest,
 	_getEmbedInFlight,
+	_getTrackedBackgroundQmdDeadlines,
 	_getUpdateTimer,
 	_resetBaseDir,
 	_resetExecFileForTest,
@@ -703,6 +708,177 @@ describe("scheduleQmdUpdate", () => {
 	});
 });
 
+describe("background QMD reliability", () => {
+	test("embed owns a 600s watchdog instead of an execFile timeout", () => {
+		_setQmdAvailable(true);
+		_clearEmbedInFlight();
+		const callbacks: any[] = [];
+		const options: any[] = [];
+		_setExecFileForTest(((_file: string, _args: string[], opts: any, cb: any) => {
+			options.push(opts);
+			callbacks.push(cb);
+			return { kill: mock(() => true), unref: mock(() => {}) };
+		}) as any);
+		try {
+			expect(ensureQmdEmbed()).toBe(true);
+			expect(ensureQmdEmbed()).toBe(true);
+			// The deadline must be ours: execFile's built-in timer stays ref'd and
+			// would keep the host alive for the whole deadline.
+			expect(options[0].timeout).toBeUndefined();
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([10 * 60_000]);
+			// A deadline and the real callback can both fire for the same child;
+			// the pending queue must still advance once.
+			callbacks[0](new Error("timeout"), "", "");
+			callbacks[0](null, "", "");
+			expect(_getEmbedInFlight()).toBe(true);
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([10 * 60_000]);
+			callbacks[1](null, "", "");
+			expect(_getEmbedInFlight()).toBe(false);
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([]);
+		} finally {
+			_resetExecFileForTest();
+			_clearEmbedInFlight();
+			_setQmdAvailable(false);
+		}
+	});
+
+	test("the embed watchdog kills the direct child once and leaves late callbacks inert", () => {
+		_setQmdAvailable(true);
+		_clearEmbedInFlight();
+		const kill = mock(() => true);
+		const callbacks: any[] = [];
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			callbacks.push(cb);
+			return {
+				kill,
+				unref: mock(() => {}),
+				stdout: { unref: mock(() => {}) },
+				stderr: { unref: mock(() => {}) },
+			};
+		}) as any);
+		try {
+			expect(ensureQmdEmbed()).toBe(true);
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([10 * 60_000]);
+
+			expect(_fireBackgroundWatchdogsForTest()).toBe(1);
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(_getEmbedInFlight()).toBe(false);
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([]);
+
+			// The killed child's real callback lands late: it must not clear or
+			// re-arm the next in-flight child.
+			expect(ensureQmdEmbed()).toBe(true);
+			callbacks[0](null, "", "");
+			expect(_getEmbedInFlight()).toBe(true);
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([10 * 60_000]);
+		} finally {
+			_resetExecFileForTest();
+			_clearEmbedInFlight();
+			_setQmdAvailable(false);
+		}
+	});
+
+	test("background qmd update owns a 30s watchdog instead of an execFile timeout", async () => {
+		_setQmdAvailable(true);
+		_clearUpdateTimer();
+		_clearEmbedInFlight();
+		const options: any[] = [];
+		_setExecFileForTest(((_file: string, _args: string[], opts: any, _cb: any) => {
+			options.push(opts);
+			// Never complete: keep the update child tracked.
+			return { kill: mock(() => true), unref: mock(() => {}) };
+		}) as any);
+		try {
+			scheduleQmdUpdate();
+			await new Promise((r) => setTimeout(r, 700));
+			expect(options[0].timeout).toBeUndefined();
+			expect(_getTrackedBackgroundQmdDeadlines()).toEqual([30_000]);
+		} finally {
+			_resetExecFileForTest();
+			_clearUpdateTimer();
+			_clearEmbedInFlight();
+			_setQmdAvailable(false);
+		}
+	});
+
+	// Real subprocess regression for the confirmed High: a qmd launcher that
+	// spawns a grandchild inheriting the launcher's stdio keeps the pipe open, so
+	// execFile's own ref'd deadline timer keeps the host alive for the whole
+	// deadline (measured: 0s without it vs. the grandchild's lifetime with
+	// `{timeout}`). The host must exit promptly while our unref'd watchdog is
+	// still pending. Grandchildren are explicitly not killed here.
+	test("host exits long before the pending 600s watchdog when a grandchild holds the pipes", async () => {
+		if (process.platform === "win32") return; // POSIX shell fixture below
+
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-host-"));
+		try {
+			const binDir = path.join(dir, "bin");
+			fs.mkdirSync(binDir);
+			const fakeQmd = path.join(binDir, "qmd");
+			// Launcher exits immediately; the grandchild inherits stdout/stderr and
+			// keeps the pipe open long past the host's lifetime.
+			fs.writeFileSync(fakeQmd, "#!/bin/sh\nsleep 45 &\nexit 0\n", { mode: 0o755 });
+
+			const indexPath = fileURLToPath(new URL("../index.ts", import.meta.url));
+			const hostScript = path.join(dir, "host.ts");
+			fs.writeFileSync(
+				hostScript,
+				[
+					`import { _setQmdAvailable, ensureQmdEmbed, _getTrackedBackgroundQmdDeadlines } from ${JSON.stringify(indexPath)};`,
+					"_setQmdAvailable(true);",
+					"const started = ensureQmdEmbed();",
+					"console.log(JSON.stringify({ started, deadlines: _getTrackedBackgroundQmdDeadlines() }));",
+				].join("\n"),
+				"utf-8",
+			);
+
+			// Must be node, not the current (bun) runtime: the ref'd execFile deadline
+			// timer that causes the block only exists in node's child_process.
+			const nodeBin = process.env.PI_MEMORY_TEST_NODE ?? "node";
+			const budgetMs = 15_000;
+			const startedAt = Date.now();
+			type Outcome = { code: number | null; stdout: string; timedOut: boolean; spawnError: boolean };
+			const outcome = await new Promise<Outcome>((resolve) => {
+				const host = spawn(nodeBin, [hostScript], {
+					env: {
+						...process.env,
+						PI_MEMORY_DIR: dir,
+						PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+					},
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+				let stdout = "";
+				let timedOut = false;
+				host.stdout.on("data", (chunk) => {
+					stdout += String(chunk);
+				});
+				const killer = setTimeout(() => {
+					timedOut = true;
+					host.kill("SIGKILL");
+				}, budgetMs);
+				host.on("error", () => {
+					clearTimeout(killer);
+					resolve({ code: null, stdout, timedOut: false, spawnError: true });
+				});
+				host.on("close", (code) => {
+					clearTimeout(killer);
+					resolve({ code, stdout, timedOut, spawnError: false });
+				});
+			});
+			const elapsed = Date.now() - startedAt;
+
+			// No usable `node` on PATH: environment limitation, not a regression.
+			if (outcome.spawnError) return;
+			expect(outcome.timedOut).toBe(false);
+			expect(outcome.code).toBe(0);
+			expect(outcome.stdout).toContain('"deadlines":[600000]');
+			expect(elapsed).toBeLessThan(budgetMs);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("ensureQmdEmbed", () => {
 	afterEach(() => {
 		_resetExecFileForTest();
@@ -1352,18 +1528,25 @@ describe("memory_status tool", () => {
 
 describe("lifecycle hooks", () => {
 	let hooks: Record<string, (...args: unknown[]) => unknown>;
+	let tools: Record<string, any>;
 
 	beforeEach(() => {
 		setupTmpDir();
 		ensureDirs();
 		_setQmdAvailable(false);
+		_clearQmdStatusCaches();
 		_resetMemorySnapshot();
 		const mockPi = createMockPi();
 		hooks = mockPi.hooks;
+		tools = mockPi.tools;
 		registerExtension(mockPi.pi as any);
 	});
 
-	afterEach(cleanupTmpDir);
+	afterEach(() => {
+		_resetExecFileForTest();
+		_clearEmbedInFlight();
+		cleanupTmpDir();
+	});
 
 	test("registers all expected hooks", () => {
 		expect(hooks.session_start).toBeDefined();
@@ -1399,7 +1582,65 @@ describe("lifecycle hooks", () => {
 		expect(result.systemPrompt).toContain("scratchpad");
 	});
 
-	// -- session_shutdown --
+	// -- session lifecycle --
+
+	test("headless session_start does not start a background qmd embed", async () => {
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			cb(null, args.includes("--json") ? '[{"name":"pi-memory"}]' : "", "");
+			return { kill: mock(() => true) };
+		}) as any);
+
+		await hooks.session_start({}, createShutdownCtx());
+
+		expect(calls).not.toContainEqual(["embed"]);
+	});
+
+	test("headless memory_write persists markdown without scheduling a qmd update", async () => {
+		_setQmdAvailable(true);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(null, '[{"name":"pi-memory"}]', "");
+			return { kill: mock(() => true) };
+		}) as any);
+		await hooks.session_start({}, createShutdownCtx());
+		_clearUpdateTimer();
+
+		await tools.memory_write.execute(
+			"call1",
+			{ target: "daily", content: "synthetic headless write" },
+			null,
+			null,
+			createShutdownCtx(),
+		);
+
+		expect(fs.readFileSync(dailyPath(todayStr()), "utf-8")).toContain("synthetic headless write");
+		expect(_getUpdateTimer()).toBeNull();
+	});
+
+	test("headless memory_search still runs awaited qmd queries", async () => {
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			const stdout =
+				args[0] === "search" ? '[{"path":"MEMORY.md","content":"synthetic result"}]' : '[{"name":"pi-memory"}]';
+			cb(null, stdout, "");
+			return { kill: mock(() => true) };
+		}) as any);
+		await hooks.session_start({}, createShutdownCtx());
+
+		const result = await tools.memory_search.execute(
+			"call1",
+			{ query: "synthetic" },
+			null,
+			null,
+			createShutdownCtx(),
+		);
+
+		expect(result.content[0].text).toContain("synthetic result");
+		expect(calls.some((args) => args[0] === "search")).toBe(true);
+		expect(calls).not.toContainEqual(["embed"]);
+	});
 
 	test("session_shutdown clears update timer", async () => {
 		_setQmdAvailable(true);
@@ -1407,6 +1648,118 @@ describe("lifecycle hooks", () => {
 		expect(_getUpdateTimer()).not.toBeNull();
 		await hooks.session_shutdown({}, createShutdownCtx());
 		expect(_getUpdateTimer()).toBeNull();
+	});
+
+	test("session_shutdown cancels a pending update without spawning qmd", async () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			cb(null, "", "");
+			return { kill: mock(() => true) };
+		}) as any);
+
+		scheduleQmdUpdate();
+		expect(_getUpdateTimer()).not.toBeNull();
+
+		await hooks.session_shutdown({ reason: "reload" }, createShutdownCtx());
+		await new Promise((r) => setTimeout(r, 700));
+
+		// The debounced update was cancelled, not executed during teardown.
+		expect(calls).toEqual([]);
+	});
+
+	test("session_shutdown kills tracked direct children, waits boundedly, and is repeat-safe", async () => {
+		_setQmdAvailable(true);
+		_clearEmbedInFlight();
+		const kill = mock(() => true);
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, _cb: any) =>
+			// Never completes: the shutdown path must kill it and not wait forever.
+			({
+				kill,
+				unref: mock(() => {}),
+				stdout: { unref: mock(() => {}) },
+				stderr: { unref: mock(() => {}) },
+			})) as any);
+
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(_getTrackedBackgroundQmdDeadlines()).toEqual([10 * 60_000]);
+
+		const startedAt = Date.now();
+		await hooks.session_shutdown({ reason: "reload" }, createShutdownCtx());
+		const elapsed = Date.now() - startedAt;
+
+		expect(kill).toHaveBeenCalledTimes(1);
+		expect(_getTrackedBackgroundQmdDeadlines()).toEqual([]);
+		expect(elapsed).toBeLessThan(1500);
+
+		// A second shutdown (retry / double event) must be safe and a no-op.
+		await hooks.session_shutdown({ reason: "reload" }, createShutdownCtx());
+		expect(kill).toHaveBeenCalledTimes(1);
+		expect(_getTrackedBackgroundQmdDeadlines()).toEqual([]);
+	});
+
+	test("a shutdown in one registered Pi instance leaves another instance's background embed alone", async () => {
+		_setQmdAvailable(true);
+		_clearQmdStatusCaches();
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			// Leave background embed/update in flight so the assertions below can
+			// observe whose state is still live.
+			if (args[0] !== "embed" && args[0] !== "update") cb(null, "", "");
+			return { kill: mock(() => true), unref: mock(() => {}) };
+		}) as any);
+
+		const headlessPi = createMockPi();
+		registerExtension(headlessPi.pi as any);
+		const uiPi = createMockPi();
+		registerExtension(uiPi.pi as any);
+		const uiCtx = {
+			sessionManager: { getSessionId: () => "abcdef1234567890" },
+			hasUI: true,
+			isIdle: () => true,
+			ui: {
+				notify: mock(() => {}),
+				onTerminalInput: () => () => {},
+				getEditorText: () => "",
+			},
+		};
+
+		// The headless instance starts nothing in the background...
+		await headlessPi.hooks.session_start({}, createShutdownCtx());
+		expect(_getEmbedInFlight()).toBe(false);
+
+		// ...the UI instance does.
+		await uiPi.hooks.session_start({}, uiCtx);
+		expect(_getEmbedInFlight()).toBe(true);
+
+		// Tearing down the headless instance must not touch the UI instance.
+		await headlessPi.hooks.session_shutdown({ reason: "reload" }, createShutdownCtx());
+		expect(_getEmbedInFlight()).toBe(true);
+	});
+
+	test("session_shutdown prevents a completed qmd callback from starting a pending embed", async () => {
+		_setQmdAvailable(true);
+		const calls: string[][] = [];
+		let finish: (() => void) | null = null;
+		const unref = mock(() => {});
+		const stdoutUnref = mock(() => {});
+		const stderrUnref = mock(() => {});
+		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
+			calls.push(args);
+			finish = () => cb(null, "", "");
+			return { unref, stdout: { unref: stdoutUnref }, stderr: { unref: stderrUnref } };
+		}) as any);
+
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(ensureQmdEmbed()).toBe(true);
+		expect(unref).toHaveBeenCalledTimes(1);
+		expect(stdoutUnref).toHaveBeenCalledTimes(1);
+		expect(stderrUnref).toHaveBeenCalledTimes(1);
+		await hooks.session_shutdown({ reason: "reload" }, createShutdownCtx());
+		finish?.();
+
+		expect(calls).toEqual([["embed"]]);
+		expect(_getEmbedInFlight()).toBe(false);
 	});
 
 	test("session_shutdown is safe when no timer exists", async () => {
