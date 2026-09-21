@@ -1743,9 +1743,21 @@ describe("lifecycle hooks", () => {
 			expect(getExitSummaryMode()).toBe("inline");
 		});
 
-		test("detached mode spawns the worker instead of summarizing inline", async () => {
+		test("detached mode streams the worker payload without writing secrets to disk", async () => {
 			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
-			const spawnMock = mock(() => ({ on: mock(() => {}), unref: mock(() => {}) }));
+			let streamed = "";
+			const stdin = {
+				end: mock((data: string) => {
+					streamed += data;
+				}),
+				unref: mock(() => {}),
+			};
+			const spawnMock = mock(() => ({
+				on: mock(() => {}),
+				unref: mock(() => {}),
+				kill: mock(() => {}),
+				stdin,
+			}));
 			_setSpawnForTest(spawnMock as never);
 			const getApiKey = mock(async () => "secret-key");
 			const ctx = createShutdownCtx({
@@ -1760,19 +1772,24 @@ describe("lifecycle hooks", () => {
 			const [, args, opts] = (spawnMock as ReturnType<typeof mock>).mock.calls[0] as [
 				string,
 				string[],
-				{ detached: boolean },
+				{ detached: boolean; stdio: unknown },
 			];
 			expect(opts.detached).toBe(true);
-			expect(args).toContain("--exit-summary-worker");
-			const payloadPath = args[args.length - 1];
-			const payload = JSON.parse(fs.readFileSync(payloadPath, "utf-8")) as Record<string, unknown>;
+			expect(opts.stdio).toEqual(["pipe", "ignore", "ignore"]);
+			expect(args).toEqual(expect.arrayContaining(["--exit-summary-worker"]));
+			expect(args).not.toContain(expect.stringContaining("payload.json"));
+			const payload = JSON.parse(streamed) as Record<string, unknown>;
 			expect(payload.apiKey).toBe("secret-key");
 			expect(payload.model).toEqual({ provider: "openai", id: "gpt-4o-mini" });
 			expect(payload.prompt).toContain("<conversation>");
 			expect(payload.sessionId).toBe("abcdef1234567890");
+			expect(stdin.end).toHaveBeenCalledTimes(1);
 			// the parent must not write the summary itself — the worker owns persistence
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
-			fs.rmSync(path.dirname(payloadPath), { recursive: true, force: true });
+			const leakedTemp = fs
+				.readdirSync(os.tmpdir())
+				.filter((name) => name.startsWith("pi-memory-exit-summary-"));
+			expect(leakedTemp).toEqual([]);
 		});
 
 		test("detached mode still skips trivial sessions without spawning", async () => {
@@ -1804,6 +1821,23 @@ describe("lifecycle hooks", () => {
 			expect(spawnMock).not.toHaveBeenCalled();
 			expect(getApiKey).not.toHaveBeenCalled();
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		});
+
+		test("detached mode falls back to inline when worker stdin is unavailable", async () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
+			const kill = mock(() => true);
+			_setSpawnForTest((() => ({ on: mock(() => {}), unref: mock(() => {}), kill, stdin: null })) as never);
+			const getApiKey = mock(async () => undefined);
+			const ctx = createShutdownCtx({
+				branch: fourMessageBranch(),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(getApiKey).toHaveBeenCalled();
 		});
 
 		test("detached mode falls back to inline when spawn fails", async () => {
