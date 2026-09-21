@@ -26,7 +26,6 @@
 import { type ExecFileOptions, execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
@@ -523,41 +522,31 @@ interface DetachedExitSummaryPayload {
 const EXIT_SUMMARY_WORKER_ARG = "--exit-summary-worker";
 
 /**
- * Spawn the exit-summary worker as a detached child process. The payload
- * (prompt, model, API key) is handed over via a 0600 temp file; the worker
- * deletes it after reading. Returns false when spawning failed, so the caller
- * can fall back to the inline path.
+ * Spawn the exit-summary worker as a detached child process. The complete
+ * payload is streamed over the child's stdin pipe: API keys, conversation
+ * prompt, and model metadata never touch disk. Returns false when synchronous
+ * spawning or pipe setup fails so the caller can fall back to the inline path.
  */
 function spawnDetachedExitSummaryWorker(payload: DetachedExitSummaryPayload): boolean {
-	let payloadDir: string | undefined;
 	try {
-		payloadDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-exit-summary-"));
-		const payloadPath = path.join(payloadDir, "payload.json");
-		fs.writeFileSync(payloadPath, JSON.stringify(payload), { encoding: "utf-8", mode: 0o600 });
 		const selfPath = fileURLToPath(import.meta.url);
-		const args = [selfPath, EXIT_SUMMARY_WORKER_ARG, payloadPath];
+		const args = [selfPath, EXIT_SUMMARY_WORKER_ARG];
 		const child = spawnForTest
-			? spawnForTest(process.execPath, args, { detached: true, stdio: "ignore" })
-			: spawn(process.execPath, args, { detached: true, stdio: "ignore" });
+			? spawnForTest(process.execPath, args, { detached: true, stdio: ["pipe", "ignore", "ignore"] })
+			: spawn(process.execPath, args, { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+		if (!child.stdin) {
+			child.kill();
+			return false;
+		}
 		child.on("error", () => {
-			// Async spawn failure (e.g. execPath vanished): pi is already gone, so
-			// the summary is dropped — same as inline timeout expiry.
-			try {
-				fs.rmSync(payloadDir as string, { recursive: true, force: true });
-			} catch {
-				/* best-effort cleanup */
-			}
+			// Async spawn failures happen after the parent may already have exited;
+			// dropping the summary matches the existing detached-mode semantics.
 		});
+		child.stdin.end(JSON.stringify(payload), "utf-8");
+		(child.stdin as typeof child.stdin & { unref?: () => void }).unref?.();
 		child.unref();
 		return true;
 	} catch {
-		if (payloadDir) {
-			try {
-				fs.rmSync(payloadDir, { recursive: true, force: true });
-			} catch {
-				/* best-effort cleanup */
-			}
-		}
 		return false;
 	}
 }
@@ -633,26 +622,27 @@ export async function runExitSummaryWorker(
 }
 
 /**
- * Entry point when this file is executed directly as the detached worker:
- * `bun index.ts --exit-summary-worker <payload.json>`. Reads and deletes the
- * payload, then runs the summary. Never runs when pi loads this file as an
- * extension (import.meta.main is false there).
+ * Entry point when this file is executed directly as the detached worker.
+ * The parent streams one JSON payload over stdin; no credential or conversation
+ * payload is persisted to a temporary file.
  */
 async function runExitSummaryWorkerProcess(argv: string[]): Promise<void> {
-	const argIndex = argv.indexOf(EXIT_SUMMARY_WORKER_ARG);
-	const payloadPath = argIndex >= 0 ? argv[argIndex + 1] : undefined;
-	if (!payloadPath) return;
+	if (!argv.includes(EXIT_SUMMARY_WORKER_ARG)) return;
 
-	let payload: DetachedExitSummaryPayload;
+	let raw = "";
 	try {
-		payload = JSON.parse(fs.readFileSync(payloadPath, "utf-8")) as DetachedExitSummaryPayload;
+		process.stdin.setEncoding("utf-8");
+		for await (const chunk of process.stdin) raw += chunk;
 	} catch {
 		return;
 	}
+	if (!raw) return;
+
+	let payload: DetachedExitSummaryPayload;
 	try {
-		fs.rmSync(path.dirname(payloadPath), { recursive: true, force: true });
+		payload = JSON.parse(raw) as DetachedExitSummaryPayload;
 	} catch {
-		/* best-effort cleanup */
+		return;
 	}
 	if (!payload?.prompt || !payload.model || !payload.apiKey) return;
 	await runExitSummaryWorker(payload);
@@ -2641,7 +2631,7 @@ export default function (pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 
 // Spawned by spawnDetachedExitSummaryWorker() as:
-//   <runtime> index.ts --exit-summary-worker <payload.json>
+//   <runtime> index.ts --exit-summary-worker   (payload arrives over stdin)
 // Runs after pi has already exited: performs the LLM call, appends the daily
 // log, and refreshes qmd. Never runs when pi loads this file as an extension
 // (import.meta.main is false there).
