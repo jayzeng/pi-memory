@@ -2488,6 +2488,46 @@ describe("pi-dream consolidation", () => {
 		expect(result.keptContent).not.toContain("2026-01-01");
 	});
 
+	test("duplicate clustering is not transitive", () => {
+		const content = [
+			stamp("2026-01-01 10:00:00"),
+			"alpha beta gamma delta epsilon",
+			"",
+			stamp("2026-02-01 10:00:00"),
+			"alpha beta gamma delta zeta",
+			"",
+			stamp("2026-03-01 10:00:00"),
+			"alpha beta gamma zeta eta",
+		].join("\n");
+		const analysis = dreamAnalyze(content, { duplicateSimilarity: 0.65, supersedeSimilarity: 1 });
+		for (const group of analysis.duplicateGroups) {
+			for (let i = 0; i < group.length; i++) {
+				for (let j = i + 1; j < group.length; j++) {
+					expect(dreamSimilarity(analysis.blocks[group[i]].body, analysis.blocks[group[j]].body)).toBeGreaterThanOrEqual(0.65);
+				}
+			}
+		}
+		expect(dreamDropIndices(analysis)).not.toContain(1);
+	});
+
+	test("duplicate retention prefers newest timestamp over file position", () => {
+		const body = "same durable fact with enough shared words";
+		const content = [
+			stamp("2026-06-01 10:00:00"),
+			body,
+			"",
+			stamp("2026-01-01 10:00:00"),
+			body,
+		].join("\n");
+		const analysis = dreamAnalyze(content);
+		expect(dreamDropIndices(analysis)).toEqual([1]);
+	});
+
+	test("rejects out-of-range consolidation thresholds", () => {
+		expect(() => dreamAnalyze("one block", { duplicateSimilarity: 1.1 })).toThrow("between 0 and 1");
+		expect(() => dreamAnalyze("one block", { supersedeSimilarity: -0.1 })).toThrow("between 0 and 1");
+	});
+
 	let dreamTools: Record<string, any>;
 
 	beforeEach(() => {
