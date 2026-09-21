@@ -1396,36 +1396,6 @@ let snapshotTakenAt: string | null = null;
 let snapshotTakenOnDate: string | null = null;
 let snapshotReason: string | null = null;
 let snapshotDirty = false;
-// Append-only list of things that stopped being true AFTER the snapshot was
-// taken (deletions, restores). Re-rendering the whole block to reflect them
-// would move every byte of it and cost a full prompt reprocess, so these are
-// drained into an injected message instead (see before_agent_start) and still
-// stop the model from acting on a memory that was explicitly forgotten. Writes
-// are NOT listed here: the written fact is already in the tool-call history.
-let snapshotCorrections: string[] = [];
-
-const SNAPSHOT_CORRECTIONS_MAX = 20;
-
-function noteSnapshotCorrection(line: string) {
-	if (snapshotCorrections.length >= SNAPSHOT_CORRECTIONS_MAX) return;
-	if (!snapshotCorrections.includes(line)) snapshotCorrections.push(line);
-}
-
-// One short, stable line per changed entry: strip the HTML id/timestamp
-// comments, take the first line, cap the length.
-function correctionPreview(entries: string[]): string[] {
-	return entries
-		.map((e) =>
-			e
-				.replace(/<!--[\s\S]*?-->/g, "")
-				.trim()
-				.split("\n")[0]
-				.trim()
-				.slice(0, 160),
-		)
-		.filter(Boolean);
-}
-
 function refreshMemorySnapshot(reason: string) {
 	memorySnapshot = buildMemoryContext("");
 	snapshotTakenAt = nowTimestamp();
@@ -1448,7 +1418,6 @@ export function _resetMemorySnapshot() {
 	snapshotTakenOnDate = null;
 	snapshotReason = null;
 	snapshotDirty = false;
-	snapshotCorrections = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,31 +1594,8 @@ export default function (pi: ExtensionAPI) {
 			memoryContext,
 		);
 
-		// Corrections are delivered as an injected message, NOT appended to the
-		// system prompt. Appending would still move the prefix boundary, and a
-		// recurrent/hybrid model (GatedDeltaNet, Mamba) cannot rewind its state to
-		// a partial match — it reuses zero tokens and reprocesses the entire
-		// conversation, measured at 15.5k tokens / 17.8 s for one appended line.
-		// A message lands at the tail of the history, which costs nothing, and pi
-		// persists it in the session so it stays visible on later turns; that is
-		// also why the queue is drained after emitting rather than re-sent.
-		let correctionMessage: { customType: string; content: string; display: boolean } | undefined;
-		if (mode !== "refresh" && snapshotCorrections.length > 0) {
-			correctionMessage = {
-				customType: "pi-memory-correction",
-				content: [
-					"Memory corrections - these override the ## Memory block in the system prompt,",
-					"which was loaded at session start and is not re-read:",
-					...snapshotCorrections,
-				].join("\n"),
-				display: true,
-			};
-			snapshotCorrections = [];
-		}
-
 		return {
 			systemPrompt: event.systemPrompt + headerLines.join("\n"),
-			...(correctionMessage ? { message: correctionMessage } : {}),
 		};
 	});
 
@@ -2184,14 +2130,11 @@ export default function (pi: ExtensionAPI) {
 			// If either write fails, we never report a successful unrecoverable deletion.
 			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
-			// Deleted facts must leave the injected snapshot too, whichever file
-			// they lived in — a forgotten-but-still-injected memory defeats the
-			// point of forgetting. In stable mode that is done by appending a
-			// correction rather than re-rendering the block.
-			snapshotDirty = true;
-			for (const line of correctionPreview(result.removed)) {
-				noteSnapshotCorrection(`- FORGOTTEN, no longer true: ${line}${target === "daily" ? " (daily log)" : ""}`);
-			}
+			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
+			// so deleted content disappears from authoritative context without being
+			// copied into persisted correction messages. This intentionally spends one
+			// cache invalidation on an explicit deletion.
+			refreshMemorySnapshot("memory_forget");
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
@@ -2259,10 +2202,9 @@ export default function (pi: ExtensionAPI) {
 			if (missingEntries.length > 0) {
 				const separator = existing.trim() ? "\n\n" : "";
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
-				snapshotDirty = true;
-				for (const line of correctionPreview(missingEntries)) {
-					noteSnapshotCorrection(`- RESTORED, true again: ${line}`);
-				}
+				// Restore changes which durable facts are authoritative, so refresh the
+				// snapshot instead of persisting restored content in a correction message.
+				refreshMemorySnapshot("memory_restore");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 			}
