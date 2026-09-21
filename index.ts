@@ -828,49 +828,58 @@ function dreamDaysBetween(a: Date, b: Date): number {
 }
 
 /** Analyze MEMORY.md content for duplicate groups and superseded older entries. */
+function dreamThreshold(value: number | undefined, fallback: number, label: string): number {
+	if (value === undefined) return fallback;
+	if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${label} must be between 0 and 1`);
+	return value;
+}
+
 export function dreamAnalyze(content: string, opts: DreamAnalysisOptions = {}): DreamAnalysis {
-	const duplicateThreshold = opts.duplicateSimilarity ?? 0.75;
-	const supersedeThreshold = opts.supersedeSimilarity ?? 0.6;
+	const duplicateThreshold = dreamThreshold(opts.duplicateSimilarity, 0.75, "duplicateSimilarity");
+	const supersedeThreshold = dreamThreshold(opts.supersedeSimilarity, 0.6, "supersedeSimilarity");
 	const supersedeMinAgeDays = opts.supersedeMinAgeDays ?? 7;
+	if (!Number.isFinite(supersedeMinAgeDays) || supersedeMinAgeDays < 0)
+		throw new Error("supersedeMinAgeDays must be a non-negative number");
 	const blocks = parseMemoryBlocks(content);
 	const n = blocks.length;
 
-	// Union-find over near-identical pairs.
-	const parent = Array.from({ length: n }, (_, i) => i);
-	const find = (i: number): number => {
-		if (parent[i] !== i) parent[i] = find(parent[i]);
-		return parent[i];
-	};
-	const unionPair = (i: number, j: number) => {
-		parent[find(i)] = find(j);
-	};
-	const superseded: Array<{ olderIndex: number; newerIndex: number }> = [];
+	const duplicateGroups: number[][] = [];
+	const assigned = new Set<number>();
 	for (let i = 0; i < n; i++) {
+		if (assigned.has(i)) continue;
+		const group = [i];
 		for (let j = i + 1; j < n; j++) {
-			const sim = dreamSimilarity(blocks[i].body, blocks[j].body);
-			if (sim >= duplicateThreshold) {
-				unionPair(i, j);
-				continue;
+			if (assigned.has(j)) continue;
+			if (group.every((member) => dreamSimilarity(blocks[member].body, blocks[j].body) >= duplicateThreshold)) {
+				group.push(j);
 			}
-			const ti = blocks[i].timestamp;
-			const tj = blocks[j].timestamp;
-			if (sim >= supersedeThreshold && ti && tj) {
-				if (dreamDaysBetween(ti, tj) >= supersedeMinAgeDays) {
-					const olderIsFirst = ti <= tj;
-					superseded.push(olderIsFirst ? { olderIndex: i, newerIndex: j } : { olderIndex: j, newerIndex: i });
-				}
-			}
+		}
+		if (group.length > 1) {
+			duplicateGroups.push(group);
+			for (const member of group) assigned.add(member);
 		}
 	}
 
-	const groupMap = new Map<number, number[]>();
-	for (let i = 0; i < n; i++) {
-		const root = find(i);
-		const group = groupMap.get(root);
-		if (group) group.push(i);
-		else groupMap.set(root, [i]);
+	const duplicatePairs = new Set<string>();
+	for (const group of duplicateGroups) {
+		for (let i = 0; i < group.length; i++) {
+			for (let j = i + 1; j < group.length; j++) duplicatePairs.add(`${group[i]}:${group[j]}`);
+		}
 	}
-	const duplicateGroups = [...groupMap.values()].filter((group) => group.length > 1);
+
+	const superseded: Array<{ olderIndex: number; newerIndex: number }> = [];
+	for (let i = 0; i < n; i++) {
+		for (let j = i + 1; j < n; j++) {
+			if (duplicatePairs.has(`${i}:${j}`)) continue;
+			const sim = dreamSimilarity(blocks[i].body, blocks[j].body);
+			const ti = blocks[i].timestamp;
+			const tj = blocks[j].timestamp;
+			if (sim >= supersedeThreshold && ti && tj && dreamDaysBetween(ti, tj) >= supersedeMinAgeDays) {
+				const olderIsFirst = ti <= tj;
+				superseded.push(olderIsFirst ? { olderIndex: i, newerIndex: j } : { olderIndex: j, newerIndex: i });
+			}
+		}
+	}
 	return { blocks, duplicateGroups, superseded };
 }
 
@@ -878,9 +887,15 @@ export function dreamAnalyze(content: string, opts: DreamAnalysisOptions = {}): 
 export function dreamDropIndices(analysis: DreamAnalysis): number[] {
 	const drops = new Set<number>();
 	for (const group of analysis.duplicateGroups) {
-		// Keep the newest member (largest index = latest position); drop earlier copies.
-		const sorted = [...group].sort((a, b) => a - b);
-		for (const index of sorted.slice(0, -1)) drops.add(index);
+		const keep = [...group].sort((a, b) => {
+			const ta = analysis.blocks[a].timestamp?.getTime();
+			const tb = analysis.blocks[b].timestamp?.getTime();
+			if (ta !== undefined && tb !== undefined && ta !== tb) return tb - ta;
+			if (ta !== undefined && tb === undefined) return -1;
+			if (ta === undefined && tb !== undefined) return 1;
+			return b - a;
+		})[0]!;
+		for (const index of group) if (index !== keep) drops.add(index);
 	}
 	for (const pair of analysis.superseded) drops.add(pair.olderIndex);
 	return [...drops].sort((a, b) => a - b);
@@ -2348,10 +2363,10 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			duplicateSimilarity: Type.Optional(
-				Type.Number({ description: "Jaccard threshold for duplicates (0-1, default 0.75)" }),
+				Type.Number({ minimum: 0, maximum: 1, description: "Jaccard threshold for duplicates (0-1, default 0.75)" }),
 			),
 			supersedeSimilarity: Type.Optional(
-				Type.Number({ description: "Jaccard threshold for superseded entries (0-1, default 0.6)" }),
+				Type.Number({ minimum: 0, maximum: 1, description: "Jaccard threshold for superseded entries (0-1, default 0.6)" }),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -2451,7 +2466,7 @@ export default function (pi: ExtensionAPI) {
 	// --- /pi-dream command: drives the agent to run the memory_dream tool ---
 	pi.registerCommand("pi-dream", {
 		description:
-			"Memory consolidation: /pi-dream [auto|report|apply] (default auto: applies pure duplicates, asks about superseded)",
+			"Memory consolidation: /pi-dream [auto|report|apply] (default auto is report-only; apply must be explicit)",
 		handler: async (args, ctx) => {
 			const mode = (args ?? "").trim().toLowerCase();
 			const existing = readFileSafe(MEMORY_FILE);
@@ -2468,7 +2483,7 @@ export default function (pi: ExtensionAPI) {
 				effective === "apply"
 					? "Run the memory_dream tool with mode='apply' to consolidate MEMORY.md. Show me what was removed and the recovery ID."
 					: effective === "auto"
-						? "Run the memory_dream tool in report mode on MEMORY.md. If ALL removable entries are near-duplicates of kept newer versions (zero unique content would be lost), immediately re-run with mode='apply' and show me what was removed plus the recovery ID. If any finding involves superseded entries where older content differs meaningfully from its newer replacement, do NOT apply — present those findings and ask me first."
+						? "Run the memory_dream tool in report mode on MEMORY.md and show me the findings. Do not modify anything. If consolidation looks useful, tell me to re-run /pi-dream apply explicitly."
 						: "Run the memory_dream tool in report mode and show me the full findings for MEMORY.md — duplicate groups and superseded entries with previews. Do not modify anything.",
 			);
 		},
