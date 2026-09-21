@@ -1953,7 +1953,7 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
 	});
 
-	test("memory_forget sends a correction message and leaves the systemPrompt untouched", async () => {
+	test("memory_forget refreshes the snapshot without persisting deleted content", async () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "WRONG_FACT_ABOUT_Z\n\nkeep me\n", "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
@@ -1962,18 +1962,11 @@ describe("KV cache stability: memory snapshot", () => {
 
 		await tools.memory_forget.execute("tc1", { match: "WRONG_FACT_ABOUT_Z" }, null, null, {});
 
-		// A forgotten memory must stop being authoritative — but via a message at
-		// the tail of the history, not by moving the cached prompt prefix.
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
-		expect(result2.systemPrompt).toBe(result1.systemPrompt);
-		expect(result2.message).toBeDefined();
-		expect(result2.message.customType).toBe("pi-memory-correction");
-		expect(result2.message.content).toContain("WRONG_FACT_ABOUT_Z");
-
-		// pi persists the injected message, so it is sent once and then drained.
-		const result3 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
-		expect(result3.systemPrompt).toBe(result1.systemPrompt);
-		expect(result3.message).toBeUndefined();
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("WRONG_FACT_ABOUT_Z");
+		expect(result2.systemPrompt).toContain("keep me");
+		expect(result2.message).toBeUndefined();
 	});
 
 	test("memory_write target=daily does NOT mark snapshot dirty (cache stays warm)", async () => {
