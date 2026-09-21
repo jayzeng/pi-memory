@@ -161,7 +161,11 @@ function getUserMemoryPaths(): MemoryPaths {
 
 function getRepoMemoryPaths(cwd: string): MemoryPaths {
 	const repoRoot = resolveRepositoryRoot(cwd);
-	const paths = memoryPaths("repo", path.join(repoRoot, CONFIG_DIR_NAME, "agent", "memory"), repoCollectionName(repoRoot));
+	const paths = memoryPaths(
+		"repo",
+		path.join(repoRoot, CONFIG_DIR_NAME, "agent", "memory"),
+		repoCollectionName(repoRoot),
+	);
 	// Repository memory is intentionally git-friendly, but recovery records can
 	// contain complete deleted content. Keep those private and outside the repo
 	// so a forgotten secret cannot be committed or preserved in Git history.
