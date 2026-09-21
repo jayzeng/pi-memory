@@ -1431,7 +1431,6 @@ let snapshotTakenAt: string | null = null;
 let snapshotTakenOnDate: string | null = null;
 let snapshotReason: string | null = null;
 let snapshotDirty = false;
-
 function refreshMemorySnapshot(reason: string) {
 	memorySnapshot = buildMemoryContext("");
 	snapshotTakenAt = nowTimestamp();
@@ -1440,9 +1439,11 @@ function refreshMemorySnapshot(reason: string) {
 	snapshotDirty = false;
 }
 
-function getSnapshotMode(): "stable" | "per-turn" {
+function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
 	const mode = (process.env.PI_MEMORY_SNAPSHOT ?? "stable").toLowerCase();
-	return mode === "per-turn" ? "per-turn" : "stable";
+	if (mode === "per-turn") return "per-turn";
+	if (mode === "refresh") return "refresh";
+	return "stable";
 }
 
 /** Reset snapshot state (for testing). */
@@ -1583,18 +1584,33 @@ export default function (pi: ExtensionAPI) {
 			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
 			memoryContext = buildMemoryContext(searchResults);
 		} else {
+			// "stable" means stable: once taken, the block is emitted byte-for-byte
+			// for the rest of the session. Refreshing on a long-term write or a
+			// midnight rollover rewrites the tail of the system prompt and voids the
+			// whole conversation's prefix cache — the exact cost the snapshot exists
+			// to avoid, paid on the single most common in-session event. The fresh
+			// state is not lost: the write is in tool-call history a few messages
+			// back, deletions are sent as a correction message below, and
+			// memory_read / memory_search reach the files directly. "refresh" restores the old
+			// checkpoint behaviour.
 			const today = todayStr();
-			const needsRefresh = memorySnapshot === null || snapshotDirty || snapshotTakenOnDate !== today;
-			if (needsRefresh) {
+			const stale = mode === "refresh" && (snapshotDirty || snapshotTakenOnDate !== today);
+			if (memorySnapshot === null || stale) {
 				const reason =
 					memorySnapshot === null ? "before_agent_start" : snapshotDirty ? "long_term_write" : "day_rollover";
 				refreshMemorySnapshot(reason);
 			}
 			memoryContext = memorySnapshot ?? "";
+			// Deliberately carries no timestamp and no reason word: both change
+			// between turns without the memory itself changing, which is enough on
+			// its own to invalidate the cache this branch is trying to preserve.
 			snapshotCaveat =
-				`Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
-				"Use memory_read / memory_search for the authoritative latest state; " +
-				"recent writes may also be visible in tool-call history.";
+				mode === "refresh"
+					? `Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
+						"Use memory_read / memory_search for the authoritative latest state; " +
+						"recent writes may also be visible in tool-call history."
+					: "Loaded once at session start and not re-read since. Use memory_read / memory_search " +
+						"for the authoritative latest state; anything written this session is in tool-call history.";
 		}
 
 		if (!memoryContext) return;
@@ -2149,10 +2165,11 @@ export default function (pi: ExtensionAPI) {
 			// If either write fails, we never report a successful unrecoverable deletion.
 			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
-			// Deleted facts must leave the injected snapshot too, whichever file
-			// they lived in — a forgotten-but-still-injected memory defeats the
-			// point of forgetting.
-			snapshotDirty = true;
+			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
+			// so deleted content disappears from authoritative context without being
+			// copied into persisted correction messages. This intentionally spends one
+			// cache invalidation on an explicit deletion.
+			refreshMemorySnapshot("memory_forget");
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
@@ -2220,7 +2237,9 @@ export default function (pi: ExtensionAPI) {
 			if (missingEntries.length > 0) {
 				const separator = existing.trim() ? "\n\n" : "";
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
-				snapshotDirty = true;
+				// Restore changes which durable facts are authoritative, so refresh the
+				// snapshot instead of persisting restored content in a correction message.
+				refreshMemorySnapshot("memory_restore");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 			}
