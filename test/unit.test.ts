@@ -1825,7 +1825,11 @@ describe("lifecycle hooks", () => {
 			process.env.PI_MEMORY_EXIT_SUMMARY = "detached";
 			const kill = mock(() => true);
 			_setSpawnForTest((() => ({ on: mock(() => {}), unref: mock(() => {}), kill, stdin: null })) as never);
-			const getApiKey = mock(async () => undefined);
+			let keyLookups = 0;
+			const getApiKey = mock(async () => {
+				keyLookups++;
+				return keyLookups === 1 ? "secret-key" : undefined;
+			});
 			const ctx = createShutdownCtx({
 				branch: fourMessageBranch(),
 				model: { provider: "openai", id: "gpt-4o-mini" },
@@ -1835,7 +1839,7 @@ describe("lifecycle hooks", () => {
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
 
 			expect(kill).toHaveBeenCalledTimes(1);
-			expect(getApiKey).toHaveBeenCalled();
+			expect(getApiKey).toHaveBeenCalledTimes(2);
 		});
 
 		test("detached mode falls back to inline when spawn fails", async () => {
