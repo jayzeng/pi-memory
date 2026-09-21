@@ -9,7 +9,7 @@
  *   MEMORY.md              — curated long-term memory (decisions, preferences, durable facts)
  *   SCRATCHPAD.md           — checklist of things to keep in mind / fix later
  *   daily/YYYY-MM-DD.md    — daily append-only log (today + yesterday loaded at session start)
- *   recovery/*.json        — durable records for restoring memory_forget deletions
+ *   recovery/*.json        — user-private durable records for restoring deletions (never stored in repositories)
  *
  * Tools:
  *   memory_write   — write to MEMORY.md or daily log
@@ -161,7 +161,15 @@ function getUserMemoryPaths(): MemoryPaths {
 
 function getRepoMemoryPaths(cwd: string): MemoryPaths {
 	const repoRoot = resolveRepositoryRoot(cwd);
-	return memoryPaths("repo", path.join(repoRoot, CONFIG_DIR_NAME, "agent", "memory"), repoCollectionName(repoRoot));
+	const paths = memoryPaths("repo", path.join(repoRoot, CONFIG_DIR_NAME, "agent", "memory"), repoCollectionName(repoRoot));
+	// Repository memory is intentionally git-friendly, but recovery records can
+	// contain complete deleted content. Keep those private and outside the repo
+	// so a forgotten secret cannot be committed or preserved in Git history.
+	const recoveryKey = createHash("sha256").update(path.resolve(repoRoot)).digest("hex").slice(0, 24);
+	return {
+		...paths,
+		recoveryDir: path.join(MEMORY_DIR, "recovery", "repos", recoveryKey),
+	};
 }
 
 function ensureMemoryDirs(paths: MemoryPaths) {
