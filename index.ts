@@ -994,6 +994,8 @@ interface QmdBackgroundHandle {
 interface QmdBackgroundState {
 	/** False for print/headless sessions: no fire-and-forget QMD work at all. */
 	enabled: boolean;
+	/** True after a memory mutation until qmd update has caught up. */
+	indexDirty: boolean;
 	/** Bumped on each session boundary; stale callbacks compare against it. */
 	lifecycle: number;
 	embedInFlight: boolean;
@@ -1006,6 +1008,7 @@ interface QmdBackgroundState {
 function createQmdBackgroundState(): QmdBackgroundState {
 	return {
 		enabled: true,
+		indexDirty: false,
 		lifecycle: 0,
 		embedInFlight: false,
 		embedPending: false,
@@ -1635,7 +1638,10 @@ export default function (pi: ExtensionAPI) {
 	// Shadow the module-level test seams so every handler below uses this
 	// instance's state.
 	const ensureQmdEmbed = () => startQmdEmbed(qmdState);
-	const scheduleQmdUpdate = () => scheduleQmdUpdateForState(qmdState);
+	const scheduleQmdUpdate = () => {
+		qmdState.indexDirty = true;
+		scheduleQmdUpdateForState(qmdState);
+	};
 
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
@@ -2490,6 +2496,28 @@ export default function (pi: ExtensionAPI) {
 
 			const mode = params.mode ?? "keyword";
 			const limit = clampSearchLimit(params.limit);
+
+			if (!qmdState.enabled && qmdState.indexDirty) {
+				try {
+					await new Promise<void>((resolve, reject) => {
+						execFileFn("qmd", ["update"], { timeout: DEFAULT_QMD_UPDATE_TIMEOUT_MS }, (err) =>
+							err ? reject(err) : resolve(),
+						);
+					});
+					qmdState.indexDirty = false;
+				} catch {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "Could not refresh the qmd index before this headless search. Retry after qmd update succeeds.",
+							},
+						],
+						isError: true,
+						details: { mode, query: params.query, indexRefreshFailed: true },
+					};
+				}
+			}
 
 			try {
 				const { results, stderr } = await runQmdSearch(mode, params.query, limit);
