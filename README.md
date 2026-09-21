@@ -8,7 +8,7 @@
 
 Thanks to https://github.com/skyfallsin/pi-mem for inspiration.
 
-Your coding agent forgets everything between sessions. pi-memory gives it a memory: durable facts and decisions, a running daily log, and a scratchpad of things to come back to. User-wide memory lives under `~/.pi/agent/memory/`; repository-specific memory lives under `.pi/agent/memory/` in the repository root. Both use plain Markdown you can inspect and edit, and repository memory can be committed with the project. With optional [qmd](https://github.com/tobi/qmd), pi can search both scopes with keyword, semantic, and hybrid **search**.
+Your coding agent forgets everything between sessions. pi-memory gives it a memory: durable facts and decisions, a running daily log, and a scratchpad of things to come back to. User-wide memory lives under `~/.pi/agent/memory/`; repository-specific memory lives under `.pi/agent/memory/` in the repository root. Both use plain Markdown you can inspect and edit, and repository memory can be committed with the project. Recovery payloads are always kept in user-private state outside the repository. With optional [qmd](https://github.com/tobi/qmd), pi can search both scopes with keyword, semantic, and hybrid **search**.
 
 ## What it feels like
 
@@ -82,7 +82,7 @@ Without qmd, the core tools still work fully — only `memory_search` and select
 | Tool | Description |
 |------|-------------|
 | `memory_write` | Write to user or repository MEMORY.md (long-term) or a daily log |
-| `memory_forget` | Delete matching entries in either scope and create a durable recovery record |
+| `memory_forget` | Delete matching entries in either scope and create a durable recovery record outside repository Git history |
 | `memory_restore` | Restore a deletion using the recovery ID returned by `memory_forget` |
 | `memory_read` | Read a user or repository memory file, or list daily logs |
 | `scratchpad` | Add/done/undo/clear/list user or repository checklist items |
@@ -127,7 +127,7 @@ Both scopes use the same layout:
 ```
 
 The user scope root is `~/.pi/agent/memory/`. The repository scope root is
-`.pi/agent/memory/` under the nearest Git root.
+`.pi/agent/memory/` under the nearest Git root. Repository-scope recovery JSON is stored under the user-wide recovery area, keyed by repository identity, so deleted content is never written into the repository.
 
 ## How it works
 
