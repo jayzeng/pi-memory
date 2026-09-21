@@ -2363,10 +2363,18 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			duplicateSimilarity: Type.Optional(
-				Type.Number({ minimum: 0, maximum: 1, description: "Jaccard threshold for duplicates (0-1, default 0.75)" }),
+				Type.Number({
+					minimum: 0,
+					maximum: 1,
+					description: "Jaccard threshold for duplicates (0-1, default 0.75)",
+				}),
 			),
 			supersedeSimilarity: Type.Optional(
-				Type.Number({ minimum: 0, maximum: 1, description: "Jaccard threshold for superseded entries (0-1, default 0.6)" }),
+				Type.Number({
+					minimum: 0,
+					maximum: 1,
+					description: "Jaccard threshold for superseded entries (0-1, default 0.6)",
+				}),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
