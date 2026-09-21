@@ -1786,9 +1786,7 @@ describe("lifecycle hooks", () => {
 			expect(stdin.end).toHaveBeenCalledTimes(1);
 			// the parent must not write the summary itself — the worker owns persistence
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
-			const leakedTemp = fs
-				.readdirSync(os.tmpdir())
-				.filter((name) => name.startsWith("pi-memory-exit-summary-"));
+			const leakedTemp = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("pi-memory-exit-summary-"));
 			expect(leakedTemp).toEqual([]);
 		});
 
