@@ -1617,7 +1617,7 @@ describe("lifecycle hooks", () => {
 		expect(_getUpdateTimer()).toBeNull();
 	});
 
-	test("headless memory_search still runs awaited qmd queries", async () => {
+	test("headless memory_search refreshes a dirty qmd index before querying", async () => {
 		const calls: string[][] = [];
 		_setExecFileForTest(((_file: string, args: string[], _opts: any, cb: any) => {
 			calls.push(args);
@@ -1628,6 +1628,14 @@ describe("lifecycle hooks", () => {
 		}) as any);
 		await hooks.session_start({}, createShutdownCtx());
 
+		await tools.memory_write.execute(
+			"write1",
+			{ target: "daily", content: "synthetic headless write" },
+			null,
+			null,
+			createShutdownCtx(),
+		);
+
 		const result = await tools.memory_search.execute(
 			"call1",
 			{ query: "synthetic" },
@@ -1637,7 +1645,10 @@ describe("lifecycle hooks", () => {
 		);
 
 		expect(result.content[0].text).toContain("synthetic result");
-		expect(calls.some((args) => args[0] === "search")).toBe(true);
+		const updateIndex = calls.findIndex((args) => args[0] === "update");
+		const searchIndex = calls.findIndex((args) => args[0] === "search");
+		expect(updateIndex).toBeGreaterThanOrEqual(0);
+		expect(searchIndex).toBeGreaterThan(updateIndex);
 		expect(calls).not.toContainEqual(["embed"]);
 	});
 
