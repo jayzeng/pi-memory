@@ -2600,6 +2600,9 @@ describe("memory_forget tool", () => {
 		);
 		expect(fs.readFileSync(path.join(repoDir, "MEMORY.md"), "utf-8")).not.toContain("Old repository fact");
 		expect(forgotten.details.scope).toBe("repo");
+		expect(forgotten.details.recoveryPath).toContain(path.join(tmpDir, "recovery", "repos"));
+		expect(forgotten.details.recoveryPath).not.toContain(repoDir);
+		expect(fs.existsSync(forgotten.details.recoveryPath)).toBe(true);
 
 		const restored = await tools.memory_restore.execute(
 			"c2",
