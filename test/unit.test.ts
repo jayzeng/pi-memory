@@ -2503,7 +2503,9 @@ describe("pi-dream consolidation", () => {
 		for (const group of analysis.duplicateGroups) {
 			for (let i = 0; i < group.length; i++) {
 				for (let j = i + 1; j < group.length; j++) {
-					expect(dreamSimilarity(analysis.blocks[group[i]].body, analysis.blocks[group[j]].body)).toBeGreaterThanOrEqual(0.65);
+					expect(
+						dreamSimilarity(analysis.blocks[group[i]].body, analysis.blocks[group[j]].body),
+					).toBeGreaterThanOrEqual(0.65);
 				}
 			}
 		}
@@ -2512,13 +2514,7 @@ describe("pi-dream consolidation", () => {
 
 	test("duplicate retention prefers newest timestamp over file position", () => {
 		const body = "same durable fact with enough shared words";
-		const content = [
-			stamp("2026-06-01 10:00:00"),
-			body,
-			"",
-			stamp("2026-01-01 10:00:00"),
-			body,
-		].join("\n");
+		const content = [stamp("2026-06-01 10:00:00"), body, "", stamp("2026-01-01 10:00:00"), body].join("\n");
 		const analysis = dreamAnalyze(content);
 		expect(dreamDropIndices(analysis)).toEqual([1]);
 	});
