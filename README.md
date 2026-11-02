@@ -223,6 +223,14 @@ moves on its own — `/memory migrate` prints the plan, `--apply` renames
 `MEMORY.md`, `SCRATCHPAD.md`, `daily/` and `recovery/` into `global/`, and
 `--undo` reverses it using `.migration-manifest.json`.
 
+If the destination already exists — say `global/MEMORY.md` — that entry is
+reported as a **conflict**: the move is skipped, `--apply` exits non-zero, and
+the root file stays put. pi-memory only reads `global/` and `projects/` now, so
+a leftover root `MEMORY.md` is stale and invisible to the agent (including when
+you `cat` it at the old path). Merge it into `global/MEMORY.md` or delete it
+yourself. A failed move is likewise left in place and the run is re-runnable,
+and `--undo` moves everything recorded in the manifest back to the root.
+
 ## How it works
 
 ### Context injection
@@ -331,6 +339,7 @@ Run the `memory_status` tool first — it reports most of these at a glance.
 | “need embeddings” on semantic/deep search | Vectors not built yet | Embedding starts automatically in the background — retry shortly. If `PI_MEMORY_QMD_UPDATE` is `manual`/`off`, run `qmd embed` yourself |
 | Collection `pi-memory` missing | Auto-setup didn't run (qmd installed mid-session) | Run any `memory_search` (auto-creates it) or `qmd collection add ~/.pi/agent/memory/global --name pi-memory` |
 | Memory looks empty after upgrading | Old flat memory not migrated yet | Run `/memory migrate` to see the plan, then `/memory migrate --apply` |
+| Root `~/.pi/agent/memory/MEMORY.md` still exists after migration | The destination (`global/MEMORY.md`) already existed, so the move was reported as a conflict (or the move failed) | Merge it into `global/MEMORY.md` or delete it by hand — pi-memory no longer reads the root file, so anything you see there is stale |
 | qmd works in the shell but not from pi on Windows | Broken `.cmd`/`.ps1` shims | The extension bypasses them by invoking qmd's JS entry with `node`; make sure the npm global `node_modules` dir is on `PATH` |
 | Memory isn't being injected after a write | The snapshot is taken once per session and deliberately not re-rendered | The write is visible in tool-call history; use `memory_read` / `memory_search` for the current state, or set `PI_MEMORY_SNAPSHOT=refresh` (costs a full prompt reprocess per write) |
 
