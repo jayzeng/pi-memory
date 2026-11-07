@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Quitting no longer waits on the exit summary. Pi stops its screen before it
+  runs shutdown handlers, so the summary's model call (up to 10 s, plus
+  `qmd update`) looked like a hang, and the Ctrl+C people pressed to get out
+  killed pi, its "To resume this session" hint and the summary. Quitting now
+  saves the transcript under `pending/`, and the next interactive session
+  writes the summary in the background, into the daily log of the day the
+  session ended. Quitting the same session again replaces its pending entry,
+  sessions claim entries by renaming them, and a summary that fails is tried
+  by the next session up to three times. `PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS`
+  now bounds that background call and defaults to 60 s. (#55)
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

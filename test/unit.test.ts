@@ -16,11 +16,14 @@ import {
 	_clearUpdateTimer,
 	_getEmbedInFlight,
 	_getUpdateTimer,
+	_pendingExitSummaryWork,
 	_resetBaseDir,
+	_resetCompleteForTest,
 	_resetExecFileForTest,
 	_resetMemorySnapshot,
 	_resetQmdJsResolutionForTest,
 	_setBaseDir,
+	_setCompleteForTest,
 	_setExecFileForTest,
 	_setQmdAvailable,
 	buildMemoryContext,
@@ -54,6 +57,7 @@ import {
 	serializeScratchpad,
 	shortSessionId,
 	todayStr,
+	writePendingExitSummaries,
 	yesterdayStr,
 } from "../index.js";
 
@@ -66,6 +70,16 @@ let tmpDir: string;
 function setupTmpDir() {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-test-"));
 	_setBaseDir(tmpDir);
+}
+
+/** The exit summaries waiting for the next session, by file name. */
+function pendingFiles(): string[] {
+	const dir = path.join(tmpDir, "pending");
+	return fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
+}
+
+function readPending(name: string) {
+	return JSON.parse(fs.readFileSync(path.join(tmpDir, "pending", name), "utf-8"));
 }
 
 function cleanupTmpDir() {
@@ -1521,10 +1535,10 @@ describe("lifecycle hooks", () => {
 		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
 	});
 
-	test("session_shutdown with reason=quit still attempts the exit summary", async () => {
-		// Ensure the reload-skip guard does not suppress real quit summaries.
-		// Summarization cannot succeed here (no API key), so the attempt is
-		// observed via the API-key lookup — and no boilerplate is written.
+	test("session_shutdown with reason=quit leaves the summary to the next session", async () => {
+		// Ensure the reload-skip guard does not suppress real quit summaries, and
+		// that quitting itself never waits on the model: pi has already stopped its
+		// screen, so any wait here looks like a hang.
 		const getApiKey = mock(async () => undefined);
 		const ctx = createShutdownCtx({
 			branch: [
@@ -1567,8 +1581,13 @@ describe("lifecycle hooks", () => {
 
 		await hooks.session_shutdown({ reason: "quit" }, ctx);
 
-		expect(getApiKey).toHaveBeenCalled();
+		expect(getApiKey).not.toHaveBeenCalled();
 		expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+		expect(pendingFiles()).toEqual(["abcdef1234567890.json"]);
+		const pending = readPending("abcdef1234567890.json");
+		expect(pending.conversation).toContain("Please remember we chose dark mode.");
+		expect(pending.date).toBe(todayStr());
+		expect(pending.model).toEqual({ provider: "openai", id: "gpt-4o-mini" });
 	});
 
 	// -- exit summary configurability (PI_MEMORY_EXIT_SUMMARY / PI_MEMORY_EXIT_SUMMARY_MODEL) --
@@ -1635,6 +1654,7 @@ describe("lifecycle hooks", () => {
 
 			expect(getApiKey).not.toHaveBeenCalled();
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+			expect(pendingFiles()).toEqual([]);
 		});
 
 		test("PI_MEMORY_EXIT_SUMMARY=off (and other aliases) also disable", async () => {
@@ -1658,6 +1678,7 @@ describe("lifecycle hooks", () => {
 			});
 
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
+			await writePendingExitSummaries(ctx as any);
 
 			expect(find).toHaveBeenCalledWith("anthropic", "claude-haiku-4");
 			expect(getApiKey).toHaveBeenCalledWith(overrideModel);
@@ -1675,6 +1696,7 @@ describe("lifecycle hooks", () => {
 			});
 
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
+			await writePendingExitSummaries(ctx as any);
 
 			expect(getApiKey).toHaveBeenCalledWith(sessionModel);
 		});
@@ -1717,7 +1739,7 @@ describe("lifecycle hooks", () => {
 		});
 	});
 
-	describe("exit summary shutdown timeout", () => {
+	describe("exit summary timeout", () => {
 		const fourMessageBranch = () => [
 			{
 				type: "message",
@@ -1764,20 +1786,18 @@ describe("lifecycle hooks", () => {
 
 		test("getExitSummaryTimeoutMs parses env with fallback to default", () => {
 			delete process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS;
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "250";
 			expect(getExitSummaryTimeoutMs()).toBe(250);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "not-a-number";
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "-5";
-			expect(getExitSummaryTimeoutMs()).toBe(10_000);
+			expect(getExitSummaryTimeoutMs()).toBe(60_000);
 		});
 
-		test("session_shutdown stays responsive when summary generation hangs", async () => {
-			// Pi core awaits session_shutdown handlers with no timeout; a hanging
-			// provider must not block quitting forever. The API-key lookup never
-			// resolves here, so without a self-imposed timeout this test only fails
-			// via bun's per-test timeout.
+		test("a hanging summary gives up at the timeout and waits for the next session", async () => {
+			// The API-key lookup never resolves here, so without the timeout this
+			// test only fails via bun's per-test timeout.
 			process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS = "50";
 			const getApiKey = mock(() => new Promise<string | undefined>(() => {}));
 			const ctx = createShutdownCtx({
@@ -1787,9 +1807,148 @@ describe("lifecycle hooks", () => {
 			});
 
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
+			expect(await writePendingExitSummaries(ctx as any)).toBe(0);
 
 			expect(getApiKey).toHaveBeenCalled();
 			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+			expect(pendingFiles()).toEqual(["abcdef1234567890.json"]);
+			expect(readPending("abcdef1234567890.json").attempts).toBe(1);
+		});
+	});
+
+	describe("exit summaries written by the next session", () => {
+		const branch = (text: string) => [
+			{ type: "message", message: { role: "user", content: [{ type: "text", text }], timestamp: 1 } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Noted." }], timestamp: 2 } },
+			{
+				type: "message",
+				message: { role: "user", content: [{ type: "text", text: "And the config?" }], timestamp: 3 },
+			},
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "Migrated." }], timestamp: 4 },
+			},
+		];
+		const model = { provider: "openai", id: "gpt-4o-mini" };
+		const SUMMARY =
+			"### Decisions\n- Chose SQLite.\n### Lessons Learned\n- None.\n### Notes\n- None.\n### Follow-ups\n- None.";
+		const answering = (text: string) => mock(async () => ({ content: [{ type: "text", text }] }) as any);
+
+		afterEach(() => _resetCompleteForTest());
+
+		test("writes the summary into the daily log of the day the session ended", async () => {
+			const complete = answering(SUMMARY);
+			_setCompleteForTest(complete as any);
+			const ctx = createShutdownCtx({
+				branch: branch("We chose SQLite."),
+				model,
+				modelRegistry: { getApiKey: async () => "key" },
+			});
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+			const pending = readPending("abcdef1234567890.json");
+			pending.date = "2026-01-02";
+			pending.endedAt = "2026-01-02 23:59:00";
+			fs.writeFileSync(path.join(tmpDir, "pending", "abcdef1234567890.json"), JSON.stringify(pending));
+
+			expect(await writePendingExitSummaries(ctx as any)).toBe(1);
+
+			const log = fs.readFileSync(dailyPath("2026-01-02"), "utf-8");
+			expect(log).toContain("<!-- 2026-01-02 23:59:00 [abcdef12] -->");
+			expect(log).toContain("## Session Summary (auto, exit: session-end)");
+			expect(log).toContain("- Chose SQLite.");
+			expect(String((complete.mock.calls[0] as any[])[1].messages[0].content[0].text)).toContain("We chose SQLite.");
+			expect(pendingFiles()).toEqual([]);
+		});
+
+		test("a later quit of the same session replaces its pending summary", async () => {
+			const first = createShutdownCtx({ branch: branch("First part."), model });
+			const second = createShutdownCtx({ branch: [...branch("First part."), ...branch("Second part.")], model });
+			await hooks.session_shutdown({ reason: "quit" }, first);
+			await hooks.session_shutdown({ reason: "quit" }, second);
+
+			expect(pendingFiles()).toEqual(["abcdef1234567890.json"]);
+			expect(readPending("abcdef1234567890.json").conversation).toContain("Second part.");
+		});
+
+		test("a summary with nothing in it is dropped without a write", async () => {
+			_setCompleteForTest(answering("### Decisions\n- None.\n### Notes\n- None.") as any);
+			const ctx = createShutdownCtx({
+				branch: branch("hi"),
+				model,
+				modelRegistry: { getApiKey: async () => "key" },
+			});
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(await writePendingExitSummaries(ctx as any)).toBe(0);
+			expect(fs.existsSync(dailyPath(todayStr()))).toBe(false);
+			expect(pendingFiles()).toEqual([]);
+		});
+
+		test("a summary that keeps failing is dropped after three tries", async () => {
+			_setCompleteForTest(
+				mock(async () => {
+					throw new Error("HTTP 400");
+				}) as any,
+			);
+			const ctx = createShutdownCtx({
+				branch: branch("hi"),
+				model,
+				modelRegistry: { getApiKey: async () => "key" },
+			});
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			await writePendingExitSummaries(ctx as any);
+			await writePendingExitSummaries(ctx as any);
+			expect(readPending("abcdef1234567890.json").attempts).toBe(2);
+			await writePendingExitSummaries(ctx as any);
+			expect(pendingFiles()).toEqual([]);
+		});
+
+		test("leaves a summary another live session is writing, and takes over one whose session died", async () => {
+			const complete = answering(SUMMARY);
+			_setCompleteForTest(complete as any);
+			const ctx = createShutdownCtx({
+				branch: branch("hi"),
+				model,
+				modelRegistry: { getApiKey: async () => "key" },
+			});
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+			const dir = path.join(tmpDir, "pending");
+			const live = path.join(dir, `abcdef1234567890.json.${process.ppid}.claimed`);
+			fs.renameSync(path.join(dir, "abcdef1234567890.json"), live);
+
+			expect(await writePendingExitSummaries(ctx as any)).toBe(0);
+			expect(complete).not.toHaveBeenCalled();
+
+			fs.renameSync(live, path.join(dir, "abcdef1234567890.json.2147483646.claimed"));
+			expect(await writePendingExitSummaries(ctx as any)).toBe(1);
+			expect(pendingFiles()).toEqual([]);
+		});
+
+		test("an interactive session starts writing them, and a print run does not", async () => {
+			_setCompleteForTest(answering(SUMMARY) as any);
+			_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+				cb(new Error("not available"), "", "");
+			}) as any);
+			try {
+				const ctx = createShutdownCtx({
+					branch: branch("hi"),
+					model,
+					modelRegistry: { getApiKey: async () => "key" },
+				});
+				await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+				await hooks.session_start({}, { ...ctx, hasUI: false });
+				expect(_pendingExitSummaryWork()).toBeNull();
+				expect(pendingFiles()).toEqual(["abcdef1234567890.json"]);
+
+				const ui = { notify: () => {}, onTerminalInput: () => () => {} };
+				await hooks.session_start({}, { ...ctx, hasUI: true, ui });
+				await _pendingExitSummaryWork();
+				expect(fs.readFileSync(dailyPath(todayStr()), "utf-8")).toContain("- Chose SQLite.");
+			} finally {
+				_resetExecFileForTest();
+			}
 		});
 	});
 

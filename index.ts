@@ -27,7 +27,7 @@ import { type ExecFileOptions, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type Message, StringEnum, Type } from "@earendil-works/pi-ai";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
@@ -297,12 +297,6 @@ function formatContextSection(label: string, content: string, mode: TruncateMode
 
 type ExitSummaryReason = "ctrl+d" | "slash-quit" | "session-end";
 
-interface ExitSummaryResult {
-	summary: string | null;
-	error?: string;
-	hasMessages: boolean;
-}
-
 function formatExitSummaryReason(reason: ExitSummaryReason): string {
 	if (reason === "ctrl+d") return "ctrl+d";
 	if (reason === "slash-quit") return "/quit";
@@ -416,11 +410,67 @@ function resolveExitSummaryModel(ctx: ExtensionContext): ExtensionContext["model
 	return ctx.model;
 }
 
-async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryResult> {
+// ---------------------------------------------------------------------------
+// Exit summaries, written by the next session
+// ---------------------------------------------------------------------------
+
+/**
+ * A session's exit summary, waiting for the next session to write it.
+ *
+ * Pi stops its screen before it runs `session_shutdown` handlers and then waits
+ * for them with no timeout and nothing on screen. A model call made there looked
+ * like a hang, and the Ctrl+C people pressed to get out of it killed pi, its
+ * "To resume this session" hint and the summary. So quitting only saves the
+ * transcript, and the next interactive session writes the summary in the
+ * background.
+ */
+interface PendingExitSummary {
+	version: 1;
+	sessionId: string;
+	reason: ExitSummaryReason;
+	/** When the session ended, which picks the daily log and stamps the entry. */
+	endedAt: string;
+	date: string;
+	model?: { provider: string; id: string };
+	conversation: string;
+	truncated: boolean;
+	totalChars: number;
+	attempts: number;
+}
+
+const EXIT_SUMMARY_MAX_ATTEMPTS = 3;
+
+type CompleteFn = typeof complete;
+let completeFn: CompleteFn = complete;
+
+/** Replace the model call (for testing). */
+export function _setCompleteForTest(fn: CompleteFn) {
+	completeFn = fn;
+}
+
+export function _resetCompleteForTest() {
+	completeFn = complete;
+}
+
+function pendingDir(): string {
+	return path.join(MEMORY_DIR, "pending");
+}
+
+/** One file per session, so quitting the same session again replaces what it left. */
+function pendingFileOf(sessionId: string): string {
+	return path.join(pendingDir(), `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+}
+
+function writeJsonAtomic(filePath: string, value: unknown) {
+	const temporary = `${filePath}.${process.pid}.tmp`;
+	fs.writeFileSync(temporary, JSON.stringify(value), "utf-8");
+	fs.renameSync(temporary, filePath);
+}
+
+/** What the next session needs to summarize this one, or null when there is nothing worth it. */
+function pendingExitSummaryOf(ctx: ExtensionContext, reason: ExitSummaryReason): PendingExitSummary | null {
 	const branch = getSessionBranch(ctx);
-	if (!branch) {
-		return { summary: null, error: "Session branch unavailable", hasMessages: false };
-	}
+	if (!branch) return null;
 
 	const messages = branch
 		.filter((entry): entry is SessionEntry & { type: "message" } => entry.type === "message")
@@ -430,60 +480,189 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 	// one-liner Q&A) appends noise the daily-log injection and search then
 	// faithfully resurface forever. Only sessions with enough exchange to
 	// plausibly contain decisions/lessons earn an automatic summary.
-	if (messages.length < EXIT_SUMMARY_MIN_MESSAGES) {
-		return { summary: null, hasMessages: false };
-	}
+	if (messages.length < EXIT_SUMMARY_MIN_MESSAGES) return null;
+
+	const { text, truncated, totalChars } = truncateConversationForSummary(
+		serializeConversation(convertToLlm(messages)),
+	);
+	if (!text.trim()) return null;
 
 	const model = resolveExitSummaryModel(ctx);
-	if (!model) {
-		return { summary: null, error: "No active model", hasMessages: true };
+	const endedAt = nowTimestamp();
+	return {
+		version: 1,
+		sessionId: ctx.sessionManager.getSessionId(),
+		reason,
+		endedAt,
+		date: endedAt.slice(0, 10),
+		model: model ? { provider: model.provider, id: model.id } : undefined,
+		conversation: text,
+		truncated,
+		totalChars,
+		attempts: 0,
+	};
+}
+
+function savePendingExitSummary(pending: PendingExitSummary) {
+	fs.mkdirSync(pendingDir(), { recursive: true });
+	writeJsonAtomic(pendingFileOf(pending.sessionId), pending);
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
 	}
+}
+
+/**
+ * Takes the pending summaries no live session is writing. The rename is the
+ * claim: two sessions starting together never write the same summary, and one
+ * left by a session that died mid-write is taken over.
+ */
+function claimPendingExitSummaries(): string[] {
+	let names: string[];
+	try {
+		names = fs.readdirSync(pendingDir()).sort();
+	} catch {
+		return [];
+	}
+	const claimed: string[] = [];
+	for (const name of names) {
+		const match = /^(.+\.json)(?:\.(\d+)\.claimed)?$/.exec(name);
+		if (!match) continue;
+		const [, file, owner] = match;
+		if (owner !== undefined && isProcessAlive(Number(owner))) continue;
+		const target = path.join(pendingDir(), `${file}.${process.pid}.claimed`);
+		try {
+			fs.renameSync(path.join(pendingDir(), name), target);
+			claimed.push(target);
+		} catch {
+			// Another session claimed it first.
+		}
+	}
+	return claimed;
+}
+
+function readPendingExitSummary(file: string): PendingExitSummary | null {
+	try {
+		const value = JSON.parse(fs.readFileSync(file, "utf-8")) as PendingExitSummary;
+		return value?.version === 1 && typeof value.conversation === "string" ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+/** A failed try goes back for the next session, unless the session quit again since and left a newer one. */
+function releasePendingExitSummary(claimed: string, pending: PendingExitSummary) {
+	const attempts = pending.attempts + 1;
+	const file = pendingFileOf(pending.sessionId);
+	if (attempts < EXIT_SUMMARY_MAX_ATTEMPTS && !fs.existsSync(file)) {
+		writeJsonAtomic(file, { ...pending, attempts });
+	}
+	fs.rmSync(claimed, { force: true });
+}
+
+type ExitSummaryOutcome = "written" | "empty" | "failed";
+
+async function writeExitSummary(
+	ctx: ExtensionContext,
+	pending: PendingExitSummary,
+	gaveUp: () => boolean,
+): Promise<ExitSummaryOutcome> {
+	const modelRegistry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+		find?: (provider: string, modelId: string) => ExtensionContext["model"];
+	};
+	const model = (pending.model && modelRegistry?.find?.(pending.model.provider, pending.model.id)) || ctx.model;
+	if (!model) return "failed";
 
 	const apiKey = await resolveExitSummaryApiKey(ctx, model);
-	if (!apiKey) {
-		return {
-			summary: null,
-			error: `API key resolution unavailable for ${model.provider}/${model.id}`,
-			hasMessages: true,
-		};
-	}
+	if (!apiKey) return "failed";
 
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const { text: truncatedText, truncated, totalChars } = truncateConversationForSummary(conversationText);
-	if (!truncatedText.trim()) {
-		return { summary: null, error: "No conversation text to summarize", hasMessages: true };
-	}
-
-	const summaryMessages: Message[] = [
+	const response = await completeFn(
+		model,
 		{
-			role: "user",
-			content: [{ type: "text", text: buildExitSummaryPrompt(truncatedText, truncated, totalChars) }],
-			timestamp: Date.now(),
+			systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: buildExitSummaryPrompt(pending.conversation, pending.truncated, pending.totalChars),
+						},
+					],
+					timestamp: Date.now(),
+				},
+			],
 		},
-	];
+		{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
+	);
+	const summary = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n")
+		.trim();
 
-	try {
-		const response = await complete(
-			model,
-			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
-		);
+	// Only persist real summaries. A summary whose every section is "None." is
+	// boilerplate the daily-log injection would resurface forever.
+	if (!summary || isExitSummaryEmpty(summary)) return "empty";
+	// Too late: the entry already went back for the next session, which would write it twice.
+	if (gaveUp()) return "failed";
 
-		const summaryText = response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n")
-			.trim();
+	ensureDirs();
+	const entry = formatExitSummaryEntry(summary, pending.reason, shortSessionId(pending.sessionId), pending.endedAt);
+	const filePath = dailyPath(pending.date);
+	const existing = readFileSafe(filePath) ?? "";
+	fs.appendFileSync(filePath, (existing.trim() ? "\n\n" : "") + entry, "utf-8");
+	return "written";
+}
 
-		if (!summaryText) {
-			return { summary: null, error: "Summary was empty", hasMessages: true };
+function writeExitSummaryInTime(ctx: ExtensionContext, pending: PendingExitSummary): Promise<ExitSummaryOutcome> {
+	let gaveUp = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<ExitSummaryOutcome>((resolve) => {
+		timer = setTimeout(() => {
+			gaveUp = true;
+			resolve("failed");
+		}, getExitSummaryTimeoutMs());
+	});
+	const work = writeExitSummary(ctx, pending, () => gaveUp).catch((): ExitSummaryOutcome => "failed");
+	return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Writes the exit summaries earlier sessions left, one at a time, and returns
+ * how many reached the daily log. A summary that fails goes back for the next
+ * session, up to three tries.
+ */
+export async function writePendingExitSummaries(ctx: ExtensionContext): Promise<number> {
+	let written = 0;
+	for (const claimed of claimPendingExitSummaries()) {
+		const pending = readPendingExitSummary(claimed);
+		if (!pending) {
+			fs.rmSync(claimed, { force: true });
+			continue;
 		}
-
-		return { summary: summaryText, hasMessages: true };
-	} catch (err) {
-		return { summary: null, error: err instanceof Error ? err.message : String(err), hasMessages: true };
+		const outcome = await writeExitSummaryInTime(ctx, pending);
+		if (outcome === "failed") {
+			releasePendingExitSummary(claimed, pending);
+			continue;
+		}
+		fs.rmSync(claimed, { force: true });
+		if (outcome === "written") written++;
 	}
+	if (written > 0 && (await ensureQmdAvailableForUpdate())) await runQmdUpdateNow();
+	return written;
+}
+
+let pendingExitSummaryWork: Promise<number> | null = null;
+
+/** The background write the last session start began, if it is still running (for testing). */
+export function _pendingExitSummaryWork(): Promise<number> | null {
+	return pendingExitSummaryWork;
 }
 
 function getQmdUpdateMode(): "background" | "manual" | "off" {
@@ -524,13 +703,13 @@ export function isExitSummaryEmpty(summary: string): boolean {
 	return contentLines.every((line) => /^none\.?$/i.test(line.replace(/^[-*+]\s*/, "")));
 }
 
-const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 10_000;
+const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 60_000;
 
 /**
- * Self-imposed timeout for the exit-summary work on session_shutdown. Pi core
- * awaits shutdown handlers with no timeout, and generateExitSummary() is only
- * bounded by the provider's own timeout — a hanging provider would otherwise
- * block quitting indefinitely. Override with PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS.
+ * How long one exit summary may take before it waits for the next session.
+ * The model call is bounded only by the provider's own timeout, and a hanging
+ * provider would otherwise hold the queue behind it. Override with
+ * PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS.
  */
 export function getExitSummaryTimeoutMs(): number {
 	const configured = Number(process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS);
@@ -1463,6 +1642,15 @@ export default function (pi: ExtensionAPI) {
 	// --- session_start: detect qmd, auto-setup collection ---
 	pi.on("session_start", async (_event, ctx) => {
 		exitSummaryReason = null;
+		// A print run is often a script and ends soon; leave the summaries to an
+		// interactive session, where the background call has time to finish.
+		if (ctx.hasUI && pendingExitSummaryWork === null) {
+			pendingExitSummaryWork = writePendingExitSummaries(ctx)
+				.catch(() => 0)
+				.finally(() => {
+					pendingExitSummaryWork = null;
+				});
+		}
 		if (terminalInputUnsubscribe) {
 			terminalInputUnsubscribe();
 			terminalInputUnsubscribe = null;
@@ -1497,7 +1685,7 @@ export default function (pi: ExtensionAPI) {
 		refreshMemorySnapshot("session_start");
 	});
 
-	// --- session_shutdown: write exit summary + clean up timer ---
+	// --- session_shutdown: leave the exit summary to the next session + clean up timer ---
 	pi.on("session_shutdown", async (event, ctx) => {
 		const shutdownReason = (event as { reason?: string }).reason;
 
@@ -1523,44 +1711,17 @@ export default function (pi: ExtensionAPI) {
 		const reason = exitSummaryReason ?? "session-end";
 		exitSummaryReason = null;
 
-		let summaryTimer: ReturnType<typeof setTimeout> | undefined;
+		if (updateTimer) {
+			clearTimeout(updateTimer);
+			updateTimer = null;
+		}
+		// Only save what the next session needs: pi has already stopped its
+		// screen, so anything awaited here looks like a hang.
 		try {
-			if (reason) {
-				ensureDirs();
-				// Race the summary against a self-imposed timeout: pi core awaits
-				// shutdown handlers with no timeout, so a hanging provider would
-				// otherwise block quitting indefinitely. On expiry nothing is
-				// persisted (the late result, if any, is simply dropped).
-				const summaryWork = generateExitSummary(ctx);
-				const expired = new Promise<null>((resolve) => {
-					summaryTimer = setTimeout(() => resolve(null), getExitSummaryTimeoutMs());
-				});
-				const result = await Promise.race([summaryWork, expired]);
-				// Only persist real summaries. The old fallback appended an
-				// all-"None." boilerplate block on every failed summarization
-				// (no API key, empty response, …), polluting the daily log —
-				// which is then re-injected into context every session start.
-				// Successful-but-empty summaries (every section "None.") are
-				// filtered out for the same reason.
-				if (result?.hasMessages && result.summary && !isExitSummaryEmpty(result.summary)) {
-					const summary = result.summary;
-					const sid = shortSessionId(ctx.sessionManager.getSessionId());
-					const ts = nowTimestamp();
-					const entry = formatExitSummaryEntry(summary, reason, sid, ts);
-					const filePath = dailyPath(todayStr());
-					const existing = readFileSafe(filePath) ?? "";
-					const separator = existing.trim() ? "\n\n" : "";
-					fs.writeFileSync(filePath, existing + separator + entry, "utf-8");
-					await ensureQmdAvailableForUpdate();
-					await runQmdUpdateNow();
-				}
-			}
-		} finally {
-			if (summaryTimer) clearTimeout(summaryTimer);
-			if (updateTimer) {
-				clearTimeout(updateTimer);
-				updateTimer = null;
-			}
+			const pending = pendingExitSummaryOf(ctx, reason);
+			if (pending) savePendingExitSummary(pending);
+		} catch {
+			// A failed save must never keep pi from quitting.
 		}
 	});
 
