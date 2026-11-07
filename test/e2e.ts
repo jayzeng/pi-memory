@@ -18,12 +18,23 @@
  *   6. memory_search graceful error when qmd is not configured
  *   7. Optional qmd-enabled search (when qmd + collection are configured)
  *   8. qmd no-results parsing (when qmd + collection are configured)
+ *   9. Cross-project marker isolation (API-backed; skipped without an API key)
  */
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import registerExtension, { _clearUpdateTimer } from "../index.js";
+import registerExtension, {
+	_clearUpdateTimer,
+	_resetBaseDir,
+	_setMemoryRoot,
+	_setScopeSetForTest,
+	buildMemoryContext,
+	scopeHash,
+	scopeSlug,
+	searchRelevantMemories,
+} from "../index.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -103,7 +114,10 @@ function toolResultText(result: any): string {
 }
 
 /** Run pi in print+json mode with the extension loaded. */
-function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }): PiResult {
+function runPi(
+	prompt: string,
+	opts?: { timeout?: number; textMode?: boolean; cwd?: string; env?: NodeJS.ProcessEnv },
+): PiResult {
 	const timeout = opts?.timeout ?? TIMEOUT_MS;
 	const mode = opts?.textMode ? "text" : "json";
 
@@ -127,6 +141,8 @@ function runPi(prompt: string, opts?: { timeout?: number; textMode?: boolean }):
 			encoding: "utf-8",
 			maxBuffer: 10 * 1024 * 1024, // 10MB
 			stdio: ["pipe", "pipe", "pipe"],
+			cwd: opts?.cwd,
+			env: opts?.env ? { ...process.env, ...opts.env } : undefined,
 		});
 	} catch (err: any) {
 		stdout = err.stdout ?? "";
@@ -552,6 +568,60 @@ function testHandoffSurvivesToNextSession() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-project isolation (API-backed marker-token case)
+// ---------------------------------------------------------------------------
+
+/** The e2e suite's API-backed cases are skipped when no provider key is configured. */
+function hasApiKeyConfigured(): boolean {
+	const keys = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"];
+	return keys.some((key) => (process.env[key] ?? "").trim().length > 0);
+}
+
+async function testCrossProjectMarkerIsolation() {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-e2e-scope-root-"));
+	const projectA = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-e2e-proj-a-"));
+	const projectB = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-e2e-proj-b-"));
+	const gitEnv = { ...process.env };
+	delete gitEnv.GIT_DIR;
+	delete gitEnv.GIT_WORK_TREE;
+
+	try {
+		execSync("git init -q", { cwd: projectA, stdio: "ignore", env: gitEnv });
+		execSync("git init -q", { cwd: projectB, stdio: "ignore", env: gitEnv });
+
+		const token = `SCOPE_ISO_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+		const dirA = path.join(root, "projects", `${scopeSlug(projectA)}-${scopeHash(projectA)}`);
+		const dirB = path.join(root, "projects", `${scopeSlug(projectB)}-${scopeHash(projectB)}`);
+		fs.mkdirSync(dirA, { recursive: true });
+		fs.mkdirSync(dirB, { recursive: true });
+		fs.writeFileSync(path.join(dirA, "MEMORY.md"), `Project A secret marker: ${token}\n`, "utf-8");
+		fs.writeFileSync(path.join(dirB, "MEMORY.md"), "Project B memory: the local bakery is Crumb.\n", "utf-8");
+
+		// Assertions of record: B's built context and search output are raw text.
+		_setMemoryRoot(root);
+		_setScopeSetForTest(`project:${scopeSlug(projectB)}`);
+		const built = buildMemoryContext();
+		assert(built.includes("Crumb"), "project B's own memory should be injected");
+		assert(!built.includes(token), "project A's marker leaked into project B's built context");
+		const searchOutput = await searchRelevantMemories(token);
+		assert(!searchOutput.includes(token), "project A's marker leaked into project B's search output");
+
+		// API-backed smoke test of the wiring (not the assertion of record).
+		const result = runPi(
+			"List any secret marker tokens present in your memory context. If there are none, reply exactly NONE. Do not use any tools.",
+			{ cwd: projectB, env: { ...process.env, PI_MEMORY_DIR: root } },
+		);
+		assertPiExitedOk(result, "pi (scope isolation)");
+		assert(!result.stdout.includes(token), "raw pi output leaked project A's marker into project B's session");
+	} finally {
+		_resetBaseDir();
+		for (const dir of [root, projectA, projectB]) {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -624,6 +694,14 @@ async function main() {
 			console.log("\n\x1b[1m7–11. qmd-dependent tests\x1b[0m");
 			console.log("  (skipped: qmd not available or collection missing)");
 			skipped += 5;
+		}
+
+		console.log("\n\x1b[1m12. Cross-project isolation\x1b[0m");
+		if (hasApiKeyConfigured()) {
+			await test("project A's marker stays out of project B's context and output", testCrossProjectMarkerIsolation);
+		} else {
+			console.log("  (skipped: no API key configured)");
+			skipped += 1;
 		}
 	} finally {
 		_clearUpdateTimer();

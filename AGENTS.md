@@ -7,7 +7,7 @@
 - `README.md`: user-facing install/usage docs
 - `package.json`: metadata + **peer** dependencies (provided by the pi runtime)
 
-Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`).
+Runtime data lives outside the repo under `~/.pi/agent/memory/` — a root holding one directory per scope: `global/` and `projects/<slug>-<hash>/`, each with `MEMORY.md`, `SCRATCHPAD.md` and `daily/YYYY-MM-DD.md`. See `GLOSSARY.md` for scope vocabulary.
 
 ## Activity Tracking (Required)
 
@@ -25,7 +25,7 @@ Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `S
 - `npm run build`: typecheck with `tsc` (`--noEmit`)
 - `npm run lint`: lint with Biome
 - Optional (for `memory_search`, requires Bun): `command -v qmd >/dev/null 2>&1 || bun install -g https://github.com/tobi/qmd`
-- Optional search setup: `qmd collection add ~/.pi/agent/memory --name pi-memory && qmd embed`
+- Optional search setup: `qmd collection add ~/.pi/agent/memory/global --name pi-memory && qmd embed`
 
 ## Coding Style & Naming Conventions
 
@@ -40,7 +40,7 @@ Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `S
 - Add or update a failing test first that reproduces the bug or captures the new requirement; implement code only after the test fails for the expected reason.
 - Keep tests green after implementation and after any refactor; do not merge with skipped failing tests.
 - Every bug fix must include a regression test that fails before the fix and passes after it.
-- Tests touch `~/.pi/agent/memory/`; ensure backups/restores remain intact and new tests don’t leak user data.
+- Unit tests must use temp directories (`_setBaseDir`, `_setMemoryRoot`) and must never read or write the real `~/.pi/agent/memory`; e2e tests back up and restore what they touch.
 - Prefer behavior-focused assertions (tool availability, file contents, cross-session recall). Keep timeouts generous for model latency.
 
 ## Commit & Pull Request Guidelines

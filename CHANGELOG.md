@@ -6,6 +6,54 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Project-scoped memory.** Memory is now organised into scopes: a session
+  reads its own project scope (`project:<slug>`, derived from the git root)
+  plus any configured extra scopes, with `global` available as an opt-in scope
+  instead of being the only store. Each scope has its own `MEMORY.md`,
+  `daily/`, scratchpad, recovery records and qmd collection.
+- `.pi/memory.json` (`project`, `scopes`), `PI_MEMORY_SCOPES`, and the
+  `/memory` command (`scope`, `scopes`, `migrate`) configure the scope set;
+  precedence is command > env > project config > default.
+- Optional `scope` / `scopes` parameters on the memory tools. Writes go to the
+  own scope or `global`; reads default to the active set, may widen, and group
+  output per scope.
+- `/memory migrate` moves the previous flat layout into `global/` — plan by
+  default, `--apply` to execute, `--undo` to reverse from the manifest.
+- Injected context lists each scope separately and splits the 16K budget
+  equally across them; per-scope search results merge round-robin with
+  `[scope-id]` prefixes.
+- `memory_status` reports the per-scope directories and qmd collections, plus
+  orphaned collections and embedding chunks (`qmd cleanup` is suggested, never
+  run).
+- **Interactive `/memory` panel.** Bare `/memory` in a TUI opens a picker-style
+  panel: arrows move, space or tab stage a scope, enter applies the staged set
+  or expands the `Status` row, and `esc` closes without applying. Rows list the
+  locked own scope, on-disk project scopes A→Z, `global` as an opt-in extra,
+  then `Status` (paths and qmd readiness) and `Migrate` (plan, confirm, apply).
+  Selections are session-only and never persisted; in print, JSON and RPC the
+  bare command still prints the report, and every verb is unchanged.
+
+### Changed
+
+- **`PI_MEMORY_DIR` is now the memory root**, the directory holding `global/`
+  and `projects/`, not a single scope directory. It is still honoured; pointing
+  it at a directory that contains `MEMORY.md` directly now warns once per
+  session.
+- **Upgrading does not move existing memory automatically.** Until
+  `/memory migrate --apply` runs, memory stays in the old flat location and is
+  not indexed. The plan output shows exactly what will move.
+
+### Fixed
+
+- Expanding `Status` in the `/memory` panel now paints the scope directories
+  immediately with a spinning `qmd: ⠋ checking` indicator (pi's Loader frame
+  cadence), fills in qmd readiness when the probe lands, and reports a failed
+  probe instead of leaving the block blank — previously the block stayed empty
+  for the full multi-second probe, so the row looked like a no-op. Collapsing
+  mid-probe cancels it and reports `status check canceled`.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

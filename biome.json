@@ -22,6 +22,6 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"includes": ["**/*.ts", "!node_modules", "!.claude", "!coverage"]
+		"includes": ["**/*.ts", "!node_modules", "!.claude", "!.qoder", "!.pi-worktrees", "!coverage"]
 	}
 }
