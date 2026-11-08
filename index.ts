@@ -562,6 +562,102 @@ export function shouldSkipExitSummaryForReason(reason: string | undefined): bool
 	return ["reload", "new", "resume", "fork"].includes(reason);
 }
 
+/**
+ * Session id, or null when the session manager cannot supply one.
+ *
+ * `session_shutdown` is also emitted with a bare context on teardown paths, so
+ * the duplicate guard must never be the thing that throws while quitting — the
+ * rest of this handler already treats a missing session manager as "no data,
+ * carry on".
+ */
+function getSessionIdSafe(ctx: ExtensionContext): string | null {
+	try {
+		const id = ctx.sessionManager?.getSessionId?.();
+		return typeof id === "string" && id.length > 0 ? id : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Timestamp of the last exit summary already written for a session.
+ *
+ * Exit summaries snapshot the WHOLE session branch, not "messages since the last
+ * summary". Quitting, resuming the same session, and quitting again therefore
+ * summarizes the identical transcript twice and appends it to the daily log
+ * twice. That is not just noise: today's daily log is re-injected into every new
+ * session, so the duplicate is paid for in context on every subsequent turn.
+ *
+ * Scans today's and yesterday's daily logs (a session resumed across midnight is
+ * still covered) for `<!-- <ts> [<sid>] -->` headers. Pre-compaction handoffs use
+ * the same header shape and also snapshot the whole branch, so they count too.
+ *
+ * Returns null when nothing is recorded for the session, or when the stored
+ * timestamp cannot be parsed — callers treat null as "summarize", because losing
+ * a summary is worse than writing a duplicate.
+ */
+export function findLastExitSummaryTimestamp(sessionId: string): Date | null {
+	const sid = shortSessionId(sessionId);
+	let latest: Date | null = null;
+	for (const date of [todayStr(), yesterdayStr()]) {
+		let content: string | null;
+		try {
+			content = readFileSafe(dailyPath(date));
+		} catch {
+			continue;
+		}
+		if (!content) continue;
+		// The sid group is deliberately not restricted to hex: real session ids are
+		// UUIDs, but shortSessionId() only slices the first 8 characters, and a
+		// stricter class would silently stop matching rather than fail loudly.
+		const headerRegex = /<!--\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\[([0-9A-Za-z_-]{1,64})\]\s*-->/g;
+		for (const match of content.matchAll(headerRegex)) {
+			if (match[2] !== sid) continue;
+			const parsed = parseLocalTimestamp(match[1]);
+			if (parsed && (!latest || parsed.getTime() > latest.getTime())) latest = parsed;
+		}
+	}
+	return latest;
+}
+
+/**
+ * True when the branch has gained content since its last recorded summary.
+ *
+ * Only `message` entries count. Bookkeeping entries (`plan-mode-state`,
+ * `compact-thinking-duration`, `agent-summary`, …) are appended on every session
+ * transition and would otherwise defeat the check — in the observed duplicate,
+ * the only entries between the two summaries were three `plan-mode-state` rows.
+ *
+ * Fails open: a missing branch or unparseable timestamp returns true, so the
+ * summary still runs.
+ */
+export function hasNewMessagesSince(branch: SessionEntry[] | null, lastSummaryAt: Date | null): boolean {
+	if (!lastSummaryAt) return true;
+	if (!branch) return true;
+	const cutoff = lastSummaryAt.getTime();
+	for (const entry of branch) {
+		if (entry.type !== "message") continue;
+		const ts = entry.timestamp;
+		const millis = typeof ts === "number" ? ts : Date.parse(String(ts));
+		if (!Number.isFinite(millis)) return true;
+		if (millis > cutoff) return true;
+	}
+	return false;
+}
+
+/** Format a Date using the same local stamp convention as nowTimestamp(). */
+export function formatLocalTimestamp(d: Date): string {
+	return `${localDateStr(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+/** Parse a local (non-UTC) "YYYY-MM-DD HH:mm:ss" stamp written by nowTimestamp(). */
+export function parseLocalTimestamp(value: string): Date | null {
+	const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(value);
+	if (!m) return null;
+	const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+	return Number.isNaN(date.getTime()) ? null : date;
+}
+
 async function ensureQmdAvailableForUpdate(): Promise<boolean> {
 	if (qmdAvailable) return true;
 	if (getQmdUpdateMode() !== "background") return false;
@@ -1527,6 +1623,22 @@ export default function (pi: ExtensionAPI) {
 		try {
 			if (reason) {
 				ensureDirs();
+
+				// Idempotency guard: an exit summary snapshots the whole branch, so
+				// quitting, resuming the same session, and quitting again would append
+				// the identical transcript a second time. Compare the newest message
+				// against the last recorded summary for this session and skip when
+				// nothing was added in between. Runs BEFORE the LLM call, so a no-op
+				// quit costs nothing and returns immediately. Fails open: an
+				// unidentifiable session is summarized rather than silently dropped.
+				const guardSessionId = getSessionIdSafe(ctx);
+				if (
+					guardSessionId &&
+					!hasNewMessagesSince(getSessionBranch(ctx), findLastExitSummaryTimestamp(guardSessionId))
+				) {
+					return;
+				}
+
 				// Race the summary against a self-imposed timeout: pi core awaits
 				// shutdown handlers with no timeout, so a hanging provider would
 				// otherwise block quitting indefinitely. On expiry nothing is

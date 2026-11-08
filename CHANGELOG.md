@@ -6,6 +6,20 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Exit summaries are no longer written twice for the same session. The summary
+  snapshots the whole session branch rather than "messages since the last
+  summary", so quitting, resuming a session, and quitting again appended the
+  identical transcript to the daily log a second time — which is then re-injected
+  into context on every subsequent session start. `session_shutdown` now compares
+  the newest message against the last summary recorded for that session and skips
+  the LLM call entirely when nothing was added. Only `message` entries count;
+  bookkeeping entries (`plan-mode-state`, `compact-thinking-duration`, …) are
+  appended on every transition and would otherwise defeat the check. The guard
+  fails open — a missing or unparseable timestamp summarizes rather than silently
+  dropping the session's notes.
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

@@ -30,14 +30,18 @@ import {
 	dailyPath,
 	ensureDirs,
 	ensureQmdEmbed,
+	findLastExitSummaryTimestamp,
 	forgetBlocks,
+	formatLocalTimestamp,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
+	hasNewMessagesSince,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
+	parseLocalTimestamp,
 	parseScratchpad,
 	probeEmbeddings,
 	qmdCollectionInstructions,
@@ -1677,6 +1681,150 @@ describe("lifecycle hooks", () => {
 			await hooks.session_shutdown({ reason: "quit" }, ctx);
 
 			expect(getApiKey).toHaveBeenCalledWith(sessionModel);
+		});
+	});
+
+	describe("exit summary duplicate suppression", () => {
+		const message = (iso: string) => ({ type: "message", id: iso, parentId: null, timestamp: iso, message: {} });
+		const bookkeeping = (iso: string, customType: string) => ({
+			type: "custom",
+			customType,
+			id: iso,
+			parentId: null,
+			timestamp: iso,
+		});
+		// Exit summaries are gated on EXIT_SUMMARY_MIN_MESSAGES, so every
+		// session_shutdown assertion below needs a substantive branch — otherwise
+		// the handler exits early and the test passes without exercising the guard.
+		const substantiveBranch = (endIso: string) => [
+			message(new Date(Date.parse(endIso) - 40_000).toISOString()),
+			message(new Date(Date.parse(endIso) - 30_000).toISOString()),
+			message(new Date(Date.parse(endIso) - 20_000).toISOString()),
+			message(endIso),
+		];
+
+		test("parseLocalTimestamp reads local stamps and rejects anything else", () => {
+			const parsed = parseLocalTimestamp("2026-10-15 13:03:46");
+			expect(parsed).toBeInstanceOf(Date);
+			expect(parsed?.getHours()).toBe(13);
+			expect(parseLocalTimestamp("nope")).toBeNull();
+			expect(parseLocalTimestamp("2026-10-15T13:03:46Z")).toBeNull();
+		});
+
+		test("formatLocalTimestamp round-trips through parseLocalTimestamp", () => {
+			const now = new Date();
+			const parsed = parseLocalTimestamp(formatLocalTimestamp(now));
+			expect(parsed).not.toBeNull();
+			expect(Math.floor((parsed as Date).getTime() / 1000)).toBe(Math.floor(now.getTime() / 1000));
+		});
+
+		test("findLastExitSummaryTimestamp returns null without a daily log", () => {
+			expect(findLastExitSummaryTimestamp("deadbeef")).toBeNull();
+		});
+
+		test("findLastExitSummaryTimestamp matches only the given session", () => {
+			ensureDirs();
+			fs.writeFileSync(
+				dailyPath(todayStr()),
+				`<!-- ${formatLocalTimestamp(new Date())} [aaaaaaaa] -->\n## Session Summary (auto, exit: /quit)\n\n- other\n`,
+			);
+			expect(findLastExitSummaryTimestamp("bbbbbbbb")).toBeNull();
+			expect(findLastExitSummaryTimestamp("aaaaaaaa")).not.toBeNull();
+		});
+
+		test("findLastExitSummaryTimestamp matches non-hex session ids", () => {
+			// shortSessionId() only slices 8 characters, so a hex-only character
+			// class would silently stop matching and let duplicates through.
+			ensureDirs();
+			const ts = formatLocalTimestamp(new Date());
+			fs.writeFileSync(dailyPath(todayStr()), `<!-- ${ts} [exit-tes] -->\n## Session Summary\n\n- x\n`);
+			expect(findLastExitSummaryTimestamp("exit-test-session")).not.toBeNull();
+		});
+
+		test("hasNewMessagesSince fails open without a prior summary or branch", () => {
+			expect(hasNewMessagesSince([message(new Date().toISOString())], null)).toBe(true);
+			expect(hasNewMessagesSince(null, new Date())).toBe(true);
+		});
+
+		test("bookkeeping-only tail does not re-trigger a summary", () => {
+			const summaryAt = new Date(Date.now() - 60_000);
+			const branch = [
+				message(new Date(summaryAt.getTime() - 120_000).toISOString()),
+				// The exact observed tail: three state entries, no new message.
+				bookkeeping(new Date(summaryAt.getTime() + 1_000).toISOString(), "plan-mode-state"),
+				bookkeeping(new Date(summaryAt.getTime() + 5_000).toISOString(), "plan-mode-state"),
+				bookkeeping(new Date(summaryAt.getTime() + 9_000).toISOString(), "compact-thinking-duration"),
+			];
+			expect(hasNewMessagesSince(branch, summaryAt)).toBe(false);
+		});
+
+		test("a genuinely new message re-enables the summary", () => {
+			const summaryAt = new Date(Date.now() - 60_000);
+			const branch = [
+				message(new Date(summaryAt.getTime() - 120_000).toISOString()),
+				bookkeeping(new Date(summaryAt.getTime() + 5_000).toISOString(), "plan-mode-state"),
+				message(new Date(summaryAt.getTime() + 10_000).toISOString()),
+			];
+			expect(hasNewMessagesSince(branch, summaryAt)).toBe(true);
+		});
+
+		test("numeric timestamps and unparseable values are handled", () => {
+			const summaryAt = new Date();
+			expect(hasNewMessagesSince([message(new Date(summaryAt.getTime() - 1_000).toISOString())], summaryAt)).toBe(
+				false,
+			);
+			const numeric = [{ type: "message", timestamp: summaryAt.getTime() - 1_000 }];
+			expect(hasNewMessagesSince(numeric, summaryAt)).toBe(false);
+			const numericNewer = [{ type: "message", timestamp: summaryAt.getTime() + 1_000 }];
+			expect(hasNewMessagesSince(numericNewer, summaryAt)).toBe(true);
+			expect(hasNewMessagesSince([{ type: "message", timestamp: "garbage" }], summaryAt)).toBe(true);
+		});
+
+		test("session_shutdown skips the LLM call when nothing changed since the last summary", async () => {
+			ensureDirs();
+			const summaryAt = new Date(Date.now() - 60_000);
+			fs.writeFileSync(
+				dailyPath(todayStr()),
+				`<!-- ${formatLocalTimestamp(summaryAt)} [abcdef12] -->\n## Session Summary (auto, exit: /quit)\n\n- already summarized\n`,
+			);
+			const getApiKey = mock(async () => "key");
+			const ctx = createShutdownCtx({
+				sessionId: "abcdef1234567890",
+				// All four messages predate the recorded summary, plus a bookkeeping
+				// entry after it: nothing new to summarize.
+				branch: [
+					...substantiveBranch(new Date(summaryAt.getTime() - 10_000).toISOString()),
+					bookkeeping(new Date(summaryAt.getTime() + 5_000).toISOString(), "plan-mode-state"),
+				],
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(getApiKey).not.toHaveBeenCalled();
+			const body = fs.readFileSync(dailyPath(todayStr()), "utf-8");
+			expect((body.match(/## Session Summary/g) || []).length).toBe(1);
+		});
+
+		test("session_shutdown still summarizes when the branch moved on", async () => {
+			ensureDirs();
+			const summaryAt = new Date(Date.now() - 60_000);
+			fs.writeFileSync(
+				dailyPath(todayStr()),
+				`<!-- ${formatLocalTimestamp(summaryAt)} [abcdef12] -->\n## Session Summary (auto, exit: /quit)\n\n- already summarized\n`,
+			);
+			const getApiKey = mock(async () => "key");
+			const ctx = createShutdownCtx({
+				sessionId: "abcdef1234567890",
+				branch: substantiveBranch(new Date(summaryAt.getTime() + 10_000).toISOString()),
+				model: { provider: "openai", id: "gpt-4o-mini" },
+				modelRegistry: { getApiKey },
+			});
+
+			await hooks.session_shutdown({ reason: "quit" }, ctx);
+
+			expect(getApiKey).toHaveBeenCalled();
 		});
 	});
 
