@@ -1446,6 +1446,20 @@ function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
 	return "stable";
 }
 
+/** The prompt section pi renders the memory block in, as `<memory>…</memory>`. */
+const MEMORY_SECTION = "memory";
+
+/**
+ * Pi's structured system prompt sections, which recent pi versions expose on
+ * `before_agent_start`. Undefined on older hosts, which only take a replacement
+ * `systemPrompt`.
+ */
+function promptSections(event: { systemPromptOptions?: unknown }): Record<string, string> | undefined {
+	const options = event.systemPromptOptions as { sections?: unknown } | undefined;
+	const sections = options?.sections;
+	return typeof sections === "object" && sections !== null ? (sections as Record<string, string>) : undefined;
+}
+
 /** Reset snapshot state (for testing). */
 export function _resetMemorySnapshot() {
 	memorySnapshot = null;
@@ -1613,9 +1627,19 @@ export default function (pi: ExtensionAPI) {
 						"for the authoritative latest state; anything written this session is in tool-call history.";
 		}
 
-		if (!memoryContext) return;
+		// With a section, a changed block (a /reload after a daily write, a
+		// deletion) is appended as a system message and the cached prefix stays.
+		// A replacement systemPrompt rewrites the whole prompt instead, and makes pi
+		// fold every other extension's section changes into it too (#50).
+		// per-turn changes the block every turn, so it keeps the replacement rather
+		// than appending the whole block to the transcript on every turn.
+		const sections = mode === "per-turn" ? undefined : promptSections(event);
+		if (!memoryContext) {
+			if (sections) delete sections[MEMORY_SECTION];
+			return;
+		}
 
-		const headerLines = ["\n\n## Memory"];
+		const headerLines = ["## Memory"];
 		if (snapshotCaveat) headerLines.push(`(${snapshotCaveat})`);
 		headerLines.push(
 			"The following memory files have been loaded. Use the memory_write tool to persist important information.",
@@ -1629,8 +1653,13 @@ export default function (pi: ExtensionAPI) {
 			memoryContext,
 		);
 
+		const block = headerLines.join("\n");
+		if (sections) {
+			sections[MEMORY_SECTION] = block;
+			return;
+		}
 		return {
-			systemPrompt: event.systemPrompt + headerLines.join("\n"),
+			systemPrompt: `${event.systemPrompt}\n\n${block}`,
 		};
 	});
 

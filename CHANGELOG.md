@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- On pi versions with structured system prompt sections, the memory block goes
+  in a `memory` section instead of a replacement `systemPrompt`. A changed
+  block, such as after a `/reload` that follows a daily write, no longer
+  rewrites the whole prompt: pi appends it and keeps the cached prefix. Other
+  extensions' section changes also stay small deltas. Older pi versions and
+  `per-turn` mode keep the replacement. (#50, #37)
+
 ## [0.4.2] — 2026-08-10
 
 ### Added

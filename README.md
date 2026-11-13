@@ -135,6 +135,8 @@ To keep the prefix byte-stable, the extension snapshots the memory context at de
 - **Deletions and restores** intentionally refresh the snapshot. These are rare, authority-changing operations: forgotten content must disappear from the prompt immediately, and pi does not copy deleted content into a persisted correction message merely to preserve the cache.
 - Set `PI_MEMORY_SNAPSHOT=refresh` for the old behaviour (refresh on long-term write and day rollover, with a `Snapshot <reason> at <hh:mm:ss>` caveat line).
 
+On pi versions with structured system prompt sections, the block goes in its own `<memory>` section instead of replacing the whole system prompt. When the block changes, as after a `/reload` that follows a daily write, pi keeps the cached prefix and appends the new block as a system message. Older pi versions still get the block appended to the system prompt. `per-turn` mode always replaces the system prompt, since a section rebuilt every turn would append the whole block to the transcript every turn.
+
 `memory_write` with `target: daily` and `scratchpad` writes do **not** mark dirty — they're high-frequency and the write content is already echoed via tool-call args. The model can always call `memory_read` / `memory_search` for the authoritative latest state.
 
 Set `PI_MEMORY_SNAPSHOT=per-turn` to opt out and restore the old per-turn rebuild behavior, including automatic per-prompt qmd search injection.

@@ -1401,6 +1401,47 @@ describe("lifecycle hooks", () => {
 		expect(result.systemPrompt).toContain("scratchpad");
 	});
 
+	test("before_agent_start writes memory to its own prompt section when pi has sections", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Remember this", "utf-8");
+		const sections: Record<string, string> = { other: "another extension" };
+		const event = { systemPrompt: "base prompt", systemPromptOptions: { sections } };
+		const result = await hooks.before_agent_start(event, {});
+		// No replacement prompt: pi keeps its cached prefix and appends a delta when memory changes.
+		expect(result).toBeUndefined();
+		expect(sections.memory).toStartWith("## Memory");
+		expect(sections.memory).toContain("Remember this");
+		expect(sections.other).toBe("another extension");
+	});
+
+	test("before_agent_start removes its prompt section when memory is empty", async () => {
+		const sections: Record<string, string> = { memory: "left over" };
+		const event = { systemPrompt: "base prompt", systemPromptOptions: { sections } };
+		const result = await hooks.before_agent_start(event, {});
+		expect(result).toBeUndefined();
+		expect(sections.memory).toBeUndefined();
+	});
+
+	test("before_agent_start keeps replacing the prompt in per-turn mode", async () => {
+		const previous = process.env.PI_MEMORY_SNAPSHOT;
+		const previousNoSearch = process.env.PI_MEMORY_NO_SEARCH;
+		process.env.PI_MEMORY_SNAPSHOT = "per-turn";
+		process.env.PI_MEMORY_NO_SEARCH = "1";
+		try {
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Remember this", "utf-8");
+			const sections: Record<string, string> = {};
+			const event = { systemPrompt: "base prompt", systemPromptOptions: { sections } };
+			const result = await hooks.before_agent_start(event, {});
+			// A section rebuilt every turn would append the whole block to the transcript every turn.
+			expect(result.systemPrompt).toContain("Remember this");
+			expect(sections.memory).toBeUndefined();
+		} finally {
+			if (previous === undefined) delete process.env.PI_MEMORY_SNAPSHOT;
+			else process.env.PI_MEMORY_SNAPSHOT = previous;
+			if (previousNoSearch === undefined) delete process.env.PI_MEMORY_NO_SEARCH;
+			else process.env.PI_MEMORY_NO_SEARCH = previousNoSearch;
+		}
+	});
+
 	// -- session_shutdown --
 
 	test("session_shutdown clears update timer", async () => {
