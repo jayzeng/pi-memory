@@ -603,6 +603,20 @@ describe("buildMemoryContext", () => {
 		expect(ctx).toContain("Yesterday's work");
 	});
 
+	test("preserves the newest entry header when truncating a daily log", () => {
+		ensureDirs();
+		const today = todayStr();
+		const header = `<!-- ${today} 23:31:54 [01a197ba] -->\n## Latest work`;
+		const content = `## Earlier work\n\n${header}\n\n${"old detail\n".repeat(400)}\n- latest detail`;
+		fs.writeFileSync(path.join(tmpDir, "daily", `${today}.md`), content, "utf-8");
+
+		const ctx = buildMemoryContext();
+		expect(ctx).toContain(header);
+		expect(ctx).toContain("- latest detail");
+		expect(ctx).not.toContain("## Earlier work");
+		expect(ctx).toContain("[truncated:");
+	});
+
 	test("combines all sections with separators", () => {
 		ensureDirs();
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Memory content", "utf-8");
