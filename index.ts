@@ -286,6 +286,10 @@ function formatPreviewBlock(label: string, content: string, mode: TruncateMode) 
 
 function formatContextSection(label: string, content: string, mode: TruncateMode, maxLines: number, maxChars: number) {
 	const result = buildPreview(content, { maxLines, maxChars, mode });
+	return formatContextPreview(label, result);
+}
+
+function formatContextPreview(label: string, result: PreviewResult) {
 	if (!result.preview) {
 		return "";
 	}
@@ -293,6 +297,49 @@ function formatContextSection(label: string, content: string, mode: TruncateMode
 		? `\n\n[truncated: showing ${result.previewLines}/${result.totalLines} lines, ${result.previewChars}/${result.totalChars} chars]`
 		: "";
 	return `${label}\n\n${result.preview}${note}`;
+}
+
+function formatDailyLogSection(label: string, content: string) {
+	const normalized = normalizeContent(content).replace(/\r\n/g, "\n");
+	const limits = { maxLines: CONTEXT_DAILY_MAX_LINES, maxChars: CONTEXT_DAILY_MAX_CHARS, mode: "end" as const };
+	const result = buildPreview(normalized, limits);
+	if (result.truncated) {
+		const cut = normalized.length - result.preview.length;
+		// Find the entry containing the start of the retained tail.
+		const headers = normalized.matchAll(
+			/^<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[[^\]\n]+\] -->[ \t]*(?:\n## [^\n]+)?/gm,
+		);
+		let header: RegExpMatchArray | undefined;
+		let nextHeaderIndex = normalized.length;
+		for (const candidate of headers) {
+			if (candidate.index >= cut) {
+				nextHeaderIndex = candidate.index;
+				break;
+			}
+			header = candidate;
+		}
+
+		if (header?.index !== undefined) {
+			const prefix = `${header[0]}\n\n`;
+			const maxChars = limits.maxChars - prefix.length;
+			if (maxChars > 0) {
+				// Reserve space for the header within the existing line and character budgets.
+				const tail = buildPreview(normalized.slice(header.index + header[0].length), {
+					...limits,
+					maxLines: limits.maxLines - (prefix.split("\n").length - 1),
+					maxChars,
+				});
+				// If reserving space dropped the entire entry, the tail starts in a newer one.
+				const tailStart = normalized.length - tail.preview.length;
+				if (tail.preview && tailStart < nextHeaderIndex) {
+					result.preview = prefix + tail.preview;
+					result.previewChars = result.preview.length;
+					result.previewLines = result.preview.split("\n").length;
+				}
+			}
+		}
+	}
+	return formatContextPreview(label, result);
 }
 
 type ExitSummaryReason = "ctrl+d" | "slash-quit" | "session-end";
@@ -822,13 +869,7 @@ export function buildMemoryContext(searchResults?: string): string {
 
 	const todayContent = readFileSafe(dailyPath(today));
 	if (todayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${today} (today)`,
-			todayContent,
-			"end",
-			CONTEXT_DAILY_MAX_LINES,
-			CONTEXT_DAILY_MAX_CHARS,
-		);
+		const section = formatDailyLogSection(`## Daily log: ${today} (today)`, todayContent);
 		if (section) sections.push(section);
 	}
 
@@ -857,13 +898,7 @@ export function buildMemoryContext(searchResults?: string): string {
 
 	const yesterdayContent = readFileSafe(dailyPath(yesterday));
 	if (yesterdayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${yesterday} (yesterday)`,
-			yesterdayContent,
-			"end",
-			CONTEXT_DAILY_MAX_LINES,
-			CONTEXT_DAILY_MAX_CHARS,
-		);
+		const section = formatDailyLogSection(`## Daily log: ${yesterday} (yesterday)`, yesterdayContent);
 		if (section) sections.push(section);
 	}
 
