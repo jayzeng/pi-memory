@@ -3,3 +3,6 @@ node_modules/
 *.d.ts
 *.map
 .codegraph
+.pi-worktrees/
+.claude/
+.qoder/
