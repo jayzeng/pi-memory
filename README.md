@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/pi-memory?color=cb3837&logo=npm)](https://www.npmjs.com/package/pi-memory)
 [![npm downloads](https://img.shields.io/npm/dm/pi-memory?color=cb3837&logo=npm)](https://www.npmjs.com/package/pi-memory)
 [![license](https://img.shields.io/npm/l/pi-memory)](LICENSE)
+[![omp status](https://omppackages.com/badge/pi-memory.svg)](https://omppackages.com/packages/pi-memory)
 
 **The most popular memory extension for [pi](https://github.com/earendil-works/pi/)** — listed in the [official pi package directory](https://pi.dev/packages?name=pi-memory), with semantic search powered by [qmd](https://github.com/tobi/qmd).
 
