@@ -354,7 +354,19 @@ export function projectRootFor(cwd: string): string | null {
 			stdio: ["ignore", "pipe", "ignore"],
 			env,
 		}).trim();
-		return out ? path.resolve(out) : null;
+		if (!out) return null;
+
+		// Check if we're in a worktree. If so, return the main repo's root.
+		const commonDir = execFileSync("git", ["-C", cwd, "rev-parse", "--git-common-dir"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			env,
+		}).trim();
+		if (commonDir) {
+			const mainRoot = path.dirname(path.resolve(cwd, commonDir));
+			return mainRoot;
+		}
+		return path.resolve(out);
 	} catch {
 		return null;
 	}

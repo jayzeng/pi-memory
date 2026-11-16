@@ -3303,6 +3303,39 @@ describe("session_start scope resolution", () => {
 		}
 	});
 
+	test("anchors a worktree session to the main repository's root", async () => {
+		const mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-main-"));
+		const worktreePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-wt-")), "pi-agent-abc123");
+		const gitEnv = { ...process.env };
+		delete gitEnv.GIT_DIR;
+		delete gitEnv.GIT_WORK_TREE;
+		execFileSync("git", ["init", "-q", mainRepo], { stdio: "ignore", env: gitEnv });
+		execFileSync("git", ["-C", mainRepo, "config", "user.email", "a@b.c"], { stdio: "ignore", env: gitEnv });
+		execFileSync("git", ["-C", mainRepo, "config", "user.name", "A"], { stdio: "ignore", env: gitEnv });
+		fs.writeFileSync(path.join(mainRepo, "a.txt"), "hi", "utf-8");
+		execFileSync("git", ["-C", mainRepo, "add", "."], { stdio: "ignore", env: gitEnv });
+		execFileSync("git", ["-C", mainRepo, "commit", "-qm", "init"], { stdio: "ignore", env: gitEnv });
+		execFileSync("git", ["-C", mainRepo, "worktree", "add", "-q", worktreePath, "-b", "wt-branch"], { stdio: "ignore", env: gitEnv });
+		try {
+			expect(projectRootFor(worktreePath).toLowerCase()).toBe(fs.realpathSync(mainRepo).toLowerCase());
+			await hooks.session_start({}, { ...sessionCtx(), cwd: worktreePath });
+			await tools.memory_write.execute(
+				"c1",
+				{ target: "long_term", content: "Worktree fact" },
+				null,
+				null,
+				createMockCtx("scope001234567890"),
+			);
+			const dir = path.join(root, "projects", `${scopeSlug(mainRepo)}-${scopeHash(mainRepo)}`);
+			expect(fs.readFileSync(path.join(dir, "MEMORY.md"), "utf-8")).toContain("Worktree fact");
+			const worktreeSlug = scopeSlug(worktreePath);
+			expect(fs.existsSync(path.join(root, "projects", `${worktreeSlug}-${scopeHash(worktreePath)}`))).toBe(false);
+		} finally {
+			execFileSync("git", ["-C", mainRepo, "worktree", "remove", "-f", worktreePath], { stdio: "ignore", env: gitEnv });
+			fs.rmSync(mainRepo, { recursive: true, force: true });
+		}
+	});
+
 	test("returns null outside any repository", () => {
 		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-session-norepo-"));
 		try {
