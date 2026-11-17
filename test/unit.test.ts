@@ -31,6 +31,7 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getDailyLogCount,
 	getEmbedProbeTimeoutMs,
 	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
@@ -601,6 +602,77 @@ describe("buildMemoryContext", () => {
 		const ctx = buildMemoryContext();
 		expect(ctx).toContain(`## Daily log: ${yesterday} (yesterday)`);
 		expect(ctx).toContain("Yesterday's work");
+	});
+
+	describe("recent daily logs", () => {
+		const daysAgo = (n: number) => {
+			const d = new Date();
+			d.setDate(d.getDate() - n);
+			return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		};
+		const writeDaily = (date: string, content: string) =>
+			fs.writeFileSync(path.join(tmpDir, "daily", `${date}.md`), content, "utf-8");
+		let saved: string | undefined;
+		beforeEach(() => {
+			saved = process.env.PI_MEMORY_DAILY_LOGS;
+			delete process.env.PI_MEMORY_DAILY_LOGS;
+			ensureDirs();
+		});
+		afterEach(() => {
+			if (saved === undefined) delete process.env.PI_MEMORY_DAILY_LOGS;
+			else process.env.PI_MEMORY_DAILY_LOGS = saved;
+		});
+
+		test("injects the last two logs across a gap with no log for yesterday", () => {
+			writeDaily(daysAgo(3), "Friday work");
+			writeDaily(daysAgo(4), "Thursday work");
+			writeDaily(daysAgo(5), "Wednesday work");
+			const ctx = buildMemoryContext();
+			expect(ctx).toContain(`## Daily log: ${daysAgo(3)}`);
+			expect(ctx).toContain("Friday work");
+			expect(ctx).toContain("Thursday work");
+			expect(ctx).not.toContain("Wednesday work");
+			expect(ctx).not.toContain("(yesterday)");
+		});
+
+		test("pairs today with the most recent earlier log", () => {
+			writeDaily(todayStr(), "Monday work");
+			writeDaily(daysAgo(3), "Friday work");
+			writeDaily(daysAgo(4), "Thursday work");
+			const ctx = buildMemoryContext();
+			expect(ctx).toContain(`## Daily log: ${todayStr()} (today)`);
+			expect(ctx).toContain("Friday work");
+			expect(ctx).not.toContain("Thursday work");
+		});
+
+		test("puts older logs after MEMORY.md, newest first", () => {
+			process.env.PI_MEMORY_DAILY_LOGS = "3";
+			writeDaily(daysAgo(1), "Newest");
+			writeDaily(daysAgo(2), "Middle");
+			writeDaily(daysAgo(6), "Oldest");
+			fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "Long-term fact", "utf-8");
+			const ctx = buildMemoryContext();
+			const order = ["Newest", "Long-term fact", "Middle", "Oldest"].map((s) => ctx.indexOf(s));
+			expect(order.every((i) => i >= 0)).toBe(true);
+			expect([...order].sort((a, b) => a - b)).toEqual(order);
+		});
+
+		test("PI_MEMORY_DAILY_LOGS=0 disables daily injection", () => {
+			process.env.PI_MEMORY_DAILY_LOGS = "0";
+			writeDaily(todayStr(), "Today's work");
+			expect(buildMemoryContext()).toBe("");
+		});
+
+		test("skips empty, future-dated, and non-date files", () => {
+			writeDaily(daysAgo(-1), "Future work");
+			writeDaily(daysAgo(1), "   \n");
+			writeDaily(daysAgo(2), "Real work");
+			fs.writeFileSync(path.join(tmpDir, "daily", "notes.md"), "Stray file", "utf-8");
+			const ctx = buildMemoryContext();
+			expect(ctx).toContain("Real work");
+			expect(ctx).not.toContain("Future work");
+			expect(ctx).not.toContain("Stray file");
+		});
 	});
 
 	test("combines all sections with separators", () => {
@@ -1251,6 +1323,18 @@ describe("runQmdSearch qmd diagnostics", () => {
 		expect(env.FORCE_COLOR).toBeUndefined();
 		expect(env.NO_COLOR).toBe("1");
 		expect(env.PATH).toBe("bin");
+	});
+});
+
+describe("getDailyLogCount", () => {
+	test("defaults to 2 and accepts non-negative integers", () => {
+		expect(getDailyLogCount({})).toBe(2);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: "5" })).toBe(5);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: " 0 " })).toBe(0);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: "" })).toBe(2);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: "-1" })).toBe(2);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: "1.5" })).toBe(2);
+		expect(getDailyLogCount({ PI_MEMORY_DAILY_LOGS: "abc" })).toBe(2);
 	});
 });
 

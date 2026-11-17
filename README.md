@@ -117,9 +117,11 @@ If the first search doesn't find what you need, try rephrasing or switching mode
 Before every agent turn, the following are injected into the system prompt (in priority order):
 
 1. **Open scratchpad items** (up to 2K chars)
-2. **Today's daily log** (up to 3K chars, tail)
+2. **Most recent daily log** (up to 3K chars, tail): today's, or the last day that has a log
 3. **MEMORY.md** (up to 4K chars, middle-truncated)
-4. **Yesterday's daily log** (up to 3K chars, tail — lowest priority, trimmed first)
+4. **Earlier daily logs** (up to 3K chars each, tail — lowest priority, trimmed first)
+
+Daily logs are picked by recency, not by calendar day: days without a log (weekends, time off) are skipped, so the first session after a break still sees the last working days. `PI_MEMORY_DAILY_LOGS` sets how many logs are injected (default 2).
 
 Total injection is capped at 16K chars.
 
@@ -188,6 +190,7 @@ This ensures in-progress context survives compaction and is visible in the next 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `PI_MEMORY_DIR` | path | `~/.pi/agent/memory` | Override the memory storage directory |
+| `PI_MEMORY_DAILY_LOGS` | non-negative integer | `2` | Number of most recent daily logs injected into context. Days without a log are skipped. `0` disables daily-log injection |
 | `PI_MEMORY_SNAPSHOT` | `stable`, `refresh`, `per-turn` | `stable` | `stable` snapshots once at session start and never re-renders it (deletions append a correction); `refresh` also re-renders on long-term writes and day rollover; `per-turn` rebuilds every turn (legacy behavior) |
 | `PI_MEMORY_QMD_UPDATE` | `background`, `manual`, `off` | `background` | Controls automatic `qmd update` + `qmd embed` after writes |
 | `PI_MEMORY_QMD_SEARCH_TIMEOUT_MS` | positive integer (milliseconds) | `60000` | Sets the timeout for explicit `memory_search` qmd queries |

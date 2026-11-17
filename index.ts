@@ -8,7 +8,7 @@
  * Layout (under ~/.pi/agent/memory/):
  *   MEMORY.md              — curated long-term memory (decisions, preferences, durable facts)
  *   SCRATCHPAD.md           — checklist of things to keep in mind / fix later
- *   daily/YYYY-MM-DD.md    — daily append-only log (today + yesterday loaded at session start)
+ *   daily/YYYY-MM-DD.md    — daily append-only log (two most recent logs loaded at session start)
  *   recovery/*.json        — durable records for restoring memory_forget deletions
  *
  * Tools:
@@ -20,7 +20,7 @@
  *   memory_search  — search across all memory files via qmd (keyword, semantic, or deep)
  *
  * Context injection:
- *   - MEMORY.md + SCRATCHPAD.md + today's + yesterday's daily logs injected into every turn
+ *   - MEMORY.md + SCRATCHPAD.md + the most recent daily logs (PI_MEMORY_DAILY_LOGS, default 2) injected into every turn
  */
 
 import { type ExecFileOptions, execFile } from "node:child_process";
@@ -154,6 +154,13 @@ const CONTEXT_SCRATCHPAD_MAX_CHARS = 2_000;
 const CONTEXT_SCRATCHPAD_MAX_LINES = 120;
 const CONTEXT_DAILY_MAX_CHARS = 3_000;
 const CONTEXT_DAILY_MAX_LINES = 120;
+const DEFAULT_DAILY_LOG_COUNT = 2;
+
+/** How many of the most recent daily logs to inject (`PI_MEMORY_DAILY_LOGS`, 0 disables). */
+export function getDailyLogCount(env: NodeJS.ProcessEnv = process.env): number {
+	const value = (env.PI_MEMORY_DAILY_LOGS ?? "").trim();
+	return /^\d+$/.test(value) ? Number(value) : DEFAULT_DAILY_LOG_COUNT;
+}
 const CONTEXT_SEARCH_MAX_CHARS = 2_500;
 const CONTEXT_SEARCH_MAX_LINES = 80;
 const CONTEXT_MAX_CHARS = 16_000;
@@ -796,9 +803,49 @@ function readRecoveryRecord(recoveryId: string): { record: RecoveryRecord; fileP
 // Context builder
 // ---------------------------------------------------------------------------
 
+/**
+ * The `count` most recent non-empty daily logs up to today, newest first.
+ * Days without a log are skipped, so a weekend or a break does not leave the
+ * context without the last working day.
+ */
+function recentDailyLogs(count: number): { date: string; content: string }[] {
+	if (count <= 0) return [];
+	const today = todayStr();
+	let names: string[];
+	try {
+		names = fs.readdirSync(DAILY_DIR);
+	} catch {
+		return [];
+	}
+	const dates = names
+		.filter((name) => name.endsWith(".md"))
+		.map((name) => name.slice(0, -3))
+		.filter((date) => isValidDailyDate(date) && date <= today)
+		.sort()
+		.reverse();
+	const logs: { date: string; content: string }[] = [];
+	for (const date of dates) {
+		const content = readFileSafe(dailyPath(date));
+		if (content?.trim()) logs.push({ date, content });
+		if (logs.length === count) break;
+	}
+	return logs;
+}
+
+function formatDailySection(date: string, content: string): string | null {
+	const label = date === todayStr() ? " (today)" : date === yesterdayStr() ? " (yesterday)" : "";
+	return formatContextSection(
+		`## Daily log: ${date}${label}`,
+		content,
+		"end",
+		CONTEXT_DAILY_MAX_LINES,
+		CONTEXT_DAILY_MAX_CHARS,
+	);
+}
+
 export function buildMemoryContext(searchResults?: string): string {
 	ensureDirs();
-	// Priority order: scratchpad > today's daily > search results > MEMORY.md > yesterday's daily
+	// Priority order: scratchpad > latest daily > search results > MEMORY.md > earlier dailies
 	const sections: string[] = [];
 
 	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
@@ -817,18 +864,9 @@ export function buildMemoryContext(searchResults?: string): string {
 		}
 	}
 
-	const today = todayStr();
-	const yesterday = yesterdayStr();
-
-	const todayContent = readFileSafe(dailyPath(today));
-	if (todayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${today} (today)`,
-			todayContent,
-			"end",
-			CONTEXT_DAILY_MAX_LINES,
-			CONTEXT_DAILY_MAX_CHARS,
-		);
+	const [latestDaily, ...earlierDailies] = recentDailyLogs(getDailyLogCount());
+	if (latestDaily) {
+		const section = formatDailySection(latestDaily.date, latestDaily.content);
 		if (section) sections.push(section);
 	}
 
@@ -855,15 +893,8 @@ export function buildMemoryContext(searchResults?: string): string {
 		if (section) sections.push(section);
 	}
 
-	const yesterdayContent = readFileSafe(dailyPath(yesterday));
-	if (yesterdayContent?.trim()) {
-		const section = formatContextSection(
-			`## Daily log: ${yesterday} (yesterday)`,
-			yesterdayContent,
-			"end",
-			CONTEXT_DAILY_MAX_LINES,
-			CONTEXT_DAILY_MAX_CHARS,
-		);
+	for (const { date, content } of earlierDailies) {
+		const section = formatDailySection(date, content);
 		if (section) sections.push(section);
 	}
 
@@ -2468,6 +2499,7 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
 				`- PI_MEMORY_EMBED_PROBE_TIMEOUT_MS: ${getEmbedProbeTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
+				`- PI_MEMORY_DAILY_LOGS: ${getDailyLogCount()}`,
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT: ${getExitSummaryReasoningEffort() ?? "off"}`,
