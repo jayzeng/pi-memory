@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Context injection now loads the two most recent daily logs instead of
+  today's and yesterday's by calendar date. Days without a log are skipped, so
+  the first session after a weekend or time off still sees the last working
+  days instead of no daily log at all.
+
+### Added
+
+- `PI_MEMORY_DAILY_LOGS` sets how many recent daily logs are injected
+  (default `2`, `0` disables daily-log injection).
+
 ## [0.4.2] — 2026-08-10
 
 ### Added
