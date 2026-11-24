@@ -467,7 +467,7 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		const response = await complete(
 			model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
+			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort(), sessionId: ctx.sessionManager.getSessionId() },
 		);
 
 		const summaryText = response.content
