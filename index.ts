@@ -2164,7 +2164,13 @@ export default function (pi: ExtensionAPI) {
 			// Persist the complete recovery payload before mutating the source file.
 			// If either write fails, we never report a successful unrecoverable deletion.
 			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
-			fs.writeFileSync(filePath, result.content, "utf-8");
+			// Older qmd releases skip empty files without retiring indexed content.
+			// Remove an emptied source so the next update can retire that document.
+			if (result.content.trim()) {
+				fs.writeFileSync(filePath, result.content, "utf-8");
+			} else {
+				fs.unlinkSync(filePath);
+			}
 			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
 			// so deleted content disappears from authoritative context without being
 			// copied into persisted correction messages. This intentionally spends one
