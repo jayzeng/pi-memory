@@ -2370,6 +2370,18 @@ describe("memory_forget tool", () => {
 		expect(tools.memory_forget).toBeDefined();
 	});
 
+	for (const target of ["long_term", "daily"] as const) {
+		test(`removes an emptied ${target} file and restores its last entry`, async () => {
+			const filePath = target === "daily" ? dailyPath(todayStr()) : path.join(tmpDir, "MEMORY.md");
+			ensureDirs();
+			fs.writeFileSync(filePath, "Last obsolete fact.\n", "utf-8");
+			const result = await tools.memory_forget.execute("forget", { match: "obsolete", target }, null, null, {});
+			expect(fs.existsSync(filePath)).toBe(false);
+			await tools.memory_restore.execute("restore", { recoveryId: result.details.recoveryId }, null, null, {});
+			expect(fs.readFileSync(filePath, "utf-8")).toContain("Last obsolete fact.");
+		});
+	}
+
 	test("removes matching entry from MEMORY.md and echoes it back", async () => {
 		fs.writeFileSync(
 			path.join(tmpDir, "MEMORY.md"),
