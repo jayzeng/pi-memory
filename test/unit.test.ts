@@ -2252,6 +2252,16 @@ describe("clampSearchLimit", () => {
 // ==========================================================================
 
 describe("forgetBlocks", () => {
+	test("keeps unrelated paragraphs under a file-level last-updated stamp", () => {
+		const input =
+			"<!-- last updated: 2026-11-22 19:15:33 [abc] -->\n# Memory\n\nKeep the database choice.\n\nObsolete deployment rule.\n\nKeep the editor preference.\n";
+		const result = forgetBlocks(input, "obsolete");
+		expect(result.removed).toEqual(["Obsolete deployment rule."]);
+		expect(result.content).toContain("last updated:");
+		expect(result.content).toContain("Keep the database choice.");
+		expect(result.content).toContain("Keep the editor preference.");
+	});
+
 	const file = [
 		"Hand-written note about deployment.",
 		"",
